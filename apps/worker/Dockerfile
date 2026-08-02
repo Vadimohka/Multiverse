@@ -1,8 +1,10 @@
-FROM python:3.12-slim
+ARG PYTHON_VERSION=3.14.6
+FROM python:${PYTHON_VERSION}-slim-bookworm
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/apps/api:/app/apps/worker:/app/packages
+RUN python -c "import sys; assert sys.version_info[:2] == (3, 14), sys.version"
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m pip install --no-cache-dir -r requirements.txt && python -m pip check
 COPY apps/api apps/api
 COPY apps/worker apps/worker
 COPY packages packages

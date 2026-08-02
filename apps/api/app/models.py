@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -38,7 +40,7 @@ class User(Base, TimestampMixin):
     password_hash: Mapped[str] = mapped_column(String(255))
     full_name: Mapped[str] = mapped_column(String(200), default="")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    roles: Mapped[list["UserRole"]] = relationship(cascade="all, delete-orphan")
+    roles: Mapped[list[UserRole]] = relationship(cascade="all, delete-orphan")
 
 
 class UserRole(Base):

@@ -1,16 +1,28 @@
 import asyncio
+from collections import Counter
 from datetime import datetime
+from pathlib import Path
 
 import httpx
 import pytest
 from app.routers.workflows import determine_run_status, node_warning
 from workflow_engine import WorkflowEngine, validate_dag
-from workflow_engine.nodes import FollowLinksNode, response_payload
+from workflow_engine.catalog import NODE_CATALOG
+from workflow_engine.nodes import NODE_REGISTRY, FollowLinksNode, response_payload
 from workflow_engine.types import ExecutionContext
 
 
 def context(clock=None):
     return ExecutionContext(run_id="contract", project_id="project", workflow_version_id="1", effective_run_clock=clock)
+
+
+def test_readme_node_catalog_matches_public_registry():
+    readme = (Path(__file__).resolve().parents[2] / "README.md").read_text(encoding="utf-8")
+    category_counts = Counter(item["category"] for item in NODE_CATALOG)
+    assert len(NODE_REGISTRY) == len(NODE_CATALOG)
+    assert f"**{len(NODE_REGISTRY)} executable node types**" in readme
+    for category, count in category_counts.items():
+        assert f"| {category} ({count}) |" in readme
 
 
 def test_http_document_has_diagnostics_not_zero_output():

@@ -1,36 +1,50 @@
 [project]
-name = "parser-studio"
+name = "multiverse-data-studio"
 version = "0.1.0"
-description = "Self-hosted no-code data parsing studio"
-requires-python = ">=3.11"
+description = "Self-hosted visual data extraction and workflow automation platform"
+requires-python = ">=3.14,<3.15"
+authors = [
+  { name = "Vladymtsev Vadim" },
+]
+license = { text = "MIT" }
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.14",
+]
 dependencies = [
-  "fastapi>=0.115",
-  "uvicorn[standard]>=0.30",
-  "sqlalchemy>=2.0",
-  "alembic>=1.13",
-  "pydantic>=2.8",
-  "pydantic-settings>=2.4",
-  "psycopg[binary]>=3.2",
+  "fastapi>=0.141.1",
+  "uvicorn[standard]>=0.52.1",
+  "sqlalchemy>=2.0.51",
+  "alembic>=1.18.5",
+  "pydantic>=2.13.4",
+  "pydantic-settings>=2.14.2",
+  "psycopg[binary]>=3.3.4",
   "PyJWT>=2.9",
-  "cryptography>=43",
+  "cryptography>=50.0.0",
   "httpx>=0.27",
   "beautifulsoup4>=4.12",
-  "lxml>=5.3",
-  "jsonpath-ng>=1.6",
+  "lxml>=6.1.1",
+  "jsonpath-ng>=1.8.0",
   "openpyxl>=3.1",
   "python-multipart>=0.0.9",
-  "celery>=5.4",
-  "redis>=5.0",
-  "boto3>=1.35",
+  "celery>=5.6.3",
+  "redis>=8.1.0",
+  "boto3>=1.43.62",
   "pymysql>=1.1",
-  "playwright>=1.49",
+  "playwright>=1.62.0",
   "jsonschema>=4.23",
-  "python-docx>=1.1",
-  "pypdf>=5.0",
+  "python-docx>=1.2.0",
+  "pypdf>=6.14.2",
 ]
 
+[project.urls]
+Homepage = "https://vadimohka.com"
+Repository = "https://github.com/Vadimohka/Multiverse"
+Issues = "https://github.com/Vadimohka/Multiverse/issues"
+LinkedIn = "https://www.linkedin.com/in/vadimohka/"
+
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.7", "mypy>=1.13"]
+dev = ["pytest>=9.1.1", "pytest-asyncio>=1.4.0", "ruff>=0.16.1", "mypy>=2.3.0"]
 
 [tool.pytest.ini_options]
 pythonpath = ["apps/api", "packages"]
@@ -39,7 +53,7 @@ addopts = "-q"
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py314"
 exclude = ["migrations/versions"]
 
 [tool.ruff.lint]
@@ -47,6 +61,6 @@ select = ["E", "F", "I", "B", "UP"]
 ignore = ["B008", "B904", "E501", "E701", "E702"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.14"
 strict = true
 ignore_missing_imports = true

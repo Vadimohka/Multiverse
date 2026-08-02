@@ -11,7 +11,7 @@
 - `apps/frontend` — React, TypeScript, Vite, React Flow, русский UI.
 - `apps/api` — FastAPI `/api/v1`, JWT/RBAC, CRUD, execution orchestration и SSE.
 - `apps/worker` — Celery workers: general, browser, document, LLM и Beat.
-- `packages/workflow_engine` — DAG engine, каталог из 23 исполняемых узлов и нормализаторы финансовых данных.
+- `packages/workflow_engine` — DAG engine, каталог из 26 исполняемых узлов и нормализаторы финансовых данных.
 - `migrations` — Alembic: initial schema, schedule state и LLM-call history.
 - `tests` — unit и API integration tests.
 - `docker-compose.yml` — PostgreSQL, Redis, MinIO, API, frontend, четыре workers и Beat.
@@ -55,7 +55,7 @@
 | Raw artifacts | Созданы |
 | XLSX export | Валидный ZIP/XLSX, 6505 байт в smoke-run |
 | Metrics endpoint | `runs_total` и `review_queue_size` доступны |
-| Workflow node catalog | 23 узла |
+| Workflow node catalog | 26 узлов |
 | Browser acceptance check | Login, dashboard, 13 основных разделов, document-source wizard, validate workflow, interactive selector screenshot/overlay и logout успешно |
 
 Полную проверку можно повторить командой:

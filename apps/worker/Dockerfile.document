@@ -1,15 +1,15 @@
-FROM python:3.12-slim
+ARG PYTHON_VERSION=3.14.6
+FROM python:${PYTHON_VERSION}-slim-bookworm
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/apps/api:/app/apps/worker:/app/packages
+RUN python -c "import sys; assert sys.version_info[:2] == (3, 14), sys.version"
 RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 tesseract-ocr tesseract-ocr-rus && rm -rf /var/lib/apt/lists/*
-COPY requirements.txt .
-# Install the CPU PyTorch wheel first. Installing Docling directly from PyPI
-# selects CUDA dependencies on Linux/ARM and turns this worker into a multi-GB
-# image even though Parser Studio does not use a GPU.
-RUN pip install --no-cache-dir -r requirements.txt \
- && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.6.0+cpu \
- && printf 'torch==2.6.0+cpu\ntorchvision==0.21.0\n' > /tmp/cpu-torch-constraints.txt \
- && pip install --no-cache-dir --constraint /tmp/cpu-torch-constraints.txt --extra-index-url https://download.pytorch.org/whl/cpu docling
+COPY requirements.txt requirements-document.txt .
+RUN python -m pip install --no-cache-dir -r requirements.txt -r requirements-document.txt \
+ && python -m pip check \
+ && python -c "import torch; assert not torch.cuda.is_available(), torch.version.cuda" \
+ && python -c "import docling; print('docling import: OK')" \
+ && ! python -m pip freeze | grep -Ei '^(nvidia-|cuda-|cudnn)'
 COPY apps/api apps/api
 COPY apps/worker apps/worker
 COPY packages packages

@@ -15,6 +15,10 @@ Keep this README synchronized with the repository.
 # Multiverse
 
 <p align="center">
+  <img src="docs/assets/multiverse-logo.png" width="720" alt="Multiverse logo">
+</p>
+
+<p align="center">
   <strong>Build, run, review, and schedule data-extraction workflows from one self-hosted visual studio.</strong>
 </p>
 
@@ -31,7 +35,9 @@ Keep this README synchronized with the repository.
 </p>
 
 <p align="center">
-  Created by <a href="https://vadimohka.com">Vadimohka</a>.
+  Created by <a href="https://vadimohka.com">Vladymtsev Vadim</a>
+  (<a href="https://github.com/Vadimohka">Vadimohka on GitHub</a> ·
+  <a href="https://www.linkedin.com/in/vadimohka/">LinkedIn</a>).
 </p>
 
 > **Project status:** early-stage, single-tenant MVP. Multiverse is ready for local evaluation and community development, but has not been qualified for large-scale or hostile public deployments.
@@ -98,17 +104,19 @@ On first startup, Multiverse seeds a deterministic bank-deposit demo. It fetches
 
 ## Node catalog
 
-The current engine exposes **27 executable node types**.
+The current engine exposes **26 executable node types**.
 
 | Category | Nodes |
 | --- | --- |
-| Trigger | Manual Trigger |
-| Fetch | HTTP Request, Browser Open, Download File, Follow Links, Pagination, Crawl Links |
-| Parse | Parse HTML, Select Elements, Repeating List, Parse Table, JSONPath, Parse Document |
-| Transform | Transform, Mapping, Set Constant, Formula |
-| AI | LLM Extract, LLM Classify |
-| Validate and logic | Validate, Deduplicate, Condition |
-| Output | Save Dataset, Save External DB, Export File, Send Webhook |
+| Trigger (1) | Manual Trigger |
+| Fetch (6) | HTTP Request, Browser Open, Download File, Follow Links, Pagination, Crawl Links |
+| Parse (6) | Parse HTML, Select Elements, Repeating List, Parse Table, JSONPath, Parse Document |
+| Transform (4) | Transform, Mapping, Set Constant, Formula |
+| AI (2) | LLM Extract, LLM Classify |
+| Validate (1) | Validate |
+| Merge (1) | Deduplicate |
+| Logic (1) | Condition |
+| Output (4) | Save Dataset, Save External DB, Export File, Send Webhook |
 
 The public node contract defines input and output data types so the API and browser editor validate the same graph structure.
 
@@ -167,10 +175,10 @@ Records are compared through natural keys and stable content hashes. Depending o
 
 ## Local development
 
-Backend requires Python 3.11 or newer:
+Backend requires CPython 3.14.6 (the normal GIL-enabled build). Linux amd64 and arm64 container images are built from `python:3.14.6-slim-bookworm`; other local platforms are not yet verified.
 
 ```bash
-python -m venv .venv
+python3.14 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
 
@@ -237,4 +245,4 @@ Contributions are welcome—especially deterministic parser nodes, document form
 
 Multiverse is released under the [MIT License](LICENSE).
 
-Copyright © 2026 [Vadimohka](https://vadimohka.com).
+Copyright © 2026 [Vladymtsev Vadim](https://vadimohka.com).
