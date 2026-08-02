@@ -175,7 +175,7 @@ Records are compared through natural keys and stable content hashes. Depending o
 
 ## Local development
 
-Backend requires CPython 3.14.6 (the normal GIL-enabled build). Linux amd64 and arm64 container images are built from `python:3.14.6-slim-bookworm`; other local platforms are not yet verified.
+Backend requires CPython 3.14.6 (the normal GIL-enabled build). Migration checks were run in a Linux/arm64 Docker image on an Apple Silicon host. The Dockerfiles use the official `python:3.14.6-slim-bookworm` image, which is published for Linux amd64 and arm64; Linux amd64 runtime verification is still pending.
 
 ```bash
 python3.14 -m venv .venv
