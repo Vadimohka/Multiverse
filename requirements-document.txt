@@ -1,0 +1,7 @@
+# Dedicated CPU-only dependencies for apps/worker/Dockerfile.document.
+# The explicit PyTorch CPU index prevents CUDA/NVIDIA packages from entering
+# the document worker and provides CPython 3.14 wheels for amd64 and arm64.
+--extra-index-url https://download.pytorch.org/whl/cpu
+docling==2.117.0
+torch==2.13.0+cpu
+torchvision==0.28.0+cpu

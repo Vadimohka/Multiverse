@@ -4,10 +4,10 @@ Thanks for helping improve Multiverse. Before opening a large feature request, c
 
 ## Local checks
 
-Use Python 3.11+ and Node.js 22+. From the repository root:
+Use CPython 3.14.6 (normal GIL-enabled build) and Node.js 24+. From the repository root:
 
 ```bash
-python -m venv .venv
+python3.14 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
 make test

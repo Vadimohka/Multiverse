@@ -14,16 +14,22 @@ jobs:
     name: Backend checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: "3.14.6"
           cache: pip
-      - run: python -m pip install --upgrade pip
+      - run: |
+          python -VV
+          python -c "import sys; assert sys.version_info[:2] == (3, 14), sys.version"
+      - run: python -m pip install --upgrade pip setuptools wheel
       - run: python -m pip install -r requirements-dev.txt
-      - run: pytest
+      - run: python -m pip check
+      - run: pytest -W error::DeprecationWarning
       - run: ruff check apps packages tests
       - run: python -m compileall -q apps packages migrations scripts tests
+      - name: Informational type check
+        run: mypy apps packages tests || true
 
   frontend:
     name: Frontend build
@@ -32,10 +38,10 @@ jobs:
       run:
         working-directory: apps/frontend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
           cache-dependency-path: apps/frontend/package-lock.json
       - run: npm ci
@@ -46,6 +52,53 @@ jobs:
     name: Compose configuration
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: cp .env.example .env
       - run: docker compose config --quiet
+
+  python-images:
+    name: Python 3.14 container checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build API and worker images
+        run: |
+          docker buildx build --load --cache-from type=gha,scope=multiverse-api --cache-to type=gha,mode=max,scope=multiverse-api -f apps/api/Dockerfile -t multiverse-api-py314 .
+          docker buildx build --load --cache-from type=gha,scope=multiverse-worker --cache-to type=gha,mode=max,scope=multiverse-worker -f apps/worker/Dockerfile -t multiverse-worker-py314 .
+          docker buildx build --load --cache-from type=gha,scope=multiverse-browser --cache-to type=gha,mode=max,scope=multiverse-browser -f apps/worker/Dockerfile.browser -t multiverse-browser-py314 .
+          docker buildx build --load --cache-from type=gha,scope=multiverse-document --cache-to type=gha,mode=max,scope=multiverse-document -f apps/worker/Dockerfile.document -t multiverse-document-py314 .
+      - name: Assert Python 3.14 in every Python service image
+        run: |
+          for service in api worker-general worker-browser worker-document worker-llm celery-beat; do
+            case "$service" in
+              api) image=multiverse-api-py314 ;;
+              worker-browser) image=multiverse-browser-py314 ;;
+              worker-document) image=multiverse-document-py314 ;;
+              *) image=multiverse-worker-py314 ;;
+            esac
+            echo "Checking $service ($image)"
+            docker run --rm --entrypoint python "$image" -VV
+            docker run --rm --entrypoint python "$image" -c "import sys; assert sys.version_info[:2] == (3, 14), sys.version"
+          done
+      - name: Browser worker smoke test
+        run: |
+          docker run -i --rm --entrypoint python multiverse-browser-py314 - <<'PY'
+          import asyncio
+          from playwright.async_api import async_playwright
+
+          async def main() -> None:
+              async with async_playwright() as playwright:
+                  browser = await playwright.chromium.launch(headless=True)
+                  page = await browser.new_page()
+                  await page.goto("data:text/html,<h1>Multiverse browser smoke</h1>")
+                  assert await page.locator("h1").text_content() == "Multiverse browser smoke"
+                  await browser.close()
+
+          asyncio.run(main())
+          PY
+      - name: Document worker CPU and parsing smoke tests
+        run: |
+          docker run --rm --entrypoint python multiverse-document-py314 -c "import torch; print(torch.__version__); assert not torch.cuda.is_available()"
+          docker run --rm --entrypoint python multiverse-document-py314 -c "import docling; print('docling import: OK')"
+          docker run --rm --entrypoint python multiverse-document-py314 -c "import importlib.metadata as metadata; banned = [item.metadata['Name'] for item in metadata.distributions() if item.metadata['Name'].lower().startswith(('nvidia-', 'cuda', 'cudnn'))]; assert not banned, banned"
+          docker run --rm -v "$PWD":/workspace -w /workspace --entrypoint python multiverse-document-py314 scripts/docling_smoke.py
