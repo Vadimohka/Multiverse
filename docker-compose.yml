@@ -1,0 +1,61 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-parser_studio}
+      POSTGRES_USER: ${POSTGRES_USER:-parser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"], interval: 5s, timeout: 5s, retries: 20}
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes: [redis_data:/data]
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 20}
+    restart: unless-stopped
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minio}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?Set S3_SECRET_KEY in .env}
+    volumes: [minio_data:/data]
+    healthcheck: {test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"], interval: 10s, timeout: 5s, retries: 20}
+    restart: unless-stopped
+  api:
+    build: {context: ., dockerfile: apps/api/Dockerfile}
+    env_file: .env
+    environment:
+      DATABASE_URL: "postgresql+psycopg://${POSTGRES_USER:-parser}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-parser_studio}"
+    depends_on: {postgres: {condition: service_healthy}, redis: {condition: service_healthy}}
+    healthcheck: {test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"], interval: 10s, timeout: 5s, retries: 20}
+    restart: unless-stopped
+  worker-general: &worker
+    build: {context: ., dockerfile: apps/worker/Dockerfile}
+    env_file: .env
+    environment:
+      DATABASE_URL: "postgresql+psycopg://${POSTGRES_USER:-parser}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-parser_studio}"
+    depends_on: {postgres: {condition: service_healthy}, redis: {condition: service_healthy}}
+    command: celery -A worker:celery_app worker --loglevel=INFO -Q default,http,exports,maintenance
+    restart: unless-stopped
+  worker-browser:
+    <<: *worker
+    build: {context: ., dockerfile: apps/worker/Dockerfile.browser}
+    command: celery -A worker:celery_app worker --loglevel=INFO -Q browser --concurrency=2
+  worker-document:
+    <<: *worker
+    build: {context: ., dockerfile: apps/worker/Dockerfile.document}
+    command: celery -A worker:celery_app worker --loglevel=INFO -Q documents --concurrency=2
+  worker-llm:
+    <<: *worker
+    command: celery -A worker:celery_app worker --loglevel=INFO -Q llm --concurrency=4
+  celery-beat:
+    <<: *worker
+    command: celery -A worker:celery_app beat --loglevel=INFO
+  frontend:
+    build: {context: ., dockerfile: apps/frontend/Dockerfile}
+    depends_on: {api: {condition: service_healthy}}
+    ports: ["8080:80"]
+    restart: unless-stopped
+volumes: {postgres_data: {}, redis_data: {}, minio_data: {}}

@@ -1,0 +1,8 @@
+services:
+  api:
+    volumes: ["./apps/api:/app/apps/api", "./packages:/app/packages"]
+    command: uvicorn app.main:app --app-dir apps/api --host 0.0.0.0 --port 8000 --reload
+  frontend:
+    build: {context: apps/frontend, dockerfile: Dockerfile.dev}
+    volumes: ["./apps/frontend:/app", "/app/node_modules"]
+    ports: ["5173:5173"]

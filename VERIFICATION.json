@@ -1,0 +1,47 @@
+{
+  "date": "2026-07-30",
+  "python_compileall": "passed",
+  "pytest": {
+    "status": "passed",
+    "tests": 19,
+    "warnings": 3
+  },
+  "alembic": {
+    "status": "passed",
+    "head": "0003_llm_calls"
+  },
+  "frontend": {
+    "production_build": "passed",
+    "bundle": "Vite production build completed"
+  },
+  "docker_compose": {
+    "yaml": "passed",
+    "service_count": 10,
+    "services": [
+      "postgres",
+      "redis",
+      "minio",
+      "api",
+      "worker-general",
+      "worker-browser",
+      "worker-document",
+      "worker-llm",
+      "celery-beat",
+      "frontend"
+    ],
+    "config": "passed",
+    "frontend_image_build": "passed",
+    "runtime": "not_run_full_stack"
+  },
+  "smoke_test": {
+    "status": "passed",
+    "workflow": "Демо-парсер депозитов",
+    "run_status": "WAITING_FOR_REVIEW",
+    "nodes": 7,
+    "records": 3,
+    "review_tasks": 3,
+    "artifacts": 1,
+    "catalog_nodes": 23,
+    "xlsx_bytes": 6505
+  }
+}

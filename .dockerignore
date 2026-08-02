@@ -1,0 +1,15 @@
+.git
+.env
+.pytest_cache
+__pycache__
+*.pyc
+*.db
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+.artifacts
+parser_studio.db
+*.zip
+graphify-out
+playwright-report
+test-results
