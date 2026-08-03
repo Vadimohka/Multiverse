@@ -28,6 +28,7 @@ Keep this README synchronized with the repository.
 
 <p align="center">
   <a href="https://github.com/Vadimohka/Multiverse/actions/workflows/ci.yml"><img src="https://github.com/Vadimohka/Multiverse/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://www.python.org/downloads/release/python-3146/"><img src="https://img.shields.io/badge/python-3.14.6-3776AB?logo=python&logoColor=white" alt="Python 3.14.6"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/Vadimohka/Multiverse" alt="MIT License"></a>
   <a href="https://github.com/Vadimohka/Multiverse/stargazers"><img src="https://img.shields.io/github/stars/Vadimohka/Multiverse?style=flat" alt="GitHub stars"></a>
   <a href="https://github.com/Vadimohka/Multiverse/issues"><img src="https://img.shields.io/github/issues/Vadimohka/Multiverse" alt="GitHub issues"></a>
@@ -175,7 +176,7 @@ Records are compared through natural keys and stable content hashes. Depending o
 
 ## Local development
 
-Backend requires CPython 3.14.6 (the normal GIL-enabled build). Migration checks were run in a Linux/arm64 Docker image on an Apple Silicon host. The Dockerfiles use the official `python:3.14.6-slim-bookworm` image, which is published for Linux amd64 and arm64; Linux amd64 runtime verification is still pending.
+Backend development requires CPython 3.14.6 using the standard GIL-enabled build. The official Docker images and CI are verified on Linux amd64, and the migration was additionally tested on Linux arm64 using Apple Silicon.
 
 ```bash
 python3.14 -m venv .venv
