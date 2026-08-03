@@ -2,7 +2,11 @@
 
 ## Reporting a vulnerability
 
-Please do not report security vulnerabilities in public GitHub issues. Report them privately through the repository owner's [GitHub profile](https://github.com/Vadimohka) and include:
+Please report security vulnerabilities using GitHub Private Vulnerability Reporting in the Security tab of this repository.
+
+Do not disclose the vulnerability in a public issue, discussion, pull request, or social media post.
+
+Include:
 
 - a clear description and affected component;
 - reproducible steps or a proof of concept;
