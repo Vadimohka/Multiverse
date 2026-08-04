@@ -21,29 +21,43 @@ class ArtifactStorage:
         content_type: str = "application/octet-stream",
         metadata: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        if self.settings.artifact_storage_backend.lower() == "local":
+            return await asyncio.to_thread(self._put_local, bucket, key, data)
         try:
             return await asyncio.to_thread(self._put_s3, bucket, key, data, content_type, metadata or {})
         except Exception as exc:
-            path = self.local_root / bucket / key
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
-            return {
-                "storage_backend": "LOCAL_FALLBACK",
-                "storage_key": str(path.resolve()),
-                "bucket": bucket,
-                "size": len(data),
-                "sha256": hashlib.sha256(data).hexdigest(),
-                "warning": str(exc),
-            }
+            result = self._put_local(bucket, key, data)
+            result["warning"] = str(exc)
+            return result
 
     async def get_bytes(self, bucket: str, storage_key: str, backend: str = "S3") -> bytes:
-        if backend == "LOCAL_FALLBACK" or Path(storage_key).is_absolute():
-            path = Path(storage_key).resolve()
-            roots = [self.local_root.resolve(), Path.cwd().resolve()]
-            if not any(path.is_relative_to(root) for root in roots):
-                raise ValueError("Недопустимый путь artifact")
+        if backend.upper() in {"LOCAL", "LOCAL_FALLBACK"} or Path(storage_key).is_absolute():
+            path = self._validated_local_path(storage_key)
             return await asyncio.to_thread(path.read_bytes)
         return await asyncio.to_thread(self._get_s3, bucket, storage_key)
+
+    def _put_local(self, bucket: str, key: str, data: bytes) -> dict[str, Any]:
+        path = self._validated_local_path(Path(bucket) / key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return {
+            "storage_backend": "LOCAL_FALLBACK",
+            "storage_key": str(path),
+            "bucket": bucket,
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+
+    def _validated_local_path(self, relative_path: str | Path) -> Path:
+        """Resolve a local artifact path without allowing it to leave local_root."""
+        candidate = Path(relative_path)
+        if ".." in candidate.parts:
+            raise ValueError("Недопустимый путь artifact")
+        root = self.local_root.resolve()
+        path = (root / candidate).resolve()
+        if not path.is_relative_to(root):
+            raise ValueError("Недопустимый путь artifact")
+        return path
 
     def _client(self):
         import boto3

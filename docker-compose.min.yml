@@ -1,0 +1,201 @@
+name: multiverse-min
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "5m"
+    max-file: "2"
+
+x-backend-environment: &backend-environment
+  APP_ENV: production
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-parser}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-parser_studio}
+  REDIS_URL: redis://redis:6379/0
+  ARTIFACT_STORAGE_BACKEND: local
+  INTERNAL_API_URL: http://api:8000
+  OMP_NUM_THREADS: "1"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  NUMEXPR_NUM_THREADS: "1"
+  MALLOC_ARENA_MAX: "2"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-parser_studio}
+      POSTGRES_USER: ${POSTGRES_USER:-parser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=24MB
+      - -c
+      - work_mem=1MB
+      - -c
+      - maintenance_work_mem=16MB
+      - -c
+      - temp_buffers=4MB
+      - -c
+      - max_connections=15
+      - -c
+      - effective_cache_size=128MB
+      - -c
+      - autovacuum_max_workers=1
+      - -c
+      - max_worker_processes=2
+      - -c
+      - max_parallel_workers=0
+      - -c
+      - jit=off
+      - -c
+      - min_wal_size=80MB
+      - -c
+      - max_wal_size=256MB
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    mem_limit: 192m
+    memswap_limit: 320m
+    pids_limit: 100
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "32mb", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    mem_limit: 48m
+    memswap_limit: 96m
+    pids_limit: 50
+    logging: *default-logging
+
+  api:
+    image: multiverse-backend:min
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.min
+    env_file: .env
+    environment:
+      <<: *backend-environment
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-http://localhost:8080}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+    command:
+      - sh
+      - -c
+      - >-
+        alembic upgrade head &&
+        exec uvicorn app.main:app
+        --app-dir apps/api
+        --host 0.0.0.0
+        --port 8000
+        --workers 1
+        --limit-concurrency 15
+        --timeout-keep-alive 5
+        --no-access-log
+    volumes:
+      - artifacts:/app/.artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+    init: true
+    mem_limit: 256m
+    memswap_limit: 512m
+    pids_limit: 150
+    logging: *default-logging
+
+  worker:
+    image: multiverse-backend:min
+    pull_policy: never
+    env_file: .env
+    environment: *backend-environment
+    command: ["celery", "-A", "worker:celery_app", "worker", "--loglevel=WARNING", "--pool=solo", "--concurrency=1", "--prefetch-multiplier=1", "--without-gossip", "--without-mingle", "--without-heartbeat", "-Q", "default,http,documents,llm,exports,maintenance"]
+    volumes:
+      - artifacts:/app/.artifacts
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    mem_limit: 320m
+    memswap_limit: 768m
+    pids_limit: 160
+    logging: *default-logging
+
+  frontend:
+    image: multiverse-frontend:min
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.frontend.min
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:80"
+    restart: unless-stopped
+    mem_limit: 32m
+    memswap_limit: 64m
+    pids_limit: 50
+    logging: *default-logging
+
+  celery-beat:
+    image: multiverse-backend:min
+    pull_policy: never
+    profiles: ["scheduler"]
+    env_file: .env
+    environment: *backend-environment
+    command: ["celery", "-A", "worker:celery_app", "beat", "--loglevel=WARNING"]
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    init: true
+    mem_limit: 96m
+    memswap_limit: 192m
+    pids_limit: 80
+    logging: *default-logging
+
+  worker-browser:
+    image: multiverse-browser:min
+    profiles: ["browser"]
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile.browser
+    env_file: .env
+    environment: *backend-environment
+    command: ["celery", "-A", "worker:celery_app", "worker", "--loglevel=WARNING", "--pool=solo", "--concurrency=1", "--prefetch-multiplier=1", "--without-gossip", "--without-mingle", "--without-heartbeat", "-Q", "browser"]
+    volumes:
+      - artifacts:/app/.artifacts
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 45s
+    shm_size: 128m
+    mem_limit: 640m
+    memswap_limit: 1536m
+    pids_limit: 220
+    logging: *default-logging
+
+volumes:
+  postgres_data:
+  artifacts:

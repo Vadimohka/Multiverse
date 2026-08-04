@@ -1,4 +1,4 @@
-.PHONY: env dev up down test lint format migrate frontend-lint frontend-build check
+.PHONY: env dev up down test lint format migrate frontend-lint frontend-build check min-build min-up min-down min-logs min-ps min-scheduler min-browser
 
 env:
 	@test -f .env || (cp .env.example .env && \
@@ -33,3 +33,27 @@ frontend-lint:
 	cd apps/frontend && npm run lint
 
 check: test lint frontend-lint frontend-build
+
+min-build: env
+	COMPOSE_PARALLEL_LIMIT=1 docker compose -f docker-compose.min.yml build api
+	COMPOSE_PARALLEL_LIMIT=1 docker compose -f docker-compose.min.yml build frontend
+
+min-up: env
+	docker compose -f docker-compose.min.yml up -d postgres redis
+	docker compose -f docker-compose.min.yml up -d api
+	docker compose -f docker-compose.min.yml up -d worker frontend
+
+min-down:
+	docker compose -f docker-compose.min.yml down
+
+min-logs:
+	docker compose -f docker-compose.min.yml logs -f --tail=150
+
+min-ps:
+	docker compose -f docker-compose.min.yml ps
+
+min-scheduler:
+	docker compose -f docker-compose.min.yml --profile scheduler up -d celery-beat
+
+min-browser:
+	COMPOSE_PARALLEL_LIMIT=1 docker compose -f docker-compose.min.yml --profile browser up -d --build worker-browser
