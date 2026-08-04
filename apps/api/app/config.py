@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     encryption_master_key: str = "development-encryption-key-change-me"
     database_url: str = "sqlite:///./parser_studio.db"
     redis_url: str = "redis://localhost:6379/0"
+    artifact_storage_backend: str = "s3"
     s3_endpoint: str = "http://localhost:9000"
     s3_access_key: str = "minio"
     s3_secret_key: str = "minio123"

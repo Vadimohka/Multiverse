@@ -99,6 +99,8 @@ grep '^DEFAULT_ADMIN_' .env
 
 Never commit `.env` or reuse its development credentials in a public deployment.
 
+For low-resource servers (1 vCPU, 1 GiB RAM), see [the minimal Compose deployment guide](README.MIN.md).
+
 ## First workflow
 
 On first startup, Multiverse seeds a deterministic bank-deposit demo. It fetches local financial HTML, extracts deposit cards, normalizes values, validates and versions three records, creates review tasks, approves the records, and exports the dataset to XLSX. Use it to verify the installation before connecting external websites.

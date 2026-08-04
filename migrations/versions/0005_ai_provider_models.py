@@ -12,8 +12,12 @@ branch_labels = None
 depends_on = None
 
 def upgrade() -> None:
-    op.add_column("ai_providers", sa.Column("available_models", sa.JSON(), nullable=True))
+    existing_columns = {column["name"] for column in sa.inspect(op.get_bind()).get_columns("ai_providers")}
+    if "available_models" not in existing_columns:
+        op.add_column("ai_providers", sa.Column("available_models", sa.JSON(), nullable=True))
     op.execute("UPDATE ai_providers SET available_models = '[]' WHERE available_models IS NULL")
 
 def downgrade() -> None:
-    op.drop_column("ai_providers", "available_models")
+    existing_columns = {column["name"] for column in sa.inspect(op.get_bind()).get_columns("ai_providers")}
+    if "available_models" in existing_columns:
+        op.drop_column("ai_providers", "available_models")
