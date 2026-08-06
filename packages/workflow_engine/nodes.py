@@ -252,10 +252,18 @@ class FollowLinksNode:
                         selector = mapping.get("selector") or mapping.get("source_path")
                         element = soup.select_one(str(selector)) if selector else None
                         child[name] = element.get(mapping.get("attribute")) if element and mapping.get("attribute") else element.get_text(" ", strip=True) if element else mapping.get("default")
-                    row = parent if merge_mode == "PARENT_ONLY" else child if merge_mode == "CHILD_ONLY" else {**parent, **child}
+                    table_config = config.get("detail_table")
+                    table_rows = []
+                    if isinstance(table_config, dict) and table_config.get("selector"):
+                        parsed_table = await ParseTableNode().execute(context, {"html": response.text}, table_config)
+                        table_rows = parsed_table.get("records") or []
+                    rows = table_rows or [{}]
                     async with lock:
-                        records.append(row)
-                        progress.append({"url": url, "status": "SUCCESS", "status_code": response.status_code})
+                        for table_row in rows:
+                            detail = {**child, **table_row}
+                            row = parent if merge_mode == "PARENT_ONLY" else detail if merge_mode == "CHILD_ONLY" else {**parent, **detail}
+                            records.append(row)
+                        progress.append({"url": url, "status": "SUCCESS", "status_code": response.status_code, "detail_rows": len(table_rows)})
 
             await asyncio.gather(*(fetch(parent) for parent in parents))
         if failures and policy == "FAIL_FAST":

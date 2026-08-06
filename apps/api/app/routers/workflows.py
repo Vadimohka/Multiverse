@@ -33,6 +33,7 @@ from app.models import (
     Run,
     Secret,
     Source,
+    SourceProfile,
     User,
     Workflow,
     WorkflowVersion,
@@ -97,6 +98,13 @@ def create_from_source(
     source = db.get(Source, payload.source_id)
     if not source:
         raise HTTPException(status_code=404, detail="Источник не найден")
+    # Older clients/profile API calls may store the profiler result separately.
+    # Hydrate source settings before generating the graph so that endpoint is
+    # never silently replaced by a demo template.
+    if not (isinstance(source.settings, dict) and source.settings.get("profile")):
+        latest_profile = db.scalar(select(SourceProfile).where(SourceProfile.source_id == source.id).order_by(SourceProfile.created_at.desc()))
+        if latest_profile:
+            source.settings = {**(source.settings or {}), "profile": latest_profile.result_json}
     graph = build_source_template(source, payload.template)
     workflow = Workflow(
         project_id=source.project_id,
@@ -267,6 +275,41 @@ def node_test_graph(payload: NodeTestRequest) -> dict[str, Any]:
     }
 
 
+def _source_extractor_config(source: Source) -> dict[str, Any]:
+    """Return the profiler suggestion plus explicit source overrides.
+
+    Source settings are intentionally JSON: users can edit them in the
+    workflow editor and a new site never requires a bank-specific code change.
+    """
+    settings = source.settings if isinstance(source.settings, dict) else {}
+    profile = settings.get("profile") if isinstance(settings.get("profile"), dict) else {}
+    configured = settings.get("extractor") if isinstance(settings.get("extractor"), dict) else {}
+    profile_extractor = profile.get("extractor") if isinstance(profile.get("extractor"), dict) else {}
+    candidates = profile.get("repeating_candidates") if isinstance(profile.get("repeating_candidates"), list) else []
+    candidate = configured.get("candidate") if isinstance(configured.get("candidate"), dict) else None
+    if not candidate:
+        usable = [item for item in candidates if isinstance(item, dict) and item.get("selector")]
+        candidate = max(usable, key=lambda item: (len(item.get("fields") or []), int(item.get("count") or 0)), default={})
+    container_selector = str(configured.get("container_selector") or profile_extractor.get("container_selector") or candidate.get("selector") or "")
+    fields = configured.get("fields") if isinstance(configured.get("fields"), list) else profile_extractor.get("fields") if isinstance(profile_extractor.get("fields"), list) else candidate.get("fields")
+    fields = [dict(item) for item in (fields or []) if isinstance(item, dict) and item.get("name") and item.get("selector")]
+    if not fields and container_selector:
+        fields = [{"name": "url", "selector": "a[href]", "attribute": "href"}]
+    link_field = next((item for item in fields if item.get("name") in {"url", "link", "href"} and item.get("attribute") == "href"), None)
+    if link_field and link_field.get("name") != "url":
+        link_field = {**link_field, "name": "url"}
+        fields = [link_field if item.get("name") in {"link", "href"} else item for item in fields]
+    detail = configured.get("detail") if isinstance(configured.get("detail"), dict) else settings.get("detail")
+    if not isinstance(detail, dict):
+        detail = {}
+    return {
+        "container_selector": container_selector,
+        "fields": fields,
+        "follow_links": bool(configured.get("follow_links", settings.get("follow_links", profile_extractor.get("follow_links", bool(link_field))))),
+        "detail": detail,
+    }
+
+
 def build_source_template(source: Source, template: str) -> dict[str, Any]:
     fetch_type = "browser_open" if source.fetch_mode == "PLAYWRIGHT" else "download_file" if source.fetch_mode == "DOCUMENT" else "http_request"
     fetch_config: dict[str, Any] = {"url": "{{source.url}}", "timeout": source.settings.get("timeout", 45)}
@@ -285,6 +328,7 @@ def build_source_template(source: Source, template: str) -> dict[str, Any]:
             {"id": "e-json-mapping", "source": "json", "target": "mapping"}, {"id": "e-mapping-output", "source": "mapping", "target": "output"},
         ]
         return {"version": 1, "settings": {"source_id": source.id, "review_policy": {"new": True, "changed": True, "confidence_below": 0.8}}, "nodes": nodes, "edges": edges}
+    extractor = _source_extractor_config(source)
     nodes: list[dict[str, Any]] = [
         {"id": "trigger", "type": "manual_trigger", "position": {"x": 20, "y": 160}, "config": {}},
         {"id": "fetch", "type": fetch_type, "position": {"x": 240, "y": 160}, "config": fetch_config},
@@ -297,19 +341,43 @@ def build_source_template(source: Source, template: str) -> dict[str, Any]:
             {"id": "output", "type": "output", "position": {"x": 820, "y": 160}, "config": {"input_path": "records"}},
         ])
     else:
-        nodes.extend([
-            {"id": "parse", "type": "parse_html", "position": {"x": 480, "y": 160}, "config": {"input_path": "body"}},
-            {"id": "mapping", "type": "mapping", "position": {"x": 700, "y": 160}, "config": {"input_path": "records", "fields": []}},
-            {"id": "extract", "type": "extract_repeating_list", "position": {"x": 720, "y": 160}, "config": {"input_path": "html", "container_selector": ".product-card", "fields": [{"name": "product_name", "selector": ".product-title"}, {"name": "rate", "selector": ".rate"}, {"name": "term", "selector": ".term"}]}},
-            {"id": "transform", "type": "transform", "position": {"x": 960, "y": 160}, "config": {"input_path": "records", "operations": [{"type": "rate", "field": "rate"}, {"type": "term", "field": "term"}]}},
-            {"id": "output", "type": "output", "position": {"x": 1200, "y": 160}, "config": {"input_path": "records"}},
-        ])
-        edges.extend([
-            {"id": "e-fetch-parse", "source": "fetch", "target": "parse"},
-            {"id": "e-parse-extract", "source": "parse", "target": "extract"},
-            {"id": "e-extract-transform", "source": "extract", "target": "transform"},
-            {"id": "e-transform-mapping", "source": "transform", "target": "mapping"}, {"id": "e-mapping-output", "source": "mapping", "target": "output"},
-        ])
+        # Prefer profiler-generated selectors.  With no repeating candidate we
+        # still create a useful, editable link collector instead of demo CSS.
+        if extractor["container_selector"]:
+            parse_node = {"id": "parse", "type": "parse_html", "position": {"x": 480, "y": 160}, "config": {"input_path": "body"}}
+            extract_node = {"id": "extract", "type": "extract_repeating_list", "position": {"x": 700, "y": 160}, "config": {"input_path": "html", "container_selector": extractor["container_selector"], "fields": extractor["fields"]}}
+            nodes.extend([parse_node, extract_node])
+            edges.extend([{ "id": "e-fetch-parse", "source": "fetch", "target": "parse" }, {"id": "e-parse-extract", "source": "parse", "target": "extract"}])
+            previous = "extract"
+        else:
+            select_node = {"id": "select", "type": "select_elements", "position": {"x": 540, "y": 160}, "config": {"input_path": "body", "selector": str(extractor.get("selector") or "a[href]"), "attribute": str(extractor.get("attribute") or "href")}}
+            nodes.append(select_node)
+            edges.append({"id": "e-fetch-select", "source": "fetch", "target": "select"})
+            previous = "select"
+
+        if extractor["follow_links"]:
+            detail = extractor["detail"]
+            follow_config = {"input_collection": "records", "url_field": "url", "merge_mode": "MERGE_PARENT_CHILD", "max_pages": int(detail.get("max_pages", 50)), "detail_fields": detail.get("fields", [])}
+            if detail.get("table"):
+                follow_config["detail_table"] = detail["table"]
+            nodes.append({"id": "follow", "type": "follow_links", "position": {"x": 900, "y": 160}, "config": follow_config})
+            edges.append({"id": "e-extract-follow", "source": previous, "target": "follow"})
+            previous = "follow"
+
+        names = [str(item.get("name")) for item in extractor["fields"] if item.get("name")]
+        operations = []
+        if "rate" in names:
+            operations.append({"type": "rate", "field": "rate"})
+        if "term" in names:
+            operations.append({"type": "term", "field": "term"})
+        nodes.append({"id": "transform", "type": "transform", "position": {"x": 1080, "y": 160}, "config": {"input_path": "records", "operations": operations}})
+        edges.append({"id": "e-previous-transform", "source": previous, "target": "transform"})
+        mapping_fields = [{"target": name, "source_path": name} for name in names]
+        nodes.append({"id": "mapping", "type": "mapping", "position": {"x": 1260, "y": 160}, "config": {"input_path": "records", "fields": mapping_fields}})
+        edges.append({"id": "e-transform-mapping", "source": "transform", "target": "mapping"})
+        key_fields = ["url"] if "url" in names else ([names[0]] if names else ["value"])
+        nodes.append({"id": "output", "type": "output", "position": {"x": 1440, "y": 160}, "config": {"input_path": "records", "natural_key_fields": key_fields, "on_empty": "warning"}})
+        edges.append({"id": "e-mapping-output", "source": "mapping", "target": "output"})
         return {"version": 1, "settings": {"source_id": source.id, "review_policy": {"new": True, "changed": True, "confidence_below": 0.8}}, "nodes": nodes, "edges": edges}
     edges.extend([
         {"id": "e-fetch-parse", "source": "fetch", "target": "parse"},
