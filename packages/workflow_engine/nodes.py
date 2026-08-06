@@ -525,6 +525,12 @@ class ParseTableNode:
         header_row = int(config.get("header_row", 0))
         headers = dedupe_headers(matrix[header_row]) if matrix else []
         records = [dict(zip(headers, row, strict=False)) for row in matrix[header_row + 1:] if any(row)]
+        if config.get("normalize_fields"):
+            for record in records:
+                for header, value in list(record.items()):
+                    normalized = normalize_table_field_name(header)
+                    if normalized and normalized not in record:
+                        record[normalized] = value
         return {"records": records, "count": len(records), "headers": headers, "table": matrix}
 
 
@@ -1220,6 +1226,24 @@ def apply_operation(row: dict[str, Any], operation: dict[str, Any]) -> None:
         row[operation.get("to", field)] = str(row[field]).split(str(operation.get("separator", ",")))
     elif kind == "concat":
         row[field] = str(operation.get("separator", " ")).join(str(row.get(source, "")) for source in operation.get("fields", []))
+
+
+def normalize_table_field_name(header: Any) -> str:
+    """Map common Russian/English detail-table headings to stable field names.
+
+    Raw headings remain in the record.  The normalized aliases are opt-in so
+    existing Parse Table workflows keep their exact source column names.
+    """
+    text = re.sub(r"\s+", " ", str(header or "").strip().lower())
+    if not text:
+        return ""
+    if any(token in text for token in ("валют", "currency", "curr", "валюта")):
+        return "currency"
+    if any(token in text for token in ("ставк", "процент", "rate", "interest", "yield")):
+        return "rate"
+    if any(token in text for token in ("срок", "период", "term", "period", "месяц", "дн", "day", "month")):
+        return "term"
+    return ""
 
 
 def safe_eval(expression: str, values: dict[str, Any], run_clock: datetime | None = None) -> Any:

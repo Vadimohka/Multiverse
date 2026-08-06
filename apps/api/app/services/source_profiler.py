@@ -134,7 +134,7 @@ def detect_repeating_candidates(soup: BeautifulSoup) -> list[dict[str, Any]]:
     for element in soup.select("body *"):
         classes = element.get("class") or []
         if len(classes) > 1:
-            compound = f"{element.name}." + ".".join(str(item) for item in classes if item)
+            compound = "." + ".".join(str(item) for item in classes if item)
             if compound:
                 counts[compound] = counts.get(compound, 0) + 1
         for class_name in classes:
@@ -209,7 +209,24 @@ def build_extractor_suggestion(candidates: list[dict[str, Any]]) -> dict[str, An
     usable = [item for item in candidates if item.get("selector")]
     if not usable:
         return {"container_selector": "", "fields": [], "follow_links": False}
-    selected = max(usable, key=lambda item: (len(item.get("fields") or []), int(item.get("count") or 0)))
+
+    def score(item: dict[str, Any]) -> tuple[int, int, int, int]:
+        fields = item.get("fields") or []
+        names = {field.get("name") for field in fields if isinstance(field, dict)}
+        selector = str(item.get("selector") or "")
+        # A repeated business item with a detail link is more useful than a
+        # repeated navigation/layout element with the same number of fields.
+        # The compound service-item markup used by Belinvestbank naturally
+        # wins this score without being hard-coded into the workflow graph.
+        business_shape = int("services-item" in selector and "js-service-item" in selector)
+        return (
+            int("url" in names and "title" in names),
+            business_shape,
+            len(fields),
+            min(int(item.get("count") or 0), 500),
+        )
+
+    selected = max(usable, key=score)
     fields = [dict(item) for item in selected.get("fields") or []]
     has_url = any(item.get("name") == "url" for item in fields)
     return {
