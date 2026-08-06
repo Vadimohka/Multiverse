@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlsplit
 
@@ -55,6 +56,7 @@ async def profile_url(url: str, timeout: float = 20) -> dict[str, Any]:
         "robots_meta": (soup.select_one('meta[name="robots"]') or {}).get("content") if soup.select_one('meta[name="robots"]') else None,
         "script_count": len(scripts),
         "repeating_candidates": repeated_candidates,
+        "extractor": build_extractor_suggestion(repeated_candidates),
         "captcha_detected": captcha_detected,
     })
     if captcha_detected:
@@ -131,12 +133,91 @@ def detect_repeating_candidates(soup: BeautifulSoup) -> list[dict[str, Any]]:
     counts: dict[str, int] = {}
     for element in soup.select("body *"):
         classes = element.get("class") or []
+        if len(classes) > 1:
+            compound = f"{element.name}." + ".".join(str(item) for item in classes if item)
+            if compound:
+                counts[compound] = counts.get(compound, 0) + 1
         for class_name in classes:
             if len(class_name) < 3:
                 continue
             selector = f"{element.name}.{class_name}"
             counts[selector] = counts.get(selector, 0) + 1
-    return [{"selector": selector, "count": count} for selector, count in sorted(counts.items(), key=lambda item: item[1], reverse=True) if 2 <= count <= 500][:20]
+    candidates: list[dict[str, Any]] = []
+    for selector, count in sorted(counts.items(), key=lambda item: item[1], reverse=True):
+        if not 2 <= count <= 500:
+            continue
+        containers = soup.select(selector)
+        fields = infer_repeating_fields(containers[0]) if containers else []
+        candidate: dict[str, Any] = {"selector": selector, "count": count}
+        if fields:
+            candidate["fields"] = fields
+        link = next((field for field in fields if field.get("name") == "url"), None)
+        if link:
+            candidate["link_field"] = link
+        candidates.append(candidate)
+        if len(candidates) >= 20:
+            break
+    return candidates
+
+
+def infer_repeating_fields(container: Any) -> list[dict[str, Any]]:
+    """Build conservative, editable field suggestions from one repeated item.
+
+    The profiler must not know a site's business vocabulary.  It only uses
+    stable HTML semantics (links, ids/classes and common numeric/date markers)
+    and returns suggestions that the workflow editor can change.
+    """
+    fields: list[dict[str, Any]] = []
+    descendants = [container] + list(container.select("*") if hasattr(container, "select") else [])
+
+    def add(name: str, selector: str, **extra: Any) -> None:
+        if not selector or any(item.get("name") == name for item in fields):
+            return
+        fields.append({"name": name, "selector": selector, **extra})
+
+    links = [element for element in descendants if getattr(element, "name", None) == "a" and element.get("href")]
+    if links:
+        link = links[0]
+        link_classes = [str(item) for item in (link.get("class") or [])]
+        selector = "." + ".".join(link_classes) if link_classes else "a[href]"
+        add("url", selector, attribute="href")
+
+    def semantic_selector(tokens: tuple[str, ...]) -> str:
+        for element in descendants[1:]:
+            haystack = " ".join([str(element.get("id") or ""), *(str(item) for item in (element.get("class") or []))]).lower()
+            if any(token in haystack for token in tokens):
+                classes = [str(item) for item in (element.get("class") or [])]
+                if classes:
+                    return "." + ".".join(classes)
+                if element.get("id"):
+                    element_id = str(element.get("id"))
+                    match = re.match(r"^(.*?[_-])?\d+$", element_id)
+                    if match and match.group(1):
+                        return f'{element.name}[id^="{match.group(1)}"]'
+                    return f"#{element_id}"
+        return ""
+
+    add("title", semantic_selector(("title", "name", "product", "description", "service", "caption")))
+    add("rate", semantic_selector(("rate", "interest", "percent", "yield", "stavk")))
+    add("term", semantic_selector(("term", "period", "month", "day", "srok", "срок")))
+    add("currency", semantic_selector(("currency", "curr", "valut", "byn", "usd", "eur")))
+    return fields
+
+
+def build_extractor_suggestion(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    """Expose one editable extractor config while retaining all candidates."""
+    usable = [item for item in candidates if item.get("selector")]
+    if not usable:
+        return {"container_selector": "", "fields": [], "follow_links": False}
+    selected = max(usable, key=lambda item: (len(item.get("fields") or []), int(item.get("count") or 0)))
+    fields = [dict(item) for item in selected.get("fields") or []]
+    has_url = any(item.get("name") == "url" for item in fields)
+    return {
+        "container_selector": selected["selector"],
+        "fields": fields,
+        "follow_links": has_url,
+        "candidate_count": selected.get("count", 0),
+    }
 
 
 def unique_dicts(items: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
