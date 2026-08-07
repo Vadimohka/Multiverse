@@ -111,6 +111,24 @@ class Workflow(Base, TimestampMixin):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class WorkflowTemplate(Base, TimestampMixin):
+    """Reusable, project-scoped workflow blueprint.
+
+    Templates deliberately store a graph copy rather than refer to a workflow:
+    changing a draft can never silently change future workflows created from an
+    already approved template.
+    """
+    __tablename__ = "workflow_templates"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str] = mapped_column(Text, default="")
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    graph_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=lambda: {"nodes": [], "edges": [], "settings": {}, "version": 1})
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    is_builtin: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class WorkflowVersion(Base):
     __tablename__ = "workflow_versions"
     __table_args__ = (UniqueConstraint("workflow_id", "version", name="uq_workflow_version"),)

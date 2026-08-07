@@ -24,6 +24,7 @@ from app.routers import (
     sources,
     system,
     users,
+    workflow_templates,
     workflows,
 )
 from app.routers import settings as settings_router
@@ -63,7 +64,7 @@ async def app_error_handler(_: Request, exc: AppError) -> JSONResponse:
 
 
 api_prefix = "/api/v1"
-for router in [auth.router, users.router, projects.router, sources.router, workflows.router, runs.router, schemas.router, prompts.router, review.router, data.router, documents.router, settings_router.router, system.router]:
+for router in [auth.router, users.router, projects.router, sources.router, workflow_templates.router, workflows.router, runs.router, schemas.router, prompts.router, review.router, data.router, documents.router, settings_router.router, system.router]:
     app.include_router(router, prefix=api_prefix)
 
 

@@ -8,7 +8,8 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user, require_roles
-from app.models import DataSchema, Dataset, Record, RecordVersion, User
+from app.audit import audit
+from app.models import DataSchema, Dataset, Record, RecordVersion, ReviewTask, User
 from app.schemas import DatasetCreate, DatasetOut, DatasetUpdate
 from app.services.exporter import export_xlsx
 
@@ -59,12 +60,60 @@ def update_dataset(dataset_id: str, payload: DatasetUpdate, db: Session = Depend
     return dataset
 
 
+def clear_dataset_records(db: Session, dataset_id: str) -> int:
+    """Remove only data owned by a dataset, including its review tasks."""
+    records = list(db.scalars(select(Record).where(Record.dataset_id == dataset_id)).all())
+    record_ids = [record.id for record in records]
+    if record_ids:
+        for task in db.scalars(select(ReviewTask).where(ReviewTask.record_id.in_(record_ids))).all():
+            db.delete(task)
+    for record in records:
+        db.delete(record)
+    return len(records)
+
+
+@router.delete("/datasets/{dataset_id}/records")
+def clear_dataset(dataset_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> dict:
+    if not db.get(Dataset, dataset_id):
+        raise HTTPException(status_code=404, detail="Dataset не найден")
+    removed = clear_dataset_records(db, dataset_id)
+    audit(db, user.id, "CLEAR", "dataset", dataset_id, after={"removed_records": removed})
+    db.commit()
+    return {"removed_records": removed}
+
+
+@router.delete("/datasets/{dataset_id}", status_code=204)
+def delete_dataset(dataset_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> None:
+    dataset = db.get(Dataset, dataset_id)
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset не найден")
+    removed = clear_dataset_records(db, dataset_id)
+    audit(db, user.id, "DELETE", "dataset", dataset_id, before={"name": dataset.name, "removed_records": removed})
+    db.delete(dataset)
+    db.commit()
+
+
+@router.get("/datasets/{dataset_id}/summary")
+def dataset_summary(dataset_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict:
+    if not db.get(Dataset, dataset_id):
+        raise HTTPException(status_code=404, detail="Dataset не найден")
+    base = (Record.dataset_id == dataset_id, Record.status == "ACTIVE")
+    return {
+        "approved": db.scalar(select(func.count()).select_from(Record).where(*base, Record.review_status == "APPROVED")) or 0,
+        "pending": db.scalar(select(func.count()).select_from(Record).where(*base, Record.review_status == "PENDING")) or 0,
+        "rejected": db.scalar(select(func.count()).select_from(Record).where(Record.dataset_id == dataset_id, Record.status == "REJECTED")) or 0,
+        "pending_initial": db.scalar(select(func.count()).select_from(Record).where(*base, Record.review_status == "PENDING", Record.current_version == 1)) or 0,
+    }
+
+
 @router.get("/datasets/{dataset_id}/records")
-def list_records(dataset_id: str, limit: int = 100, offset: int = 0, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict:
+def list_records(dataset_id: str, limit: int = 100, offset: int = 0, include_pending: bool = False, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict:
     if not db.get(Dataset, dataset_id): raise HTTPException(status_code=404, detail="Dataset не найден")
-    # The data catalogue is the confirmed-data view. Pending/rejected versions
-    # are available to operators through the dedicated review queue instead.
-    filters = (Record.dataset_id == dataset_id, Record.status == "ACTIVE", Record.review_status == "APPROVED")
+    # The default remains the exportable, confirmed-data view.  The UI can opt
+    # into pending initial records to make an empty catalogue explain itself.
+    filters = (Record.dataset_id == dataset_id, Record.status == "ACTIVE")
+    if not include_pending:
+        filters += (Record.review_status == "APPROVED",)
     total = db.scalar(select(func.count()).select_from(Record).where(*filters)) or 0
     records = db.scalars(
         select(Record).where(*filters)
@@ -73,6 +122,42 @@ def list_records(dataset_id: str, limit: int = 100, offset: int = 0, db: Session
         .limit(min(limit, 1000))
     ).all()
     return {"items": [{"id": r.id, "natural_key": r.natural_key, "status": r.status, "data": r.data_json, "confidence": r.confidence, "review_status": r.review_status, "updated_at": r.updated_at} for r in records], "limit": limit, "offset": offset, "total": total}
+
+
+@router.post("/datasets/{dataset_id}/accept-baseline")
+def accept_baseline(dataset_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "OPERATOR"))) -> dict:
+    """Publish only first-observation records after an operator reviewed a sample.
+
+    Later changed versions keep their own Review Queue tasks and are never
+    silently accepted by this convenience action.
+    """
+    if not db.get(Dataset, dataset_id):
+        raise HTTPException(status_code=404, detail="Dataset не найден")
+    records = list(db.scalars(select(Record).where(
+        Record.dataset_id == dataset_id,
+        Record.status == "ACTIVE",
+        Record.review_status == "PENDING",
+        Record.current_version == 1,
+    )).all())
+    record_ids = [record.id for record in records]
+    for record in records:
+        record.review_status = "APPROVED"
+    if record_ids:
+        versions = db.scalars(select(RecordVersion).where(RecordVersion.record_id.in_(record_ids), RecordVersion.version_number == 1)).all()
+        for version in versions:
+            version.review_status = "APPROVED"
+        tasks = db.scalars(select(ReviewTask).where(
+            ReviewTask.record_id.in_(record_ids),
+            ReviewTask.reason == "NEW_RECORD",
+            ReviewTask.status == "PENDING",
+        )).all()
+        for task in tasks:
+            task.status = "APPROVED"
+            task.decision_by = user.id
+            task.decision_comment = "Базовый срез принят оператором после выборочной проверки"
+    audit(db, user.id, "ACCEPT_BASELINE", "dataset", dataset_id, after={"approved_records": len(records)})
+    db.commit()
+    return {"approved_records": len(records)}
 
 
 @router.get("/records/{record_id}/history")

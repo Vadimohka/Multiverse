@@ -146,7 +146,15 @@ def detect_repeating_candidates(soup: BeautifulSoup) -> list[dict[str, Any]]:
     for selector, count in sorted(counts.items(), key=lambda item: item[1], reverse=True):
         if not 2 <= count <= 500:
             continue
-        containers = soup.select(selector)
+        # Utility-first CSS class names (for example ``lg:w-1/3``) and
+        # malformed classes emitted by third-party widgets are valid HTML
+        # class tokens but not valid CSS selectors.  A profiler suggestion is
+        # optional, so skip only that suggestion instead of rejecting the
+        # complete source URL.
+        try:
+            containers = soup.select(selector)
+        except Exception:
+            continue
         fields = infer_repeating_fields(containers[0]) if containers else []
         candidate: dict[str, Any] = {"selector": selector, "count": count}
         if fields:

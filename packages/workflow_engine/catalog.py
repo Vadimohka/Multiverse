@@ -91,7 +91,10 @@ _CONTRACTS: dict[str, NodeContract] = {
     "mapping": NodeContract(DataType.ARRAY_OBJECT, DataType.ARRAY_OBJECT, "records"),
     "set_constant": NodeContract(DataType.OBJECT, DataType.ARRAY_OBJECT, "records"),
     "formula": NodeContract(DataType.ARRAY_OBJECT, DataType.ARRAY_OBJECT, "records"),
-    "llm_extract": NodeContract(DataType.TEXT, DataType.ARRAY_OBJECT, "records"),
+    # Parse HTML and browser nodes return an object with ``text``/``body``.
+    # Accept that object directly so an LLM extractor can process page content
+    # without a lossy, artificial adapter node.
+    "llm_extract": NodeContract(DataType.OBJECT, DataType.ARRAY_OBJECT, "records"),
     "llm_classify": NodeContract(DataType.TEXT, DataType.OBJECT, "value"),
     "validate": NodeContract(DataType.ARRAY_OBJECT, DataType.ARRAY_OBJECT, "records"),
     "deduplicate": NodeContract(DataType.ARRAY_OBJECT, DataType.ARRAY_OBJECT, "records"),

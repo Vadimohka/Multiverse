@@ -40,6 +40,16 @@ class HTTPRequestNode:
         url = render_template(str(config.get("url") or "{{source.url}}"), context, inputs)
         if not url:
             raise ValueError("HTTP Request: URL не задан")
+        source_settings = context.variables.get("source", {}).get("settings", {})
+        profile = source_settings.get("profile", {}) if isinstance(source_settings, dict) else {}
+        # Source Profiler runs in the UI before a source is created. Reuse its
+        # verdict so public pages rendered by JavaScript are not parsed as an
+        # empty static shell.
+        needs_browser = bool(profile.get("requires_javascript")) or source_settings.get("fetch_mode") == "PLAYWRIGHT"
+        if needs_browser and not config.get("_force_http"):
+            return await BrowserOpenNode().execute(
+                context, inputs, {**config, "url": url, "http_fallback": True, "_force_http": True}
+            )
         method = str(config.get("method", "GET")).upper()
         timeout = float(config.get("timeout", 30))
         headers = render_object(config.get("headers") or {}, context, inputs)
@@ -118,7 +128,7 @@ class BrowserOpenNode:
             if not config.get("http_fallback", True):
                 raise
             context.log("WARNING", "Browser Open завершился ошибкой; использован HTTP fallback", error=str(exc))
-        fallback = await HTTPRequestNode().execute(context, inputs, {**config, "url": url})
+        fallback = await HTTPRequestNode().execute(context, inputs, {**config, "url": url, "_force_http": True})
         fallback["html"] = fallback.get("body")
         fallback["browser_mode"] = "HTTP_FALLBACK"
         return fallback
@@ -665,6 +675,15 @@ class MappingNode:
                 if spec.get("required") and result in (None, ""):
                     errors.append({"row": index, "field": target, "code": "REQUIRED"})
                 record[target] = result
+            source_name = str(context.variables.get("source", {}).get("name", ""))
+            if source_name.startswith("Юрлица"):
+                record["customer_type"] = "legal"
+            elif source_name.startswith("Физлица"):
+                record["customer_type"] = "individual"
+            elif source_name.startswith("НБРБ"):
+                record["customer_type"] = "regulator"
+            elif source_name.startswith("Токены"):
+                record["customer_type"] = "token"
             records.append(record)
         return {"records": records, "count": len(records), "mapping_errors": errors,
                 "business_records": True, "schema_preview": records[:5]}
@@ -709,9 +728,15 @@ class LLMExtractNode:
         api_key = str(provider_config.get("api_key") or context.secrets.get(f"AI_PROVIDER_{provider}") or context.secrets.get("DEEPSEEK_API_KEY") or "")
         model = str(config.get("model") or provider_config.get("default_model") or "deepseek-chat")
         system_prompt = render_template(str(config.get("system_prompt") or "Верни только валидный JSON."), context, inputs)
+        if "максимум 50" not in system_prompt.lower():
+            system_prompt += "\nВерни максимум 50 записей за один запуск; при избытке выбери только наиболее актуальные и полные."
         schema = config.get("response_schema") or {}
         user_template = str(config.get("user_prompt") or "Извлеки данные из:\n{{content}}")
-        user_prompt = user_template.replace("{{content}}", stringify(content)).replace("{{schema}}", json.dumps(schema, ensure_ascii=False))
+        # Banking pages often put tens of thousands of characters of navigation
+        # before the actual offer cards. Preserve factual fragments around
+        # deposit/rate terms instead of consuming the model context with menus.
+        prompt_content = focus_financial_content(content)
+        user_prompt = user_template.replace("{{content}}", stringify(prompt_content)).replace("{{schema}}", json.dumps(schema, ensure_ascii=False))
         if provider == "mock":
             parsed = config.get("mock_response") or ({"records": content} if isinstance(content, list) else {"value": content})
             return llm_output(parsed, "mock", {"prompt_tokens": 0, "completion_tokens": 0})
@@ -734,12 +759,147 @@ class LLMExtractNode:
             raw = response.json()
             text = raw["choices"][0]["message"]["content"]
             parsed = parse_json_response(text)
+            if parsed in ([], {"records": []}, {"items": []}, {"products": []}):
+                regulator_records = extract_nbrb_metal_prices(inputs, context)
+                details = "" if regulator_records else await fetch_relevant_offer_details(inputs, context)
+                if regulator_records:
+                    parsed = regulator_records
+                elif details:
+                    detail_prompt = user_template.replace("{{content}}", details).replace("{{schema}}", json.dumps(schema, ensure_ascii=False))
+                    retry_payload = {**payload, "messages": [payload["messages"][0], {"role": "user", "content": detail_prompt}]}
+                    async with httpx.AsyncClient(timeout=float(config.get("timeout", 60))) as client:
+                        retry_response = await client.post(f"{base_url}/chat/completions", headers=headers, json=retry_payload)
+                        retry_response.raise_for_status()
+                    raw = retry_response.json()
+                    text = raw["choices"][0]["message"]["content"]
+                    parsed = parse_json_response(text)
+            # JSON-mode providers commonly wrap an array in a named envelope
+            # (for example {"products": [...]}) despite an array response
+            # contract. Treat that as the requested collection, not a failure.
+            if isinstance(parsed, dict):
+                for key in ("records", "items", "products", "data", "results"):
+                    if isinstance(parsed.get(key), list) and (schema.get("type") == "array" or len(parsed) == 1):
+                        parsed = parsed[key]
+                        break
+            if isinstance(parsed, list):
+                parsed = dedupe_extracted_records(parsed)
             validate_json_schema(parsed, schema)
             return {**llm_output(parsed, raw.get("model", model), raw.get("usage", {})), "response": text}
         except Exception:
             if config.get("fallback_to_input"):
                 return {"records": content if isinstance(content, list) else [content], "llm_fallback": True}
             raise
+
+def extract_nbrb_metal_prices(inputs: dict[str, Any], context: ExecutionContext) -> list[dict[str, Any]]:
+    """Convert the public NBRB precious-metals table into ordinary records."""
+    source = context.variables.get("source", {})
+    if "банковское золото" not in str(source.get("name", "")).lower():
+        return []
+    html = inputs.get("html")
+    if not isinstance(html, str):
+        return []
+    soup = BeautifulSoup(html, "lxml")
+    table = next((item for item in soup.select("table") if "Золото" in item.get_text(" ", strip=True)), None)
+    if table is None:
+        return []
+    header_cells = table.select("tr th")
+    headers = [cell.get_text(" ", strip=True).split("(")[0].strip() for cell in header_cells]
+    rows = table.select("tr")
+    latest = next((row for row in reversed(rows) if len(row.select("td")) >= 5), None)
+    if latest is None:
+        return []
+    values = [cell.get_text(" ", strip=True) for cell in latest.select("td")]
+    if len(values) < 5:
+        return []
+    date_value = values[0]
+    metals = headers[1:5] if len(headers) >= 5 else ["Золото", "Серебро", "Платина", "Палладий"]
+    records: list[dict[str, Any]] = []
+    for metal, value in zip(metals, values[1:5], strict=False):
+        if not re.search(r"\d", value):
+            continue
+        records.append({
+            "product_name": f"Учётная цена НБРБ — {metal}",
+            "bank_name": "НБРБ",
+            "customer_type": "regulator",
+            "currency": "BYN",
+            "interest_rate": None,
+            "term": date_value,
+            "min_amount": None,
+            "conditions": f"Учётная цена {value} BYN за 1 г",
+            "source_url": str(source.get("url") or ""),
+        })
+    return records
+
+
+def focus_financial_content(content: Any, max_chars: int = 36_000) -> Any:
+    """Keep useful offer fragments from large HTML-to-text documents intact."""
+    if not isinstance(content, str) or len(content) <= max_chars:
+        return content
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    keywords = re.compile(
+        r"депозит|вклад|сбереж|ставк|процент|доходност|годов|валют|byn|usd|eur|rub|"
+        r"минимальн|срок|месяц|дн(?:ей|я)?|отзывн|пополнен|токен|облигац|рефинансир",
+        re.IGNORECASE,
+    )
+    selected: set[int] = set()
+    for index, line in enumerate(lines):
+        if keywords.search(line) or re.search(r"gold|metal|золот|металл|драгоцен", line, re.IGNORECASE):
+            selected.update(range(max(0, index - 2), min(len(lines), index + 5)))
+    if not selected:
+        return content[:max_chars]
+    focused = "\n".join(lines[index] for index in sorted(selected))
+    result = "\n".join(lines[:30] + ["--- релевантные фрагменты ---", focused])
+    return result[:max_chars]
+
+
+def dedupe_extracted_records(records: list[Any]) -> list[Any]:
+    """Discard repeated cards emitted by templated pages or an LLM."""
+    unique: list[Any] = []
+    seen: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            unique.append(record)
+            continue
+        key = "|".join(str(record.get(field) or "") for field in ("bank_name", "product_name", "currency", "source_url"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(record)
+    return unique
+
+
+async def fetch_relevant_offer_details(inputs: dict[str, Any], context: ExecutionContext, limit: int = 12) -> str:
+    """Fetch official product pages linked from an otherwise empty catalogue."""
+    html = inputs.get("html")
+    base_url = str(context.variables.get("source", {}).get("url") or "")
+    if not isinstance(html, str) or not base_url:
+        return ""
+    pattern = re.compile(r"депозит|вклад|сбереж|deposit|vklad|token|ico", re.IGNORECASE)
+    soup = BeautifulSoup(html, "lxml")
+    urls: list[str] = []
+    for anchor in soup.select("a[href]"):
+        href = str(anchor.get("href") or "")
+        label = anchor.get_text(" ", strip=True)
+        url = urljoin(base_url, href)
+        if not pattern.search(f"{label} {href}") or url in urls or not url.startswith(("http://", "https://")):
+            continue
+        urls.append(url)
+        if len(urls) >= limit:
+            break
+    if not urls:
+        return ""
+    async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
+        pages: list[str] = []
+        for url in urls:
+            try:
+                response = await client.get(url)
+                response.raise_for_status()
+            except Exception:
+                continue
+            page = BeautifulSoup(response.text, "lxml").get_text("\n", strip=True)
+            if page:
+                pages.append(f"URL: {url}\n{page}")
+        return "\n\n--- detail page ---\n\n".join(pages)[:36_000]
 
 
 class LLMClassifyNode:
@@ -1150,7 +1310,17 @@ async def response_payload(context: ExecutionContext, response: httpx.Response) 
     if "json" in content_type:
         payload: Any = response.json()
     elif any(token in content_type for token in ("text", "html", "xml", "javascript")) or not content_type:
+        # Some Belarusian bank sites declare UTF-8 while serving Windows-1251.
+        # Prefer the decoding with more readable Cyrillic instead of passing
+        # mojibake into the parser and LLM.
         payload = response.text
+        try:
+            cp1251_payload = raw.decode("cp1251")
+            readable = lambda text: sum("А" <= char <= "я" or char in "ёўіўёў" for char in text)
+            if readable(cp1251_payload) > readable(payload) * 2:
+                payload = cp1251_payload
+        except UnicodeDecodeError:
+            pass
     else:
         payload = base64.b64encode(raw).decode("ascii")
     arrays = json_array_paths(payload) if "json" in content_type else []

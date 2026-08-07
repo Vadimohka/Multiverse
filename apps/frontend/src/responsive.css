@@ -1,0 +1,23 @@
+/* Small-screen refinement: keep controls usable and table columns readable. */
+.table-wrap{max-width:100%;border-radius:8px;scrollbar-color:#98a2b3 transparent;scrollbar-width:thin}
+.table-wrap table{min-width:720px}
+
+@media(max-width:1000px){
+  aside{padding:18px 10px}
+  .brand{padding:5px 0 20px;text-align:center}
+  nav{align-items:center;scrollbar-width:none}
+  nav::-webkit-scrollbar{display:none}
+  nav a,.logout{justify-content:center;padding:10px;width:48px}
+  .logout{margin-inline:auto}
+  main{padding:22px}
+  .panel{padding:16px}
+  .table-wrap{margin-inline:-4px}
+  th,td{padding:10px;max-width:260px}
+}
+
+@media(max-width:650px){
+  .table-wrap table{min-width:640px}
+  header{align-items:stretch}
+  header .toolbar{width:100%}
+  header .toolbar>*{flex:1}
+}

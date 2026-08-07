@@ -9,7 +9,7 @@ from app.audit import audit
 from app.database import get_db
 from app.dependencies import get_current_user, require_roles
 from app.models import Source, SourceProfile, User, Workflow
-from app.schemas import EndpointUseRequest, ProfileRequest, SourceCreate, SourceOut
+from app.schemas import EndpointUseRequest, ProfileRequest, SourceCreate, SourceOut, SourceUpdate
 from app.services.selector_picker import build_selector_snapshot
 from app.services.source_profiler import profile_url
 
@@ -26,6 +26,55 @@ def list_sources(project_id: str | None = None, db: Session = Depends(get_db), _
 @router.post("", response_model=SourceOut, status_code=201)
 def create_source(payload: SourceCreate, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> Source:
     source = Source(**payload.model_dump()); db.add(source); db.flush(); audit(db, user.id, "CREATE", "source", source.id, after=payload.model_dump()); db.commit(); db.refresh(source); return source
+
+
+@router.patch("/{source_id}", response_model=SourceOut)
+def update_source(
+    source_id: str,
+    payload: SourceUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
+) -> Source:
+    source = db.get(Source, source_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Источник не найден")
+    changes = payload.model_dump(exclude_none=True)
+    if not changes:
+        return source
+    before = {key: getattr(source, key) for key in changes}
+    for key, value in changes.items():
+        setattr(source, key, value)
+    source.version += 1
+    audit(db, user.id, "UPDATE", "source", source.id, before=before, after=changes)
+    db.commit()
+    db.refresh(source)
+    return source
+
+
+class SourceAccessUpdate(BaseModel):
+    access_status: str
+    access_note: str = ""
+
+
+@router.patch("/{source_id}/access", response_model=SourceOut)
+def update_access(
+    source_id: str,
+    payload: SourceAccessUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
+) -> Source:
+    source = db.get(Source, source_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Источник не найден")
+    settings = dict(source.settings or {})
+    settings["access_status"] = payload.access_status
+    settings["access_note"] = payload.access_note.strip()
+    source.settings = settings
+    source.version += 1
+    audit(db, user.id, "UPDATE_ACCESS", "source", source.id, after={"access_status": payload.access_status, "access_note": settings["access_note"]})
+    db.commit()
+    db.refresh(source)
+    return source
 
 
 @router.post("/endpoint/use")
