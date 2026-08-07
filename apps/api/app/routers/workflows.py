@@ -295,6 +295,13 @@ def _source_extractor_config(source: Source) -> dict[str, Any]:
     fields = [dict(item) for item in (fields or []) if isinstance(item, dict) and item.get("name") and item.get("selector")]
     if not fields and container_selector:
         fields = [{"name": "url", "selector": "a[href]", "attribute": "href"}]
+    # Belinvestbank keeps the product name and detail URL in the same link.
+    # Give this stable site markup the dataset-friendly name while preserving
+    # the profiler's selector and href extraction.
+    for index, field in enumerate(fields):
+        selector = str(field.get("selector") or "")
+        if field.get("name") == "title" and ("item-description-link" in selector or "deposit_name_" in selector):
+            fields[index] = {**field, "name": "product_name"}
     link_field = next((item for item in fields if item.get("name") in {"url", "link", "href"} and item.get("attribute") == "href"), None)
     if link_field and link_field.get("name") != "url":
         link_field = {**link_field, "name": "url"}
@@ -302,6 +309,15 @@ def _source_extractor_config(source: Source) -> dict[str, Any]:
     detail = configured.get("detail") if isinstance(configured.get("detail"), dict) else settings.get("detail")
     if not isinstance(detail, dict):
         detail = {}
+    if link_field and not detail.get("table"):
+        # Detail pages contain the published rate/term/currency table.  The
+        # node tolerates pages without a table, but when one exists it exposes
+        # stable aliases (rate/term/currency) alongside raw headings.
+        detail = {
+            **detail,
+            "table": {"selector": "table", "header_row": 0, "normalize_fields": True},
+            "field_names": ["rate", "term", "currency"],
+        }
     return {
         "container_selector": container_selector,
         "fields": fields,
@@ -365,14 +381,26 @@ def build_source_template(source: Source, template: str) -> dict[str, Any]:
             previous = "follow"
 
         names = [str(item.get("name")) for item in extractor["fields"] if item.get("name")]
+        for name in extractor["detail"].get("field_names", []):
+            if name not in names:
+                names.append(str(name))
         operations = []
         if "rate" in names:
             operations.append({"type": "rate", "field": "rate"})
         if "term" in names:
             operations.append({"type": "term", "field": "term"})
+        if "currency" in names:
+            operations.append({"type": "currency", "field": "currency"})
         nodes.append({"id": "transform", "type": "transform", "position": {"x": 1080, "y": 160}, "config": {"input_path": "records", "operations": operations}})
         edges.append({"id": "e-previous-transform", "source": previous, "target": "transform"})
         mapping_fields = [{"target": name, "source_path": name} for name in names]
+        if "rate" in names:
+            mapping_fields.extend([{"target": "rate_value", "source_path": "rate_value"}])
+        if "term" in names:
+            mapping_fields.extend([
+                {"target": "term_min_days", "source_path": "term_min_days"},
+                {"target": "term_max_days", "source_path": "term_max_days"},
+            ])
         nodes.append({"id": "mapping", "type": "mapping", "position": {"x": 1260, "y": 160}, "config": {"input_path": "records", "fields": mapping_fields}})
         edges.append({"id": "e-transform-mapping", "source": "transform", "target": "mapping"})
         key_fields = ["url"] if "url" in names else ([names[0]] if names else ["value"])
