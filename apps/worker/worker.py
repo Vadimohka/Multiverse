@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 from app.config import get_settings
 from app.database import SessionLocal
-from app.models import Run, Schedule, Workflow
+from app.models import Run, Schedule, Source, Workflow
 from app.routers.workflows import execute_run
 from celery import Celery
 from celery.schedules import crontab
@@ -58,28 +58,37 @@ def schedule_tick() -> int:
                 continue
             if schedule.last_run_at and schedule.last_run_at.astimezone(UTC).replace(second=0, microsecond=0) >= now_utc.replace(second=0, microsecond=0):
                 continue
-            source_id = workflow.graph_json.get("settings", {}).get("source_id")
-            run = Run(
-                workflow_id=workflow.id,
-                workflow_version=workflow.published_version or workflow.version,
-                source_id=source_id,
-                input_json={"schedule_id": schedule.id, "scheduled_at": now_utc.isoformat()},
-            )
-            db.add(run)
+            workflow_version = workflow.published_version or workflow.version
+            settings = workflow.graph_json.get("settings", {})
+            if settings.get("run_all_project_sources"):
+                targets = list(db.scalars(select(Source).where(Source.project_id == workflow.project_id, Source.enabled.is_(True))).all())
+                targets = [source for source in targets if (source.settings or {}).get("access_status", "PUBLIC") == "PUBLIC"]
+            else:
+                source_id = settings.get("source_id")
+                targets = [db.get(Source, source_id)] if source_id else [None]
+            for source in targets:
+                run = Run(
+                    workflow_id=workflow.id,
+                    workflow_version=workflow_version,
+                    source_id=source.id if source else None,
+                    input_json={"schedule_id": schedule.id, "scheduled_at": now_utc.isoformat(), "batch": bool(settings.get("run_all_project_sources"))},
+                )
+                db.add(run)
+                db.flush()
+                queue = queue_for_graph(workflow.graph_json, source)
+                celery_app.send_task("parser_studio.execute_run", args=[run.id], queue=queue)
+                enqueued += 1
             schedule.last_run_at = now_utc
-            db.flush()
-            queue = queue_for_graph(workflow.graph_json)
-            celery_app.send_task("parser_studio.execute_run", args=[run.id], queue=queue)
-            enqueued += 1
         db.commit()
         return enqueued
     finally:
         db.close()
 
 
-def queue_for_graph(graph: dict) -> str:
+def queue_for_graph(graph: dict, source: Source | None = None) -> str:
     types = {node.get("type") or node.get("data", {}).get("type") for node in graph.get("nodes", [])}
-    if "browser_open" in types:
+    profile = (source.settings or {}).get("profile", {}) if source else {}
+    if "browser_open" in types or profile.get("requires_javascript") or (source.fetch_mode or "").upper() == "PLAYWRIGHT" if source else "browser_open" in types:
         return "browser"
     if types & {"parse_document", "download_file"}:
         return "documents"

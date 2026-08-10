@@ -5,9 +5,9 @@ from sqlalchemy.orm import Session
 from app.audit import audit
 from app.database import get_db
 from app.dependencies import get_current_user, require_roles
-from app.models import DataSchema, Dataset, Project, Source, User, Workflow
+from app.models import DataSchema, Dataset, Project, User
 from app.schemas import ProjectCreate, ProjectOut, ProjectUpdate
-from app.seed_templates import BANK_DEPOSIT_SCHEMA, BCSE_NEWS_SCHEMA, bcse_news_graph
+from app.seed_templates import BANK_DEPOSIT_SCHEMA
 
 router = APIRouter(prefix="/projects", tags=["Проекты"])
 
@@ -26,20 +26,6 @@ def create_project(payload: ProjectCreate, db: Session = Depends(get_db), user: 
     if payload.template == "bank_deposits":
         schema = DataSchema(project_id=project.id, name="BankDepositOffer", description="Встроенная схема депозитов", schema_json=BANK_DEPOSIT_SCHEMA, published=True)
         db.add(schema); db.flush(); db.add(Dataset(project_id=project.id, schema_id=schema.id, name="Банковские депозиты", slug=f"{payload.slug}-bank-deposits"))
-    if payload.template == "bcse_news":
-        schema = DataSchema(project_id=project.id, name="BCSE News", description="Русскоязычные новости Белорусской валютно-фондовой биржи", schema_json=BCSE_NEWS_SCHEMA, published=True)
-        db.add(schema); db.flush()
-        dataset = Dataset(project_id=project.id, schema_id=schema.id, name="BCSE News", slug=f"{payload.slug}-news")
-        db.add(dataset); db.flush()
-        source = Source(
-            project_id=project.id, name="БВФБ — Новости (рус.)", source_type="WEB_PAGE", entry_url="https://www.bcse.by/press-center/news",
-            base_url="https://www.bcse.by", fetch_mode="PLAYWRIGHT", tags=["bcse", "news", "ru"],
-            description="Официальный русскоязычный раздел новостей БВФБ; архив берётся через календарный JSON endpoint.",
-            settings={"timeout": 60, "headers": {"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5"}},
-        )
-        db.add(source); db.flush()
-        db.add(Workflow(project_id=project.id, name="BCSE News — Historical Backfill", description="Полная историческая загрузка русскоязычных новостей БВФБ", graph_json=bcse_news_graph(source.id, dataset.id)))
-        db.add(Workflow(project_id=project.id, name="BCSE News — Incremental", description="Новые и недавно изменённые новости БВФБ за последние 45 дней", graph_json=bcse_news_graph(source.id, dataset.id, incremental=True)))
     audit(db, user.id, "CREATE", "project", project.id, after=payload.model_dump()); db.commit(); db.refresh(project)
     return project
 

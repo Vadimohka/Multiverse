@@ -75,6 +75,15 @@ class SourceCreate(BaseModel):
     settings: dict[str, Any] = {}
 
 
+class SourceUpdate(BaseModel):
+    name: str | None = None
+    entry_url: str | None = None
+    enabled: bool | None = None
+    description: str | None = None
+    fetch_mode: str | None = None
+    tags: list[str] | None = None
+
+
 class SourceOut(ORMModel):
     id: str
     project_id: str
@@ -86,6 +95,7 @@ class SourceOut(ORMModel):
     version: int
     settings: dict[str, Any]
     created_at: datetime
+    updated_at: datetime
 
 
 class ProfileRequest(BaseModel):
@@ -162,6 +172,13 @@ class WorkflowUpdate(BaseModel):
     is_active: bool | None = None
 
 
+class WorkflowImportRequest(BaseModel):
+    project_id: str
+    name: str
+    description: str = ""
+    graph_json: dict[str, Any]
+
+
 class WorkflowOut(ORMModel):
     id: str
     project_id: str
@@ -173,6 +190,46 @@ class WorkflowOut(ORMModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+
+
+class WorkflowTemplateCreate(BaseModel):
+    project_id: str
+    name: str
+    description: str = ""
+    tags: list[str] = []
+    graph_json: dict[str, Any]
+
+
+class WorkflowTemplateUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    tags: list[str] | None = None
+
+
+class WorkflowTemplateInstantiateRequest(BaseModel):
+    project_id: str
+    name: str | None = None
+    source_id: str | None = None
+    dataset_id: str | None = None
+
+
+class WorkflowTemplateFromWorkflowRequest(BaseModel):
+    project_id: str
+    name: str
+    description: str = ""
+    tags: list[str] = []
+
+
+class WorkflowTemplateOut(ORMModel):
+    id: str
+    project_id: str | None = None
+    name: str
+    description: str
+    tags: list[str] = []
+    graph_json: dict[str, Any]
+    is_system: bool = False
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 class RunRequest(BaseModel):

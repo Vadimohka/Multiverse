@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from workflow_engine import NODE_CATALOG, WorkflowEngine, validate_dag
@@ -43,6 +44,7 @@ from app.schemas import (
     RunOut,
     RunRequest,
     WorkflowCreate,
+    WorkflowImportRequest,
     WorkflowOut,
     WorkflowTemplateRequest,
     WorkflowUpdate,
@@ -52,6 +54,24 @@ from app.services.artifact_storage import ArtifactStorage
 
 router = APIRouter(prefix="/workflows", tags=["Workflows"])
 settings = get_settings()
+_LITERAL_URL = re.compile(r"https?://[^\s}]+", re.I)
+_SITE_MARKER = re.compile(r"(?:bcse|бвфб|press[-_]center|bcsenews)", re.I)
+
+
+def _is_legacy_site_workflow(workflow: Workflow) -> bool:
+    graph_text = json.dumps(workflow.graph_json, ensure_ascii=False)
+    if _SITE_MARKER.search(graph_text):
+        return True
+    for node in workflow.graph_json.get("nodes", []):
+        node_type = str(node.get("type") or "")
+        if node_type not in {"http_request", "browser_open", "download_file", "crawl_links"}:
+            continue
+        config = node.get("config") if isinstance(node.get("config"), dict) else {}
+        for key in ("url", "listing_url", "base_url"):
+            value = str(config.get(key) or "")
+            if _LITERAL_URL.search(value) and "{{source." not in value:
+                return True
+    return False
 
 
 @router.get("/catalog")
@@ -62,13 +82,20 @@ def node_catalog(_: User = Depends(get_current_user)) -> list[dict[str, Any]]:
 @router.get("", response_model=list[WorkflowOut])
 def list_workflows(
     project_id: str | None = None,
+    include_legacy: bool = False,
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ) -> list[Workflow]:
     stmt = select(Workflow).order_by(Workflow.updated_at.desc())
     if project_id:
         stmt = stmt.where(Workflow.project_id == project_id)
-    return list(db.scalars(stmt).all())
+    workflows = list(db.scalars(stmt).all())
+    # Source-bound workflows were created by old versions of the source wizard.
+    # Keep them for backwards compatibility, but do not confuse the main list:
+    # the normal operation model is one reusable workflow plus many sources.
+    if not include_legacy:
+        workflows = [workflow for workflow in workflows if not (workflow.graph_json.get("settings", {}) or {}).get("source_id") and not _is_legacy_site_workflow(workflow)]
+    return workflows
 
 
 @router.post("", response_model=WorkflowOut, status_code=201)
@@ -87,6 +114,32 @@ def create_workflow(
     db.commit()
     db.refresh(workflow)
     return workflow
+
+
+@router.post("/import", response_model=WorkflowOut, status_code=201)
+def import_workflow(payload: WorkflowImportRequest, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> Workflow:
+    graph = deepcopy(payload.graph_json)
+    graph.setdefault("settings", {}).pop("source_id", None)
+    errors = validate_dag(graph)
+    if errors:
+        raise HTTPException(status_code=422, detail=errors)
+    workflow = Workflow(project_id=payload.project_id, name=payload.name, description=payload.description, graph_json=graph)
+    db.add(workflow); db.flush()
+    audit(db, user.id, "IMPORT", "workflow", workflow.id, after={"name": workflow.name})
+    db.commit(); db.refresh(workflow)
+    return workflow
+
+
+@router.get("/{workflow_id}/export")
+def export_workflow(workflow_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> Response:
+    workflow = db.get(Workflow, workflow_id)
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    graph = deepcopy(workflow.graph_json)
+    graph.setdefault("settings", {}).pop("source_id", None)
+    payload = {"format": "parser-studio-workflow/v1", "name": workflow.name, "description": workflow.description, "graph_json": graph}
+    filename = "workflow-" + "".join(char if char.isalnum() else "-" for char in workflow.name.lower()).strip("-") + ".json"
+    return Response(content=json.dumps(payload, ensure_ascii=False, indent=2), media_type="application/json", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @router.post("/from-source", response_model=WorkflowOut, status_code=201)
@@ -193,15 +246,26 @@ def publish(
     errors = validate_dag(workflow.graph_json)
     if errors:
         raise HTTPException(status_code=422, detail=errors)
-    version = (workflow.published_version or 0) + 1
-    db.add(
-        WorkflowVersion(
-            workflow_id=workflow.id,
-            version=version,
-            graph_json=deepcopy(workflow.graph_json),
-            created_by=user.id,
+    # WorkflowVersion is the immutable draft revision created by PATCH.  A
+    # publication must point at that same revision, not at a separate counter:
+    # otherwise the counters eventually collide and a newly published graph can
+    # silently keep running an older snapshot.
+    version = workflow.version
+    published = db.scalar(
+        select(WorkflowVersion).where(
+            WorkflowVersion.workflow_id == workflow.id,
+            WorkflowVersion.version == version,
         )
     )
+    if published is None:
+        db.add(
+            WorkflowVersion(
+                workflow_id=workflow.id,
+                version=version,
+                graph_json=deepcopy(workflow.graph_json),
+                created_by=user.id,
+            )
+        )
     workflow.published_version = version
     audit(db, user.id, "PUBLISH", "workflow", workflow.id, after={"published_version": version})
     db.commit()
@@ -295,13 +359,6 @@ def _source_extractor_config(source: Source) -> dict[str, Any]:
     fields = [dict(item) for item in (fields or []) if isinstance(item, dict) and item.get("name") and item.get("selector")]
     if not fields and container_selector:
         fields = [{"name": "url", "selector": "a[href]", "attribute": "href"}]
-    # Belinvestbank keeps the product name and detail URL in the same link.
-    # Give this stable site markup the dataset-friendly name while preserving
-    # the profiler's selector and href extraction.
-    for index, field in enumerate(fields):
-        selector = str(field.get("selector") or "")
-        if field.get("name") == "title" and ("item-description-link" in selector or "deposit_name_" in selector):
-            fields[index] = {**field, "name": "product_name"}
     link_field = next((item for item in fields if item.get("name") in {"url", "link", "href"} and item.get("attribute") == "href"), None)
     if link_field and link_field.get("name") != "url":
         link_field = {**link_field, "name": "url"}
@@ -309,15 +366,6 @@ def _source_extractor_config(source: Source) -> dict[str, Any]:
     detail = configured.get("detail") if isinstance(configured.get("detail"), dict) else settings.get("detail")
     if not isinstance(detail, dict):
         detail = {}
-    if link_field and not detail.get("table"):
-        # Detail pages contain the published rate/term/currency table.  The
-        # node tolerates pages without a table, but when one exists it exposes
-        # stable aliases (rate/term/currency) alongside raw headings.
-        detail = {
-            **detail,
-            "table": {"selector": "table", "header_row": 0, "normalize_fields": True},
-            "field_names": ["rate", "term", "currency"],
-        }
     return {
         "container_selector": container_selector,
         "fields": fields,
@@ -462,8 +510,19 @@ def persist_result(db: Session, workflow: Workflow, run: Run, result: dict[str, 
         if schema_errors:
             return {"enabled": True, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0,
                     "blocked": True, "validation_errors": schema_errors}
-    review_policy = output_config.get("review_policy") or graph_settings.get("review_policy") or dataset.review_policy or {"new": False, "changed": False, "confidence_below": 0.0}
-    counters = {"enabled": True, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0}
+    # Merge the three policy levels so a dataset-wide quality setting is not
+    # accidentally discarded by a reusable workflow's output node.
+    review_policy = {
+        "new": False,
+        "changed": False,
+        "confidence_below": 0.0,
+        "sample_unchanged": 0,
+        **(dataset.review_policy or {}),
+        **(graph_settings.get("review_policy") or {}),
+        **(output_config.get("review_policy") or {}),
+    }
+    counters = {"enabled": True, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0, "sampled_for_review": 0}
+    unchanged_candidates: list[tuple[Record, dict[str, Any]]] = []
     for item in payload:
         if not isinstance(item, dict):
             continue
@@ -484,6 +543,7 @@ def persist_result(db: Session, workflow: Workflow, run: Run, result: dict[str, 
             continue
         if record.data_hash == data_hash:
             counters["unchanged"] += 1
+            unchanged_candidates.append((record, item))
             continue
         requires_review = bool(review_policy.get("changed", True) or item.get("requires_review") or confidence < float(review_policy.get("confidence_below", 0.8)))
         next_version = record.current_version + 1
@@ -498,6 +558,30 @@ def persist_result(db: Session, workflow: Workflow, run: Run, result: dict[str, 
             record.confidence = confidence
             record.review_status = "APPROVED"
         counters["updated"] += 1
+    # A recurring sample catches a broken selector or extraction regression even
+    # when the content hash has not changed. Ordering varies by run so repeated
+    # scheduled checks eventually cover a whole source.
+    try:
+        sample_size = max(0, int(review_policy.get("sample_unchanged", 0) or 0))
+    except (TypeError, ValueError):
+        sample_size = 0
+    if sample_size and unchanged_candidates:
+        sample = sorted(
+            unchanged_candidates,
+            key=lambda candidate: hashlib.sha256(f"{run.id}|{candidate[0].natural_key}".encode()).hexdigest(),
+        )[:sample_size]
+        for record, item in sample:
+            db.add(ReviewTask(
+                project_id=workflow.project_id,
+                record_id=record.id,
+                run_id=run.id,
+                reason="SAMPLED_RECORD",
+                old_data=item,
+                new_data=item,
+                evidence=evidence_from_item(item),
+            ))
+        counters["review_tasks"] += len(sample)
+        counters["sampled_for_review"] = len(sample)
     return counters
 
 
@@ -582,8 +666,10 @@ def build_execution_variables(db: Session, source: Source | None) -> tuple[dict[
     variables: dict[str, Any] = {
         "source": {
             "id": source.id if source else None,
+            "name": source.name if source else "",
             "url": source.entry_url if source else "",
             "base_url": source.base_url if source else "",
+            "fetch_mode": source.fetch_mode if source else "",
             "settings": source.settings if source else {},
         },
         "deepseek_base_url": settings.deepseek_base_url,
@@ -704,6 +790,8 @@ async def run_workflow(
     workflow = db.get(Workflow, workflow_id)
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow не найден")
+    if _is_legacy_site_workflow(workflow):
+        raise HTTPException(status_code=422, detail="Этот workflow содержит legacy-привязку к сайту. Создайте копию системного универсального шаблона и выберите источник запуска.")
     source_id = payload.source_id or workflow.graph_json.get("settings", {}).get("source_id")
     if source_id and not db.get(Source, source_id):
         raise HTTPException(status_code=404, detail="Источник не найден")
@@ -713,6 +801,9 @@ async def run_workflow(
     if payload.use_published and not workflow.published_version:
         raise HTTPException(status_code=422, detail="Опубликованная версия отсутствует: сначала нажмите «Опубликовать»")
     run_version = workflow.published_version if payload.use_published else workflow.version
+    graph = active_graph(db, workflow, run_version)
+    if "{{source." in json.dumps(graph, ensure_ascii=False) and not source_id:
+        raise HTTPException(status_code=422, detail="Выберите источник запуска: этот workflow использует URL источника")
     try:
         zone = ZoneInfo(payload.timezone)
     except Exception as exc:
@@ -736,6 +827,56 @@ async def run_workflow(
     return run
 
 
+@router.post("/{workflow_id}/run-all", response_model=list[RunOut], status_code=201)
+async def run_workflow_for_all_sources(
+    workflow_id: str,
+    payload: RunRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER", "OPERATOR")),
+) -> list[Run]:
+    """Queue one independent run for every public, enabled source of the workflow project.
+
+    A batch is deliberately represented as normal runs: it preserves per-site
+    raw artifacts, failures and retry controls while writing all results into
+    the workflow's single output dataset.
+    """
+    workflow = db.get(Workflow, workflow_id)
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    if payload.use_published and not workflow.published_version:
+        raise HTTPException(status_code=422, detail="Published workflow is required")
+    try:
+        zone = ZoneInfo(payload.timezone)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="Invalid timezone") from exc
+    clock = datetime.now(zone)
+    if payload.run_clock_mode == "manual":
+        if payload.run_at is None:
+            raise HTTPException(status_code=422, detail="Manual run requires a date and time")
+        clock = payload.run_at.replace(tzinfo=zone) if payload.run_at.tzinfo is None else payload.run_at.astimezone(zone)
+    sources = list(db.scalars(select(Source).where(Source.project_id == workflow.project_id, Source.enabled.is_(True))).all())
+    sources = [source for source in sources if (source.settings or {}).get("access_status", "PUBLIC") == "PUBLIC"]
+    if not sources:
+        raise HTTPException(status_code=422, detail="No public enabled sources in this project")
+    run_version = workflow.published_version if payload.use_published else workflow.version
+    runs = [
+        Run(
+            workflow_id=workflow.id,
+            workflow_version=run_version,
+            source_id=source.id,
+            input_json={**payload.inputs, "batch": True, "_run_clock": {"mode": payload.run_clock_mode, "timezone": payload.timezone, "effective": clock.isoformat()}},
+            created_by=user.id,
+        )
+        for source in sources
+    ]
+    db.add_all(runs)
+    db.commit()
+    for run in runs:
+        db.refresh(run)
+        enqueue_run(run.id)
+    return runs
+
+
 def enqueue_run(run_id: str) -> None:
     from celery import Celery
     celery = Celery("parser_studio_client", broker=settings.redis_url)
@@ -744,8 +885,11 @@ def enqueue_run(run_id: str) -> None:
         run = db.get(Run, run_id)
         workflow = db.get(Workflow, run.workflow_id) if run else None
         graph = active_graph(db, workflow, run.workflow_version) if run and workflow else {}
+        source = db.get(Source, run.source_id) if run and run.source_id else None
         node_types = {node.get("type") or node.get("data", {}).get("type") for node in graph.get("nodes", [])}
-        queue = "browser" if "browser_open" in node_types else "documents" if node_types & {"parse_document", "download_file"} else "llm" if node_types & {"llm_extract", "llm_classify"} else "exports" if "export_file" in node_types else "default"
+        source_profile = (source.settings or {}).get("profile", {}) if source else {}
+        needs_browser = bool(source_profile.get("requires_javascript")) or (source.fetch_mode or "").upper() == "PLAYWRIGHT" if source else False
+        queue = "browser" if needs_browser or "browser_open" in node_types else "documents" if node_types & {"parse_document", "download_file"} else "llm" if node_types & {"llm_extract", "llm_classify"} else "exports" if "export_file" in node_types else "default"
     finally:
         db.close()
     celery.send_task("parser_studio.execute_run", args=[run_id], queue=queue)
