@@ -229,6 +229,9 @@ class Record(Base, TimestampMixin):
 
 class RecordVersion(Base):
     __tablename__ = "record_versions"
+    __table_args__ = (
+        Index("uq_record_version_number", "record_id", "version_number", unique=True),
+    )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
     record_id: Mapped[str] = mapped_column(ForeignKey("records.id", ondelete="CASCADE"), index=True)
     run_id: Mapped[str | None] = mapped_column(ForeignKey("runs.id"), nullable=True)

@@ -5,9 +5,11 @@ import pytest
 from openpyxl import Workbook
 from workflow_engine import WorkflowEngine
 from workflow_engine.nodes import (
+    BrowserOpenNode,
     CrawlLinksNode,
     FormulaNode,
     LLMExtractNode,
+    MappingNode,
     ParseDocumentNode,
     ParseTableNode,
     collect_paginated_html,
@@ -184,6 +186,114 @@ async def test_crawl_links_filters_and_deduplicates_json_items():
     node = CrawlLinksNode()
     items = node._listing_items({"tabs": [{"contents": [{"url": "press-center/news/n010120261"}]}]}, {"items_path": "tabs.0.contents"})
     assert items == [{"url": "press-center/news/n010120261"}]
+
+
+@pytest.mark.asyncio
+async def test_playwright_detail_does_not_require_successful_http_probe(monkeypatch):
+    browser_urls: list[str] = []
+
+    async def browser_execute(_self, _context, _inputs, config):
+        browser_urls.append(config["url"])
+        return {
+            "url": config["url"],
+            "html": "<main><h1>Browser-only detail</h1></main>",
+        }
+
+    async def forbidden_http_get(*_args, **_kwargs):
+        raise AssertionError("detail HTTP must not run in explicit PLAYWRIGHT mode")
+
+    monkeypatch.setattr(BrowserOpenNode, "execute", browser_execute)
+    monkeypatch.setattr("httpx.AsyncClient.get", forbidden_http_get)
+    result = await CrawlLinksNode().execute(
+        context(),
+        {
+            "url": "https://example.test/list",
+            "records": [{"url": "https://example.test/details/one"}],
+        },
+        {
+            "input_path": "records",
+            "url_path": "url",
+            "detail_fetch_mode": "PLAYWRIGHT",
+            "detail_fields": [{"name": "title", "selector": "h1"}],
+            "save_artifacts": False,
+            "delay_ms": 0,
+        },
+    )
+
+    assert browser_urls == ["https://example.test/details/one"]
+    assert result["errors"] == []
+    assert result["records"][0]["title"] == "Browser-only detail"
+
+
+@pytest.mark.asyncio
+async def test_explicit_http_listing_overrides_browser_source_profile(monkeypatch):
+    class Response:
+        url = "https://example.test/list"
+        content = b"<main></main>"
+        text = "<main></main>"
+        headers = {"content-type": "text/html"}
+
+        def raise_for_status(self):
+            return None
+
+    async def http_get(_self, _url, params=None):
+        return Response()
+
+    async def forbidden_browser(*_args, **_kwargs):
+        raise AssertionError("explicit HTTP listing must not open a browser")
+
+    monkeypatch.setattr("httpx.AsyncClient.get", http_get)
+    monkeypatch.setattr(BrowserOpenNode, "execute", forbidden_browser)
+    execution = context()
+    execution.variables["source"] = {
+        "fetch_mode": "PLAYWRIGHT",
+        "settings": {"profile": {"requires_javascript": True}},
+    }
+
+    listing, url = await CrawlLinksNode()._load_listing(
+        execution,
+        {},
+        {
+            "listing_url": "https://example.test/list",
+            "listing_fetch_mode": "HTTP",
+            "save_artifacts": False,
+        },
+    )
+
+    assert listing == "<main></main>"
+    assert url == "https://example.test/list"
+
+
+@pytest.mark.asyncio
+async def test_mapping_preserves_internal_record_provenance():
+    artifact = {"sha256": "a" * 64, "url": "https://example.test/details/one"}
+
+    result = await MappingNode().execute(
+        context(),
+        {
+            "records": [
+                {
+                    "external_id": "one",
+                    "title": "Mapped",
+                    "__provenance": {"raw_artifact": artifact},
+                }
+            ]
+        },
+        {
+            "fields": [
+                {"target": "external_id", "source_path": "external_id"},
+                {"target": "title", "source_path": "title"},
+            ]
+        },
+    )
+
+    assert result["records"] == [
+        {
+            "external_id": "one",
+            "title": "Mapped",
+            "__provenance": {"raw_artifact": artifact},
+        }
+    ]
 
 
 def test_llm_record_deduplication_uses_payload_or_configured_keys():

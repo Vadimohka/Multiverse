@@ -545,44 +545,54 @@ class CrawlLinksNode:
                 if context.cancelled:
                     return
                 async with semaphore:
-                    response: httpx.Response | None = None
+                    detail_url = candidate["url"]
+                    detail_html = ""
+                    artifact_content = b""
+                    artifact_content_type = "text/html"
                     error: Exception | None = None
-                    for attempt in range(retries + 1):
-                        try:
-                            response = await client.get(candidate["url"])
-                            response.raise_for_status()
-                            break
-                        except Exception as exc:  # request failures are reported per item, not hidden
-                            error = exc
-                            if attempt < retries:
-                                await asyncio.sleep(min(0.5 * (attempt + 1), 2))
-                    if response is None or not response.is_success:
-                        async with record_lock:
-                            errors.append({"url": candidate["url"], "record_id": candidate["record_id"], "error": str(error or "HTTP request failed")})
-                        return
-                    # Rendering is selected only through the node/source
-                    # configuration.  No site-specific endpoint protocol is
-                    # embedded in the crawler.
-                    detail_url = str(response.url)
-                    detail_html = response.text
-                    artifact_content = response.content
-                    artifact_content_type = response.headers.get("content-type", "text/html")
                     if self._detail_uses_browser(context, config):
-                        try:
-                            rendered = await BrowserOpenNode().execute(context, inputs, {
-                                "url": detail_url, "wait_until": config.get("detail_wait_until", "networkidle"),
-                                "timeout": config.get("request_timeout", 45), "headers": headers,
-                                "capture_network": False, "full_page": False, "http_fallback": False,
-                            })
-                            detail_url = str(rendered.get("url") or detail_url)
-                            detail_html = str(rendered.get("html") or rendered.get("body") or detail_html)
-                            artifact_content = detail_html.encode("utf-8")
-                            artifact_content_type = "text/html"
-                        except Exception as exc:
-                            # The first HTTP response is still a valid, useful
-                            # fallback.  A browser problem on one card must not
-                            # discard the whole fan-out batch.
-                            context.log("WARNING", "Detail browser render failed; using HTTP response", url=detail_url, error=str(exc))
+                        rendered: dict[str, Any] | None = None
+                        for attempt in range(retries + 1):
+                            try:
+                                # Explicit browser transport must not depend on
+                                # a successful direct HTTP probe. Some sites
+                                # intentionally reject non-browser requests.
+                                rendered = await BrowserOpenNode().execute(context, inputs, {
+                                    "url": candidate["url"], "wait_until": config.get("detail_wait_until", "networkidle"),
+                                    "timeout": config.get("request_timeout", 45), "headers": headers,
+                                    "capture_network": False, "full_page": False, "http_fallback": False,
+                                })
+                                break
+                            except Exception as exc:
+                                error = exc
+                                if attempt < retries:
+                                    await asyncio.sleep(min(0.5 * (attempt + 1), 2))
+                        if rendered is None:
+                            async with record_lock:
+                                errors.append({"url": candidate["url"], "record_id": candidate["record_id"], "error": str(error or "Browser request failed")})
+                            return
+                        detail_url = str(rendered.get("url") or candidate["url"])
+                        detail_html = str(rendered.get("html") or rendered.get("body") or "")
+                        artifact_content = detail_html.encode("utf-8")
+                    else:
+                        response: httpx.Response | None = None
+                        for attempt in range(retries + 1):
+                            try:
+                                response = await client.get(candidate["url"])
+                                response.raise_for_status()
+                                break
+                            except Exception as exc:  # request failures are reported per item, not hidden
+                                error = exc
+                                if attempt < retries:
+                                    await asyncio.sleep(min(0.5 * (attempt + 1), 2))
+                        if response is None or not response.is_success:
+                            async with record_lock:
+                                errors.append({"url": candidate["url"], "record_id": candidate["record_id"], "error": str(error or "HTTP request failed")})
+                            return
+                        detail_url = str(response.url)
+                        detail_html = response.text
+                        artifact_content = response.content
+                        artifact_content_type = response.headers.get("content-type", "text/html")
                     artifact: dict[str, Any] | None = None
                     if config.get("save_artifacts", True):
                         artifact_id = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(candidate["record_id"]))
@@ -665,7 +675,11 @@ class CrawlLinksNode:
         profile = source_settings.get("profile") if isinstance(source_settings.get("profile"), dict) else {}
         source_fetch_mode = str(source.get("fetch_mode") or source_settings.get("fetch_mode") or "").upper() if isinstance(source, dict) else ""
         listing_fetch_mode = str(config.get("listing_fetch_mode") or "").upper()
-        if listing_fetch_mode == "PLAYWRIGHT" or source_fetch_mode == "PLAYWRIGHT" or profile.get("requires_javascript"):
+        listing_uses_browser = listing_fetch_mode == "PLAYWRIGHT" or (
+            listing_fetch_mode in {"", "AUTO"}
+            and (source_fetch_mode == "PLAYWRIGHT" or profile.get("requires_javascript"))
+        )
+        if listing_uses_browser:
             rendered = await BrowserOpenNode().execute(
                 context,
                 inputs,
@@ -1045,6 +1059,9 @@ class MappingNode:
                 if spec.get("required") and result in (None, ""):
                     errors.append({"row": index, "field": target, "code": "REQUIRED"})
                 record[target] = result
+            provenance = source.get("__provenance")
+            if isinstance(provenance, dict):
+                record["__provenance"] = provenance
             records.append(record)
         return {"records": records, "count": len(records), "mapping_errors": errors,
                 "business_records": True, "schema_preview": records[:5]}
@@ -1480,7 +1497,7 @@ def extract_article_record(
         record["fetched_at"] = candidate.get("fetched_at") or datetime.now(UTC).isoformat()
         record["url"] = canonical_url(page_url, list(config.get("drop_query_params") or []))
         if artifact:
-            record["raw_artifact"] = artifact
+            record["__provenance"] = {"raw_artifact": artifact}
         return record
     title_selector = str(config.get("title_selector") or "")
     title = select_text(soup, title_selector) if title_selector else ""
@@ -1538,6 +1555,8 @@ def extract_article_record(
     # depend on a particular field name.
     if candidate.get("news_id"):
         record["news_id"] = candidate["news_id"]
+    if artifact:
+        record["__provenance"] = {"raw_artifact": artifact}
     return record
 
 

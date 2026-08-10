@@ -17,6 +17,7 @@ from app.dependencies import (
     get_current_user,
     get_data_principal,
     require_roles,
+    role_names,
 )
 from app.enums import SUCCESSFUL_RUN_STATUSES
 from app.models import (
@@ -147,8 +148,10 @@ def list_records(
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset не найден")
     authorize_dataset_read(principal, dataset.id)
-    if include_pending and principal.api_token:
-        raise HTTPException(status_code=403, detail="Read-only API token cannot access pending records")
+    if include_pending and (
+        principal.api_token or not role_names(principal.user).intersection({"ADMINISTRATOR", "OPERATOR"})
+    ):
+        raise HTTPException(status_code=403, detail="Pending records require a review role")
     if view not in {"current", "latest_run", "run", "history"}:
         raise HTTPException(status_code=422, detail="view must be current, latest_run, run or history")
     if time_basis not in {"source_published_at", "source_modified_at", "fetched_at", "observed_at"}:
@@ -213,7 +216,7 @@ def list_records(
             rows.append((record, version, observation))
 
     filtered = [row for row in rows if observation_matches_time(row[2], time_basis, from_, to)]
-    filtered.sort(key=lambda row: observation_sort_key(row[2], time_basis, row[0]), reverse=sort == "desc")
+    sort_observation_rows(filtered, time_basis, sort)
     total = len(filtered)
     cursor_context = {
         "dataset_id": dataset.id,
@@ -223,16 +226,17 @@ def list_records(
         "from": iso_utc(from_),
         "to": iso_utc(to),
         "sort": sort,
+        "include_pending": include_pending,
     }
     if cursor:
         cursor_payload = decode_cursor(cursor)
         if cursor_payload.get("context") != cursor_context:
             raise HTTPException(status_code=400, detail="Cursor does not match request filters")
-        cursor_key = (datetime.fromisoformat(cursor_payload["timestamp"].replace("Z", "+00:00")), cursor_payload["id"])
-        if sort == "desc":
-            filtered = [row for row in filtered if observation_sort_key(row[2], time_basis, row[0]) < cursor_key]
-        else:
-            filtered = [row for row in filtered if observation_sort_key(row[2], time_basis, row[0]) > cursor_key]
+        cursor_key = (cursor_payload["null_rank"], cursor_payload["parsed_timestamp"], cursor_payload["id"])
+        filtered = [
+            row for row in filtered
+            if observation_key_is_after(observation_sort_key(row[2], time_basis, row[0]), cursor_key, sort)
+        ]
     page_limit = min(max(limit, 1), 1000)
     start = max(offset, 0) if not cursor else 0
     page = filtered[start:start + page_limit]
@@ -304,10 +308,36 @@ def observation_sort_key(
     observation: RecordObservation | None,
     time_basis: str,
     record: Record,
-) -> tuple[datetime, str]:
-    value = getattr(observation, time_basis) if observation else None
-    value = ensure_utc(value) if value else ensure_utc(record.created_at)
-    return value, observation.id if observation else record.id
+) -> tuple[int, datetime, str]:
+    if observation is None:
+        return 0, ensure_utc(record.created_at), record.id
+    value = getattr(observation, time_basis)
+    if value is None:
+        return 1, datetime.min.replace(tzinfo=UTC), observation.id
+    return 0, ensure_utc(value), observation.id
+
+
+def sort_observation_rows(
+    rows: list[tuple[Record, RecordVersion | None, RecordObservation | None]],
+    time_basis: str,
+    direction: str,
+) -> None:
+    # The stable second sort keeps NULL timestamps last for both directions.
+    rows.sort(
+        key=lambda row: observation_sort_key(row[2], time_basis, row[0])[1:],
+        reverse=direction == "desc",
+    )
+    rows.sort(key=lambda row: observation_sort_key(row[2], time_basis, row[0])[0])
+
+
+def observation_key_is_after(
+    key: tuple[int, datetime, str],
+    cursor_key: tuple[int, datetime, str],
+    direction: str,
+) -> bool:
+    if key[0] != cursor_key[0]:
+        return key[0] > cursor_key[0]
+    return key[1:] < cursor_key[1:] if direction == "desc" else key[1:] > cursor_key[1:]
 
 
 def record_api_item(
@@ -353,8 +383,16 @@ def encode_cursor(
     time_basis: str,
     context: dict,
 ) -> str:
-    timestamp, item_id = observation_sort_key(row[2], time_basis, row[0])
-    raw = json.dumps({"timestamp": iso_utc(timestamp), "id": item_id, "context": context}, separators=(",", ":")).encode()
+    null_rank, timestamp, item_id = observation_sort_key(row[2], time_basis, row[0])
+    raw = json.dumps(
+        {
+            "null_rank": null_rank,
+            "timestamp": None if null_rank else iso_utc(timestamp),
+            "id": item_id,
+            "context": context,
+        },
+        separators=(",", ":"),
+    ).encode()
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
@@ -362,8 +400,24 @@ def decode_cursor(cursor: str) -> dict:
     try:
         padding = "=" * (-len(cursor) % 4)
         value = json.loads(base64.urlsafe_b64decode(cursor + padding))
-        if not isinstance(value, dict) or not {"timestamp", "id", "context"} <= value.keys():
+        if not isinstance(value, dict) or not {"null_rank", "timestamp", "id", "context"} <= value.keys():
             raise ValueError
+        if value["null_rank"] not in {0, 1} or not isinstance(value["id"], str) or not value["id"]:
+            raise ValueError
+        if not isinstance(value["context"], dict):
+            raise ValueError
+        if value["null_rank"] == 1:
+            if value["timestamp"] is not None:
+                raise ValueError
+            parsed = datetime.min.replace(tzinfo=UTC)
+        else:
+            if not isinstance(value["timestamp"], str):
+                raise ValueError
+            parsed = datetime.fromisoformat(value["timestamp"].replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError
+            parsed = parsed.astimezone(UTC)
+        value["parsed_timestamp"] = parsed
         return value
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid cursor") from exc

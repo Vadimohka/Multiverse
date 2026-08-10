@@ -8,7 +8,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Response
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from workflow_engine import NODE_CATALOG, WorkflowEngine, validate_dag
 from workflow_engine.nodes import validate_json_schema
@@ -53,6 +53,7 @@ from app.schemas import (
 )
 from app.security import decrypt_secret
 from app.services.artifact_storage import ArtifactStorage
+from app.services.run_routing import queue_for_graph
 
 router = APIRouter(prefix="/workflows", tags=["Workflows"])
 settings = get_settings()
@@ -452,7 +453,8 @@ def persist_result(db: Session, workflow: Workflow, run: Run, result: dict[str, 
         return {"enabled": False, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0}
     dataset = db.get(Dataset, dataset_id)
     if not dataset:
-        return {"enabled": False, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0, "warning": "Dataset не найден"}
+        return {"enabled": True, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0,
+                "blocked": True, "warning": "Configured dataset was not found"}
     output = result.get("result", {})
     preflight = output.get("preflight") if isinstance(output, dict) else None
     if not isinstance(preflight, dict) or not output.get("business_records"):
@@ -465,7 +467,8 @@ def persist_result(db: Session, workflow: Workflow, run: Run, result: dict[str, 
     if isinstance(payload, dict):
         payload = [payload]
     if not isinstance(payload, list):
-        return {"enabled": True, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0, "warning": "Output records is not a list"}
+        return {"enabled": True, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0,
+                "blocked": True, "warning": "Output records is not a list"}
     key_fields = output_config.get("natural_key_fields") or graph_settings.get("natural_key_fields") or dataset.natural_key_fields or []
     if isinstance(key_fields, str):
         key_fields = [item.strip() for item in key_fields.split(",") if item.strip()]
@@ -477,13 +480,35 @@ def persist_result(db: Session, workflow: Workflow, run: Run, result: dict[str, 
     if missing_keys:
         return {"enabled": True, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0,
                 "blocked": True, "validation_errors": missing_keys}
+    natural_key_rows: dict[str, list[int]] = {}
+    for index, item in enumerate(payload):
+        if not isinstance(item, dict):
+            continue
+        natural_key = "|".join(str(item.get(key, "")) for key in key_fields)
+        natural_key_rows.setdefault(natural_key, []).append(index)
+    duplicate_keys = [
+        {"code": "DUPLICATE_NATURAL_KEY", "natural_key": natural_key, "rows": rows}
+        for natural_key, rows in natural_key_rows.items()
+        if len(rows) > 1
+    ]
+    if duplicate_keys:
+        return {
+            "enabled": True,
+            "created": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "review_tasks": 0,
+            "blocked": True,
+            "warning": "Duplicate natural keys in one run",
+            "validation_errors": duplicate_keys,
+        }
     if dataset.schema_id:
         schema = db.get(DataSchema, dataset.schema_id)
         schema_errors: list[dict[str, Any]] = []
         if schema:
             for index, item in enumerate(payload):
                 try:
-                    validate_json_schema(item, schema.schema_json)
+                    validate_json_schema(business_record(item), schema.schema_json)
                 except ValueError as exc:
                     schema_errors.append({"row": index, "code": "SCHEMA", "message": str(exc)})
         if schema_errors:
@@ -505,21 +530,26 @@ def persist_result(db: Session, workflow: Workflow, run: Run, result: dict[str, 
     for item in payload:
         if not isinstance(item, dict):
             continue
+        business_item = business_record(item)
         natural_key = "|".join(str(item.get(key, "")) for key in key_fields) if key_fields else hashlib.sha256(json.dumps(item, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
-        data_hash = stable_record_hash(item)
-        confidence = float(item.get("confidence", 1.0) or 0)
-        record = db.scalar(select(Record).where(Record.dataset_id == dataset_id, Record.natural_key == natural_key))
+        data_hash = stable_record_hash(business_item)
+        confidence = float(business_item.get("confidence", 1.0) or 0)
+        record = db.scalar(
+            select(Record)
+            .where(Record.dataset_id == dataset_id, Record.natural_key == natural_key)
+            .with_for_update()
+        )
         if record is None:
-            requires_review = bool(review_policy.get("new", True) or item.get("requires_review") or confidence < float(review_policy.get("confidence_below", 0.8)))
-            record = Record(dataset_id=dataset_id, natural_key=natural_key, current_version=1, data_json=item, data_hash=data_hash, confidence=confidence, review_status="PENDING" if requires_review else "APPROVED")
+            requires_review = bool(review_policy.get("new", True) or business_item.get("requires_review") or confidence < float(review_policy.get("confidence_below", 0.8)))
+            record = Record(dataset_id=dataset_id, natural_key=natural_key, current_version=1, data_json=business_item, data_hash=data_hash, confidence=confidence, review_status="PENDING" if requires_review else "APPROVED")
             db.add(record)
             db.flush()
-            version = RecordVersion(record_id=record.id, run_id=run.id, version_number=1, data_json=item, data_hash=data_hash, confidence=confidence, review_status=record.review_status)
+            version = RecordVersion(record_id=record.id, run_id=run.id, version_number=1, data_json=business_item, data_hash=data_hash, confidence=confidence, review_status=record.review_status)
             db.add(version)
             db.flush()
             add_record_observation(db, dataset, record, version, run, item, content_changed=True)
             if requires_review:
-                db.add(ReviewTask(project_id=workflow.project_id, record_id=record.id, run_id=run.id, reason="NEW_RECORD", old_data={}, new_data=item, evidence=evidence_from_item(item)))
+                db.add(ReviewTask(project_id=workflow.project_id, record_id=record.id, run_id=run.id, reason="NEW_RECORD", old_data={}, new_data=business_item, evidence=evidence_from_item(item)))
                 counters["review_tasks"] += 1
             counters["created"] += 1
             continue
@@ -533,19 +563,21 @@ def persist_result(db: Session, workflow: Workflow, run: Run, result: dict[str, 
                 raise ValueError(f"Current version is missing for record {record.id}")
             add_record_observation(db, dataset, record, version, run, item, content_changed=False)
             counters["unchanged"] += 1
-            unchanged_candidates.append((record, item))
+            unchanged_candidates.append((record, business_item))
             continue
-        requires_review = bool(review_policy.get("changed", True) or item.get("requires_review") or confidence < float(review_policy.get("confidence_below", 0.8)))
-        next_version = record.current_version + 1
-        version = RecordVersion(record_id=record.id, run_id=run.id, version_number=next_version, data_json=item, data_hash=data_hash, confidence=confidence, review_status="PENDING" if requires_review else "APPROVED")
+        requires_review = bool(review_policy.get("changed", True) or business_item.get("requires_review") or confidence < float(review_policy.get("confidence_below", 0.8)))
+        next_version = (
+            db.scalar(select(func.max(RecordVersion.version_number)).where(RecordVersion.record_id == record.id)) or 0
+        ) + 1
+        version = RecordVersion(record_id=record.id, run_id=run.id, version_number=next_version, data_json=business_item, data_hash=data_hash, confidence=confidence, review_status="PENDING" if requires_review else "APPROVED")
         db.add(version)
         db.flush()
         add_record_observation(db, dataset, record, version, run, item, content_changed=True)
         if requires_review:
-            db.add(ReviewTask(project_id=workflow.project_id, record_id=record.id, run_id=run.id, reason="CHANGED_RECORD", old_data=record.data_json, new_data=item, evidence=evidence_from_item(item)))
+            db.add(ReviewTask(project_id=workflow.project_id, record_id=record.id, run_id=run.id, reason="CHANGED_RECORD", old_data=record.data_json, new_data=business_item, evidence=evidence_from_item(item)))
             counters["review_tasks"] += 1
         else:
-            record.data_json = item
+            record.data_json = business_item
             record.data_hash = data_hash
             record.current_version = next_version
             record.confidence = confidence
@@ -625,21 +657,25 @@ def metadata_datetime(value: Any) -> datetime | None:
     else:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
+        return None
     return parsed.astimezone(UTC)
 
 
 def raw_document_for_item(db: Session, run_id: str, item: dict[str, Any]) -> RawDocument | None:
-    explicit_id = item.get("raw_document_id")
+    provenance = item.get("__provenance") if isinstance(item.get("__provenance"), dict) else {}
+    explicit_id = provenance.get("raw_document_id") or item.get("raw_document_id")
     if explicit_id:
         document = db.get(RawDocument, str(explicit_id))
         if document and document.run_id == run_id:
             return document
-    artifact = item.get("raw_artifact") if isinstance(item.get("raw_artifact"), dict) else {}
+    artifact = provenance.get("raw_artifact") if isinstance(provenance.get("raw_artifact"), dict) else (
+        item.get("raw_artifact") if isinstance(item.get("raw_artifact"), dict) else {}
+    )
     sha256 = artifact.get("sha256")
+    if not sha256:
+        return None
     stmt = select(RawDocument).where(RawDocument.run_id == run_id)
-    if sha256:
-        stmt = stmt.where(RawDocument.sha256 == str(sha256))
+    stmt = stmt.where(RawDocument.sha256 == str(sha256))
     return db.scalar(stmt.order_by(RawDocument.created_at.desc()))
 
 
@@ -715,6 +751,15 @@ def stable_record_hash(item: dict[str, Any]) -> str:
     volatile = {"fetched_at", "observed_at", "evidence", "raw_artifact", "status_code", "artifacts"}
     comparable = {key: value for key, value in item.items() if key not in volatile}
     return hashlib.sha256(json.dumps(comparable, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def business_record(item: dict[str, Any]) -> dict[str, Any]:
+    """Remove engine-owned side channels before schema validation and storage."""
+    return {
+        key: value
+        for key, value in item.items()
+        if not key.startswith("__") and key not in {"raw_artifact", "raw_document_id"}
+    }
 
 
 def active_graph(db: Session, workflow: Workflow, workflow_version: int) -> dict[str, Any]:
@@ -838,10 +883,12 @@ async def execute_run(run_id: str) -> None:
         run.finished_at = datetime.now(UTC)
         db.commit()
     except Exception as exc:
-        if run:
-            run.status = "FAILED"
-            run.error_json = {"code": "WORKFLOW_ERROR", "message": str(exc)}
-            run.finished_at = datetime.now(UTC)
+        db.rollback()
+        failed_run = db.get(Run, run_id)
+        if failed_run:
+            failed_run.status = "FAILED"
+            failed_run.error_json = {"code": "WORKFLOW_ERROR", "message": str(exc)}
+            failed_run.finished_at = datetime.now(UTC)
             db.commit()
     finally:
         db.close()
@@ -951,10 +998,7 @@ def enqueue_run(run_id: str) -> None:
         workflow = db.get(Workflow, run.workflow_id) if run else None
         graph = active_graph(db, workflow, run.workflow_version) if run and workflow else {}
         source = db.get(Source, run.source_id) if run and run.source_id else None
-        node_types = {node.get("type") or node.get("data", {}).get("type") for node in graph.get("nodes", [])}
-        source_profile = (source.settings or {}).get("profile", {}) if source else {}
-        needs_browser = bool(source_profile.get("requires_javascript")) or (source.fetch_mode or "").upper() == "PLAYWRIGHT" if source else False
-        queue = "browser" if needs_browser or "browser_open" in node_types else "documents" if node_types & {"parse_document", "download_file"} else "llm" if node_types & {"llm_extract", "llm_classify"} else "exports" if "export_file" in node_types else "default"
+        queue = queue_for_graph(graph, source)
     finally:
         db.close()
     celery.send_task("parser_studio.execute_run", args=[run_id], queue=queue)
