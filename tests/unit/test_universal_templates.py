@@ -44,7 +44,9 @@ def test_clean_graph_removes_site_specific_crawl_settings():
     assert crawl["listing_url"] == ""
     assert crawl["items_path"] == ""
     assert crawl["url_pattern"] == ""
-    assert crawl["source_name"] == "{{source.name}}"
+    assert crawl["detail_fields"] == []
+    assert crawl["detail_constants"] == {}
+    assert "source_name" not in crawl
     assert validate["schema"] == {}
     assert validate["required"] == []
     assert validate["fail_on_error"] is False

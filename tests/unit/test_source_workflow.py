@@ -26,18 +26,40 @@ def test_profiler_detects_belinvest_service_cards_and_detail_links():
     suggestion = build_extractor_suggestion(candidates)
 
     assert suggestion["container_selector"] == ".services-item.js-service-item"
+
+
+def test_profiler_prefers_extractable_record_container_over_repeated_link():
+    html = """
+    <main>
+      <article class="entry-card x9k2"><a class="detail-target" href="/one">One</a><p class="summary-text">Alpha</p></article>
+      <article class="entry-card x9k2"><a class="detail-target" href="/two">Two</a><p class="summary-text">Beta</p></article>
+      <article class="entry-card x9k2"><a class="detail-target" href="/three">Three</a><p class="summary-text">Gamma</p></article>
+    </main>
+    """
+
+    candidates = detect_repeating_candidates(BeautifulSoup(html, "lxml"))
+    suggestion = build_extractor_suggestion(candidates)
+
+    assert suggestion["container_selector"] == ".entry-card.x9k2"
+    containers = BeautifulSoup(html, "lxml").select(suggestion["container_selector"])
+    assert containers
+    assert all(
+        container.select_one(field["selector"]) is not None
+        for container in containers
+        for field in suggestion["fields"]
+    )
     assert {field["name"] for field in suggestion["fields"]} >= {"url", "title"}
     assert next(field for field in suggestion["fields"] if field["name"] == "url")["attribute"] == "href"
     assert suggestion["follow_links"] is True
 
 
-def test_source_template_uses_profile_detail_table_and_natural_key():
+def test_source_template_preserves_profile_fields_and_natural_key():
     profile = {
         "extractor": {
-            "container_selector": ".services-item.js-service-item",
+            "container_selector": ".entry-card.x9k2",
             "fields": [
-                {"name": "url", "selector": ".item-description-link", "attribute": "href"},
-                {"name": "title", "selector": ".item-description-link"},
+                {"name": "url", "selector": ".detail-target", "attribute": "href"},
+                {"name": "title", "selector": ".detail-target"},
             ],
             "follow_links": True,
         }
@@ -48,18 +70,14 @@ def test_source_template_uses_profile_detail_table_and_natural_key():
     nodes = {node["id"]: node for node in graph["nodes"]}
 
     extract = nodes["extract"]["config"]
-    assert extract["container_selector"] == ".services-item.js-service-item"
-    assert {field["name"] for field in extract["fields"]} == {"url", "product_name"}
-    assert nodes["follow"]["config"]["detail_table"] == {
-        "selector": "table",
-        "header_row": 0,
-        "normalize_fields": True,
-    }
+    assert extract["container_selector"] == ".entry-card.x9k2"
+    assert {field["name"] for field in extract["fields"]} == {"url", "title"}
+    assert "detail_table" not in nodes["follow"]["config"]
     assert nodes["output"]["config"]["natural_key_fields"] == ["url"]
     assert nodes["output"]["config"]["on_empty"] != "allow"
 
 
-def test_parse_table_can_expose_stable_detail_field_aliases():
+def test_parse_table_normalization_is_structural_not_financial():
     html = """
     <table><tr><th>Валюта</th><th>Процентная ставка</th><th>Срок</th></tr>
     <tr><td>BYN</td><td>12,5%</td><td>3 месяца</td></tr></table>
@@ -75,7 +93,7 @@ def test_parse_table_can_expose_stable_detail_field_aliases():
         "Валюта": "BYN",
         "Процентная ставка": "12,5%",
         "Срок": "3 месяца",
-        "currency": "BYN",
-        "rate": "12,5%",
-        "term": "3 месяца",
+        "валюта": "BYN",
+        "процентная_ставка": "12,5%",
+        "срок": "3 месяца",
     }]

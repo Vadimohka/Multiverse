@@ -4,7 +4,7 @@ import hashlib
 import json
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.audit import audit
@@ -60,7 +60,11 @@ def decide(task_id: str, status: str, payload: ReviewDecision, db: Session, user
                 data_hash = stable_record_hash(accepted) if isinstance(accepted, dict) else hashlib.sha256(
                     json.dumps(accepted, ensure_ascii=False, sort_keys=True, default=str).encode()
                 ).hexdigest()
-                version_number = pending_version.version_number if pending_version and not is_sample else record.current_version + 1
+                version_number = pending_version.version_number if pending_version and not is_sample else (
+                    db.scalar(
+                        select(func.max(RecordVersion.version_number)).where(RecordVersion.record_id == record.id)
+                    ) or 0
+                ) + 1
                 record.data_json = accepted
                 record.data_hash = data_hash
                 record.current_version = version_number

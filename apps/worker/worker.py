@@ -7,7 +7,8 @@ from zoneinfo import ZoneInfo
 from app.config import get_settings
 from app.database import SessionLocal
 from app.models import Run, Schedule, Source, Workflow
-from app.routers.workflows import execute_run
+from app.routers.workflows import active_graph, execute_run
+from app.services.run_routing import queue_for_graph
 from celery import Celery
 from celery.schedules import crontab
 from sqlalchemy import select
@@ -75,7 +76,7 @@ def schedule_tick() -> int:
                 )
                 db.add(run)
                 db.flush()
-                queue = queue_for_graph(workflow.graph_json, source)
+                queue = queue_for_graph(active_graph(db, workflow, workflow_version), source)
                 celery_app.send_task("parser_studio.execute_run", args=[run.id], queue=queue)
                 enqueued += 1
             schedule.last_run_at = now_utc
@@ -83,20 +84,6 @@ def schedule_tick() -> int:
         return enqueued
     finally:
         db.close()
-
-
-def queue_for_graph(graph: dict, source: Source | None = None) -> str:
-    types = {node.get("type") or node.get("data", {}).get("type") for node in graph.get("nodes", [])}
-    profile = (source.settings or {}).get("profile", {}) if source else {}
-    if "browser_open" in types or profile.get("requires_javascript") or (source.fetch_mode or "").upper() == "PLAYWRIGHT" if source else "browser_open" in types:
-        return "browser"
-    if types & {"parse_document", "download_file"}:
-        return "documents"
-    if types & {"llm_extract", "llm_classify"}:
-        return "llm"
-    if types & {"export_file"}:
-        return "exports"
-    return "default"
 
 
 def cron_matches(expression: str, moment: datetime) -> bool:

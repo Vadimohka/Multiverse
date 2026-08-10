@@ -106,7 +106,7 @@ def main() -> None:
                 )
                 assert run["status"] == "WAITING_FOR_REVIEW", run
                 _, detail = request(api_base, f"/runs/{run['id']}", token=token)
-                assert len(detail["nodes"]) == 7
+                assert len(detail["nodes"]) == 8
                 assert all(node["status"] == "SUCCESS" for node in detail["nodes"])
                 persistence = detail["run"]["output_json"]["persistence"]
                 assert persistence["created"] == 3

@@ -45,7 +45,7 @@ export function SourcesPage(){
   async function create(event:FormEvent<HTMLFormElement>){
     event.preventDefault();const form=new FormData(event.currentTarget);const endpoint=JSON.parse(sessionStorage.getItem('source_endpoint')||'null');setLoading(true);
     try{
-      const source=await api<any>('/sources',{method:'POST',body:JSON.stringify({project_id:form.get('project_id'),name:form.get('name'),entry_url:endpoint?.url||url,source_type:endpoint?'JSON_API':profile?.document_type?'PDF_DOCUMENT':'WEB_PAGE',fetch_mode:endpoint?'XHR_JSON':form.get('fetch_mode'),settings:{timeout:45,profile:profile||{},http_request:endpoint?{url:endpoint.url,method:endpoint.method,headers:endpoint.headers||{},query_params:endpoint.query_params||{},json_body:parseEndpointBody(endpoint.request_body)}:{}}})});
+      await api<any>('/sources',{method:'POST',body:JSON.stringify({project_id:form.get('project_id'),name:form.get('name'),entry_url:endpoint?.url||url,source_type:endpoint?'JSON_API':profile?.document_type?'PDF_DOCUMENT':'WEB_PAGE',fetch_mode:endpoint?'XHR_JSON':form.get('fetch_mode'),settings:{timeout:45,profile:profile||{},http_request:endpoint?{url:endpoint.url,method:endpoint.method,headers:endpoint.headers||{},query_params:endpoint.query_params||{},json_body:parseEndpointBody(endpoint.request_body)}:{}}})});
       sessionStorage.removeItem('source_wizard_draft');sessionStorage.removeItem('source_endpoint');setWizard(false);await qc.invalidateQueries({queryKey:['sources']})
     }catch(value){setError(value instanceof Error?value.message:String(value))}finally{setLoading(false)}
   }
@@ -97,7 +97,7 @@ export function ReviewPage(){
 }
 
 export function SchemasPage(){
-  const qc=useQueryClient();const query=useQuery({queryKey:['schemas'],queryFn:()=>api<any[]>('/schemas')});const projects=useQuery({queryKey:['projects'],queryFn:()=>api<any[]>('/projects')});const [open,setOpen]=useState(false);const [fields,setFields]=useState<any[]>([{name:'product_name',type:'string',required:true},{name:'rate_value',type:'number',required:false}]);
+  const qc=useQueryClient();const query=useQuery({queryKey:['schemas'],queryFn:()=>api<any[]>('/schemas')});const projects=useQuery({queryKey:['projects'],queryFn:()=>api<any[]>('/projects')});const [open,setOpen]=useState(false);const [fields,setFields]=useState<any[]>([{name:'title',type:'string',required:true},{name:'source_url',type:'string',required:false}]);
   async function create(event:FormEvent<HTMLFormElement>){event.preventDefault();const form=new FormData(event.currentTarget);const properties=Object.fromEntries(fields.map(field=>[field.name,{type:field.type==='number'?'number':field.type==='integer'?'integer':field.type==='boolean'?'boolean':'string'}]));const schema={type:'object',properties,required:fields.filter(field=>field.required).map(field=>field.name)};await api('/schemas',{method:'POST',body:JSON.stringify({project_id:form.get('project_id'),name:form.get('name'),description:form.get('description'),schema_json:schema})});setOpen(false);await qc.invalidateQueries({queryKey:['schemas']})}
   return <><Header title="Схемы данных" actions={<button onClick={()=>setOpen(true)}>Создать схему</button>}/><div className="panel"><Table rows={query.data||[]} columns={['name','description','version','published']}/></div>{open&&<Modal title="Конструктор схемы" wide onClose={()=>setOpen(false)}><form className="form" onSubmit={create}><div className="split"><label>Проект<select name="project_id" required>{projects.data?.map(project=><option key={project.id} value={project.id}>{project.name}</option>)}</select></label><label>Название<input name="name" required/></label></div><label>Описание<textarea name="description"/></label><div className="editor-list"><div className="editor-list-head"><strong>Поля</strong><button type="button" className="secondary small" onClick={()=>setFields([...fields,{name:'field',type:'string',required:false}])}>+ Поле</button></div>{fields.map((field,index)=><div className="editor-row" key={index}><input value={field.name} onChange={event=>setFields(fields.map((item,i)=>i===index?{...item,name:event.target.value}:item))}/><select value={field.type} onChange={event=>setFields(fields.map((item,i)=>i===index?{...item,type:event.target.value}:item))}><option>string</option><option>number</option><option>integer</option><option>boolean</option></select><label className="checkbox inline-check"><input type="checkbox" checked={field.required} onChange={event=>setFields(fields.map((item,i)=>i===index?{...item,required:event.target.checked}:item))}/><span>required</span></label><button type="button" className="danger small" onClick={()=>setFields(fields.filter((_,i)=>i!==index))}>×</button></div>)}</div><button>Создать схему</button></form></Modal>}</>;
 }
@@ -117,8 +117,9 @@ export function DataPage(){
   const summary=useQuery({queryKey:['dataset-summary',selected],queryFn:()=>api<any>(`/datasets/${selected}/summary`),enabled:!!selected});
   const records=useQuery({queryKey:['records',selected,offset,view],queryFn:()=>api<any>(`/datasets/${selected}/records?limit=${pageSize}&offset=${offset}&include_pending=${view==='all'}`),enabled:!!selected});
   const rows=(records.data?.items||[]).map((item:any)=>dataExplorerRow(item));
-  const preferredColumns=['bank_name','product_name','customer_type','currency','interest_rate','term','min_amount','conditions','source_url','observed_at','review_status'];
-  const recordColumns=preferredColumns.filter(column=>rows.some((row:any)=>row[column]!==undefined));
+  const preferredColumns=['title','source_published_at','url','fetched_at','observed_at','review_status'];
+  const availableColumns:string[]=[...new Set<string>(rows.flatMap((row:any):string[]=>Object.keys(row)))];
+  const recordColumns=[...preferredColumns.filter(column=>availableColumns.includes(column)),...availableColumns.filter(column=>!preferredColumns.includes(column))].slice(0,12);
   async function download(format:string){if(!selected)return;const blob=await api<Blob>(`/exports?dataset_id=${encodeURIComponent(selected)}&format=${format}`,{method:'POST'});const dataset=datasets.data?.find(item=>item.id===selected);const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download=`${dataset?.slug||'export'}.${format}`;link.click();URL.revokeObjectURL(link.href)}
   const total=records.data?.total||0;
   function selectDataset(id:string){setSelected(id);setOffset(0)}
@@ -137,7 +138,7 @@ export function DataPage(){
 }
 
 function dataExplorerRow(item:any){
-  return {...(item.data||{}),record_id:item.id,natural_key:item.natural_key,confidence:item.confidence,review_status:item.review_status,updated_at:item.updated_at};
+  return {...(item.data||{}),...(item.timestamps||{}),record_id:item.id,natural_key:item.natural_key,confidence:item.confidence,review_status:item.review_status,updated_at:item.updated_at};
 }
 
 function RecordHistory({record,onClose}:{record:any;onClose:()=>void}){const query=useQuery({queryKey:['record-history',record.record_id],queryFn:()=>api<any[]>(`/records/${record.record_id}/history`)});return <Modal title="История записи" wide onClose={onClose}>{query.isLoading?<Loading/>:<Table rows={query.data||[]}/>}</Modal>}
@@ -172,4 +173,3 @@ export function AuditPage(){const query=useQuery({queryKey:['audit'],queryFn:()=
 export function ExportsPage(){return <><Header title="Экспорт"/><div className="panel"><p>Экспорт выполняется из раздела «Данные» и узлом Export File внутри workflow. Поддержаны XLSX, CSV и JSON.</p></div></>}
 
 export function PlaceholderPage(){return <><Header title="Раздел"/><div className="panel empty">Раздел не найден.</div></>}
-

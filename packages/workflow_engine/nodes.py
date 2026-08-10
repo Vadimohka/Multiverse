@@ -13,7 +13,7 @@ from datetime import time as datetime_time
 from html import escape
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -93,7 +93,7 @@ class BrowserOpenNode:
                 await page.goto(url, wait_until=str(config.get("wait_until", "networkidle")), timeout=timeout_ms)
                 for action in config.get("actions", []):
                     await perform_browser_action(page, action, timeout_ms)
-                tab_descriptors = await discover_tab_descriptors(page) if config.get("tabs_enabled", True) else []
+                tab_descriptors = await discover_tab_descriptors(page) if config.get("tabs_enabled", False) else []
                 rendered_html = await collect_paginated_html(page, config, timeout_ms, start_url=page.url)
                 screenshot = await page.screenshot(full_page=bool(config.get("full_page", True)), type="png")
                 title = await page.title()
@@ -169,7 +169,7 @@ async def collect_paginated_html(page: Any, config: dict[str, Any], timeout_ms: 
     site-specific classes or URLs.  Each tab is revisited from the original
     listing URL so a tab that changes the URL cannot hide subsequent tabs.
     """
-    tabs_enabled = bool(config.get("tabs_enabled", True))
+    tabs_enabled = bool(config.get("tabs_enabled", False))
     initial_url = start_url or page.url
     descriptors = await discover_tab_descriptors(page) if tabs_enabled else []
     if descriptors:
@@ -545,49 +545,60 @@ class CrawlLinksNode:
                 if context.cancelled:
                     return
                 async with semaphore:
-                    response: httpx.Response | None = None
+                    detail_url = candidate["url"]
+                    detail_html = ""
+                    artifact_content = b""
+                    artifact_content_type = "text/html"
                     error: Exception | None = None
-                    for attempt in range(retries + 1):
-                        try:
-                            response = await client.get(candidate["url"])
-                            response.raise_for_status()
-                            break
-                        except Exception as exc:  # request failures are reported per item, not hidden
-                            error = exc
-                            if attempt < retries:
-                                await asyncio.sleep(min(0.5 * (attempt + 1), 2))
-                    if response is None or not response.is_success:
-                        async with record_lock:
-                            errors.append({"url": candidate["url"], "record_id": candidate["record_id"], "error": str(error or "HTTP request failed")})
-                        return
-                    # Rendering is selected only through the node/source
-                    # configuration.  No site-specific endpoint protocol is
-                    # embedded in the crawler.
-                    detail_url = str(response.url)
-                    detail_html = response.text
-                    artifact_content = response.content
-                    artifact_content_type = response.headers.get("content-type", "text/html")
                     if self._detail_uses_browser(context, config):
-                        try:
-                            rendered = await BrowserOpenNode().execute(context, inputs, {
-                                "url": detail_url, "wait_until": config.get("detail_wait_until", "networkidle"),
-                                "timeout": config.get("request_timeout", 45), "headers": headers,
-                                "capture_network": False, "full_page": False, "http_fallback": False,
-                            })
-                            detail_url = str(rendered.get("url") or detail_url)
-                            detail_html = str(rendered.get("html") or rendered.get("body") or detail_html)
-                            artifact_content = detail_html.encode("utf-8")
-                            artifact_content_type = "text/html"
-                        except Exception as exc:
-                            # The first HTTP response is still a valid, useful
-                            # fallback.  A browser problem on one card must not
-                            # discard the whole fan-out batch.
-                            context.log("WARNING", "Detail browser render failed; using HTTP response", url=detail_url, error=str(exc))
+                        rendered: dict[str, Any] | None = None
+                        for attempt in range(retries + 1):
+                            try:
+                                # Explicit browser transport must not depend on
+                                # a successful direct HTTP probe. Some sites
+                                # intentionally reject non-browser requests.
+                                rendered = await BrowserOpenNode().execute(context, inputs, {
+                                    "url": candidate["url"], "wait_until": config.get("detail_wait_until", "networkidle"),
+                                    "timeout": config.get("request_timeout", 45), "headers": headers,
+                                    "capture_network": False, "full_page": False, "http_fallback": False,
+                                })
+                                break
+                            except Exception as exc:
+                                error = exc
+                                if attempt < retries:
+                                    await asyncio.sleep(min(0.5 * (attempt + 1), 2))
+                        if rendered is None:
+                            async with record_lock:
+                                errors.append({"url": candidate["url"], "record_id": candidate["record_id"], "error": str(error or "Browser request failed")})
+                            return
+                        detail_url = str(rendered.get("url") or candidate["url"])
+                        detail_html = str(rendered.get("html") or rendered.get("body") or "")
+                        artifact_content = detail_html.encode("utf-8")
+                    else:
+                        response: httpx.Response | None = None
+                        for attempt in range(retries + 1):
+                            try:
+                                response = await client.get(candidate["url"])
+                                response.raise_for_status()
+                                break
+                            except Exception as exc:  # request failures are reported per item, not hidden
+                                error = exc
+                                if attempt < retries:
+                                    await asyncio.sleep(min(0.5 * (attempt + 1), 2))
+                        if response is None or not response.is_success:
+                            async with record_lock:
+                                errors.append({"url": candidate["url"], "record_id": candidate["record_id"], "error": str(error or "HTTP request failed")})
+                            return
+                        detail_url = str(response.url)
+                        detail_html = response.text
+                        artifact_content = response.content
+                        artifact_content_type = response.headers.get("content-type", "text/html")
                     artifact: dict[str, Any] | None = None
                     if config.get("save_artifacts", True):
                         artifact_id = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(candidate["record_id"]))
                         artifact = await store_artifact(context, artifact_content, artifact_content_type, detail_url, f"{artifact_id}.json" if "json" in artifact_content_type else f"{artifact_id}.html", "raw_article")
-                    record = extract_article_record(detail_html, detail_url, candidate, config, artifact)
+                    fetched_candidate = {**candidate, "fetched_at": datetime.now(UTC).isoformat()}
+                    record = extract_article_record(detail_html, detail_url, fetched_candidate, config, artifact)
                     async with record_lock:
                         records.append(record)
                     if delay_ms:
@@ -639,10 +650,23 @@ class CrawlLinksNode:
         if not listing_url:
             return find_value(inputs, str(config.get("input_path") or "records")) or inputs, str(find_value(inputs, "url") or "")
         params = render_object(config.get("listing_query") or {}, context, inputs)
-        lookback_days = int(config.get("lookback_days") or 0)
-        if lookback_days:
-            now = context.effective_run_clock or datetime.now(UTC)
-            params.update({"sFrom": (now - timedelta(days=lookback_days)).strftime("%d.%m.%Y"), "sTo": now.strftime("%d.%m.%Y")})
+        date_range = config.get("date_range_query") or {}
+        if isinstance(date_range, dict) and date_range:
+            from_param = str(date_range.get("from_param") or "")
+            to_param = str(date_range.get("to_param") or "")
+            if not from_param or not to_param:
+                raise ValueError("date_range_query requires from_param and to_param")
+            try:
+                zone = ZoneInfo(str(date_range.get("timezone") or "UTC"))
+            except Exception as exc:
+                raise ValueError("date_range_query contains an unknown timezone") from exc
+            now = (context.effective_run_clock or datetime.now(UTC)).astimezone(zone)
+            lookback_days = max(int(date_range.get("lookback_days") or 0), 0)
+            pattern = str(date_range.get("format") or "YYYY-MM-DD")
+            params.update({
+                from_param: formula_format_date(now - timedelta(days=lookback_days), pattern),
+                to_param: formula_format_date(now, pattern),
+            })
         headers = {"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5", "User-Agent": "Mozilla/5.0 (compatible; ParserStudio/1.0)"}
         headers.update(render_object(config.get("headers") or {}, context, inputs))
         source = context.variables.get("source", {})
@@ -651,7 +675,11 @@ class CrawlLinksNode:
         profile = source_settings.get("profile") if isinstance(source_settings.get("profile"), dict) else {}
         source_fetch_mode = str(source.get("fetch_mode") or source_settings.get("fetch_mode") or "").upper() if isinstance(source, dict) else ""
         listing_fetch_mode = str(config.get("listing_fetch_mode") or "").upper()
-        if listing_fetch_mode == "PLAYWRIGHT" or source_fetch_mode == "PLAYWRIGHT" or profile.get("requires_javascript"):
+        listing_uses_browser = listing_fetch_mode == "PLAYWRIGHT" or (
+            listing_fetch_mode in {"", "AUTO"}
+            and (source_fetch_mode == "PLAYWRIGHT" or profile.get("requires_javascript"))
+        )
+        if listing_uses_browser:
             rendered = await BrowserOpenNode().execute(
                 context,
                 inputs,
@@ -665,6 +693,9 @@ class CrawlLinksNode:
                     "pagination_max_pages": config.get("pagination_max_pages", 25),
                     "pagination_next_selector": config.get("pagination_next_selector", ""),
                     "pagination_wait_ms": config.get("pagination_wait_ms", 500),
+                    "tabs_enabled": config.get("tabs_enabled", False),
+                    "tabs_wait_ms": config.get("tabs_wait_ms", 500),
+                    "tabs_max_depth": config.get("tabs_max_depth", 4),
                     "full_page": False,
                     "http_fallback": True,
                 },
@@ -1028,6 +1059,9 @@ class MappingNode:
                 if spec.get("required") and result in (None, ""):
                     errors.append({"row": index, "field": target, "code": "REQUIRED"})
                 record[target] = result
+            provenance = source.get("__provenance")
+            if isinstance(provenance, dict):
+                record["__provenance"] = provenance
             records.append(record)
         return {"records": records, "count": len(records), "mapping_errors": errors,
                 "business_records": True, "schema_preview": records[:5]}
@@ -1110,7 +1144,7 @@ class LLMExtractNode:
                         parsed = parsed[key]
                         break
             if isinstance(parsed, list):
-                parsed = dedupe_extracted_records(parsed)
+                parsed = dedupe_extracted_records(parsed, config.get("dedupe_key_fields"))
             validate_json_schema(parsed, schema)
             return {**llm_output(parsed, raw.get("model", model), raw.get("usage", {})), "response": text}
         except Exception:
@@ -1118,7 +1152,7 @@ class LLMExtractNode:
                 return {"records": content if isinstance(content, list) else [content], "llm_fallback": True}
             raise
 
-def dedupe_extracted_records(records: list[Any]) -> list[Any]:
+def dedupe_extracted_records(records: list[Any], key_fields: list[str] | None = None) -> list[Any]:
     """Discard repeated cards emitted by templated pages or an LLM."""
     unique: list[Any] = []
     seen: set[str] = set()
@@ -1126,7 +1160,7 @@ def dedupe_extracted_records(records: list[Any]) -> list[Any]:
         if not isinstance(record, dict):
             unique.append(record)
             continue
-        key = "|".join(str(record.get(field) or "") for field in ("bank_name", "product_name", "currency", "source_url"))
+        key = "|".join(str(record.get(field) or "") for field in key_fields) if key_fields else json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
         if key in seen:
             continue
         seen.add(key)
@@ -1386,11 +1420,20 @@ def simple_json_path(data: Any, path: str) -> list[Any]:
     return values
 
 
-def canonical_url(value: str) -> str:
-    """Drop tracking fragments/query params without changing an article identifier."""
+def canonical_url(value: str, drop_query_params: list[str] | None = None) -> str:
+    """Normalize a URL while preserving query parameters that carry identity."""
     parts = urlsplit(value)
     path = re.sub(r"/{2,}", "/", parts.path).rstrip("/")
-    return urlunsplit((parts.scheme, parts.netloc.lower(), path, "", ""))
+    configured = {item.lower() for item in (drop_query_params or [])}
+    tracking = {"utm", "gclid", "fbclid", "yclid", "mc_cid", "mc_eid"}
+    query = [
+        (key, item)
+        for key, item in parse_qsl(parts.query, keep_blank_values=True)
+        if key.lower() not in configured
+        and key.lower() not in tracking
+        and not key.lower().startswith("utm_")
+    ]
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, urlencode(sorted(query)), ""))
 
 
 async def hydrate_dynamic_detail(
@@ -1412,20 +1455,64 @@ def extract_article_record(
     artifact: dict[str, Any] | None,
 ) -> dict[str, Any]:
     soup = BeautifulSoup(page_html, "lxml")
+    detail_fields = config.get("detail_fields")
+    if isinstance(detail_fields, list):
+        record: dict[str, Any] = {"record_id": candidate.get("record_id") or hashlib.sha256(canonical_url(page_url).encode()).hexdigest()[:20]}
+        if config.get("include_listing_fields") and isinstance(candidate.get("item"), dict):
+            record.update(candidate["item"])
+        for field in detail_fields:
+            if not isinstance(field, dict) or not field.get("name"):
+                continue
+            name = str(field["name"])
+            selector = str(field.get("selector") or "")
+            elements = soup.select(selector) if selector else []
+            element = elements[0] if elements else None
+            value_mode = str(field.get("value") or "text")
+            if field.get("multiple") and value_mode == "links":
+                record[name] = json.dumps([
+                    {
+                        "title": item.get_text(" ", strip=True) or Path(urlsplit(str(item.get("href") or "")).path).name,
+                        "url": canonical_url(urljoin(page_url, str(item.get("href") or ""))),
+                    }
+                    for item in elements if item.get("href")
+                ], ensure_ascii=False)
+                continue
+            if element is None:
+                record[name] = None
+                continue
+            attribute = str(field.get("attribute") or "")
+            value = element.get(attribute) if attribute else (
+                element.decode_contents() if value_mode == "html" else element.get_text(" ", strip=True)
+            )
+            if name in {"source_published_at", "source_modified_at"}:
+                value = normalize_source_datetime(
+                    str(value or ""),
+                    timezone=str(field.get("timezone") or config.get("timezone") or "UTC"),
+                    date_format=str(field.get("format") or ""),
+                )
+            record[name] = value
+        constants = config.get("detail_constants") or {}
+        if isinstance(constants, dict):
+            record.update(constants)
+        record["fetched_at"] = candidate.get("fetched_at") or datetime.now(UTC).isoformat()
+        record["url"] = canonical_url(page_url, list(config.get("drop_query_params") or []))
+        if artifact:
+            record["__provenance"] = {"raw_artifact": artifact}
+        return record
     title_selector = str(config.get("title_selector") or "")
     title = select_text(soup, title_selector) if title_selector else ""
     title = title or str(candidate["item"].get("title") or "")
     if not title:
-        title = next((select_text(soup, selector) for selector in ("#title", "h1", "[itemprop='headline']", "article h1", "meta[property='og:title']") if select_text(soup, selector)), "")
+        title = next((select_text(soup, selector) for selector in ("h1", "[itemprop='headline']", "article h1", "meta[property='og:title']") if select_text(soup, selector)), "")
     listing_date = str(candidate["item"].get("shortDate") or candidate["item"].get("published_at") or candidate["item"].get("date") or "")
     date_selector = str(config.get("date_selector") or "")
     date_text = listing_date if re.search(r"\d{4}-\d{2}-\d{2}", listing_date) else select_text(soup, date_selector) if date_selector else ""
     if not date_text:
-        date_text = next((element.get("datetime") or element.get("content") or element.get_text(" ", strip=True) for element in soup.select(".dynamic-publicationdate, time, [itemprop='datePublished'], meta[property='article:published_time'], meta[name='date']") if element.get("datetime") or element.get("content") or element.get_text(" ", strip=True)), "")
+        date_text = next((element.get("datetime") or element.get("content") or element.get_text(" ", strip=True) for element in soup.select("time, [itemprop='datePublished'], meta[property='article:published_time'], meta[name='date']") if element.get("datetime") or element.get("content") or element.get_text(" ", strip=True)), "")
     body_selector = str(config.get("body_selector") or "")
     body = soup.select_one(body_selector) if body_selector else None
     if not body:
-        body = next((soup.select_one(selector) for selector in ("#pc_body", "[itemprop='articleBody']", "article", "main article", ".article-body", ".post-content", ".entry-content", "main") if soup.select_one(selector)), None)
+        body = next((soup.select_one(selector) for selector in ("[itemprop='articleBody']", "article", "main article", ".article-body", ".post-content", ".entry-content", "main") if soup.select_one(selector)), None)
     body_html = body.decode_contents() if body else ""
     body_text = clean_article_text(body.get_text("\n", strip=True) if body else "")
     # A detail page may legitimately omit the preferred article wrapper (for
@@ -1460,6 +1547,7 @@ def extract_article_record(
         "attachments_json": json.dumps(attachments, ensure_ascii=False),
         "language": str(config.get("language") or (soup.html or {}).get("lang") or "").split("-", 1)[0],
         "source_name": str(config.get("source_name") or candidate.get("item", {}).get("source_name") or ""),
+        "fetched_at": candidate.get("fetched_at") or datetime.now(UTC).isoformat(),
         "observed_at": datetime.now(UTC).isoformat(),
     }
     # Older saved workflows may have supplied an additional domain identifier.
@@ -1467,7 +1555,44 @@ def extract_article_record(
     # depend on a particular field name.
     if candidate.get("news_id"):
         record["news_id"] = candidate["news_id"]
+    if artifact:
+        record["__provenance"] = {"raw_artifact": artifact}
     return record
+
+
+def normalize_source_datetime(value: str, *, timezone: str = "UTC", date_format: str = "") -> str | None:
+    text = clean_inline_text(value)
+    if not text:
+        return None
+    translated_format = date_format
+    for token, replacement in (
+        ("YYYY", "%Y"), ("DD", "%d"), ("MM", "%m"),
+        ("HH", "%H"), ("mm", "%M"), ("ss", "%S"),
+    ):
+        translated_format = translated_format.replace(token, replacement)
+    parsed: datetime | None = None
+    if translated_format:
+        try:
+            parsed = datetime.strptime(text, translated_format)
+        except ValueError:
+            return None
+    else:
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            normalized = normalize_publication_date(text)
+            try:
+                parsed = datetime.fromisoformat(normalized) if normalized != text else None
+            except ValueError:
+                parsed = None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        try:
+            parsed = parsed.replace(tzinfo=ZoneInfo(timezone))
+        except Exception as exc:
+            raise ValueError(f"Unknown source timezone: {timezone}") from exc
+    return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def select_text(soup: BeautifulSoup, selector: str) -> str:
@@ -1538,13 +1663,13 @@ async def response_payload(context: ExecutionContext, response: httpx.Response) 
     if "json" in content_type:
         payload: Any = response.json()
     elif any(token in content_type for token in ("text", "html", "xml", "javascript")) or not content_type:
-        # Some Belarusian bank sites declare UTF-8 while serving Windows-1251.
-        # Prefer the decoding with more readable Cyrillic instead of passing
-        # mojibake into the parser and LLM.
+        # A response can declare UTF-8 while serving a legacy Cyrillic
+        # encoding. Prefer the decoding with more readable text.
         payload = response.text
         try:
             cp1251_payload = raw.decode("cp1251")
-            readable = lambda text: sum("А" <= char <= "я" or char in "ёўіўёў" for char in text)
+            def readable(text: str) -> int:
+                return sum("А" <= char <= "я" or char in "ЁёЎўІі" for char in text)
             if readable(cp1251_payload) > readable(payload) * 2:
                 payload = cp1251_payload
         except UnicodeDecodeError:
@@ -1627,21 +1752,9 @@ def apply_operation(row: dict[str, Any], operation: dict[str, Any]) -> None:
 
 
 def normalize_table_field_name(header: Any) -> str:
-    """Map common Russian/English detail-table headings to stable field names.
-
-    Raw headings remain in the record.  The normalized aliases are opt-in so
-    existing Parse Table workflows keep their exact source column names.
-    """
-    text = re.sub(r"\s+", " ", str(header or "").strip().lower())
-    if not text:
-        return ""
-    if any(token in text for token in ("валют", "currency", "curr", "валюта")):
-        return "currency"
-    if any(token in text for token in ("ставк", "процент", "rate", "interest", "yield")):
-        return "rate"
-    if any(token in text for token in ("срок", "период", "term", "period", "месяц", "дн", "day", "month")):
-        return "term"
-    return ""
+    """Create a stable structural key without guessing business meaning."""
+    text = re.sub(r"[^\w]+", "_", str(header or "").strip().casefold(), flags=re.UNICODE)
+    return text.strip("_")
 
 
 def safe_eval(expression: str, values: dict[str, Any], run_clock: datetime | None = None) -> Any:

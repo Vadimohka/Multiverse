@@ -2,6 +2,7 @@ import asyncio
 
 from app.services import source_profiler
 from workflow_engine import WorkflowEngine
+from workflow_engine.catalog import CATALOG_BY_TYPE
 from workflow_engine.nodes import safe_eval
 from workflow_engine.types import ExecutionContext
 
@@ -63,6 +64,15 @@ def test_set_constant_and_output_preserve_object():
     }
     result = asyncio.run(WorkflowEngine().execute(graph, ExecutionContext(run_id='1', project_id='1', workflow_version_id='1')))
     assert result['result']['records'] == [{'title': 'one', 'date': '2026-07-30', 'url': 'https://example.test'}]
+
+
+def test_crawl_links_capabilities_are_configurable_in_no_code_catalog():
+    fields = {field['name']: field for field in CATALOG_BY_TYPE['crawl_links']['fields']}
+
+    assert fields['detail_fields']['kind'] == 'detail_fields'
+    assert fields['date_range_query']['kind'] == 'json'
+    assert fields['listing_fetch_mode']['options'] == ['HTTP', 'PLAYWRIGHT']
+    assert fields['tabs_enabled']['default'] is False
 
 
 def test_dataset_crud_compound_key_history_and_export(client, auth):
