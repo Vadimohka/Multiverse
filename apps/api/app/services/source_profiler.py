@@ -64,6 +64,12 @@ async def profile_url(url: str, timeout: float = 20) -> dict[str, Any]:
     should_render = len(text) < 1500 or len(scripts) > 8
     if should_render:
         await enrich_with_playwright(result, url, timeout)
+    # For client-rendered catalogues the initial response often contains only
+    # the page shell. Build selector suggestions from the rendered DOM instead
+    # of accidentally choosing navigation links from that shell.
+    if result.get("rendered_repeating_candidates"):
+        result["repeating_candidates"] = result["rendered_repeating_candidates"]
+        result["extractor"] = result["rendered_extractor"]
     # Playwright enrichment is best-effort.  When rendering is unavailable it
     # explicitly records ``None``; treating that as zero keeps the static
     # profiler result usable instead of turning an optional browser failure
@@ -118,8 +124,12 @@ async def enrich_with_playwright(result: dict[str, Any], url: str, timeout: floa
             page.on("response", capture)
             await page.goto(url, wait_until="networkidle", timeout=int(timeout * 1000))
             rendered_text = await page.locator("body").inner_text()
+            rendered_soup = BeautifulSoup(await page.content(), "lxml")
+            rendered_candidates = detect_repeating_candidates(rendered_soup)
             result["rendered_text_length"] = len(rendered_text.strip())
             result["rendered_title"] = await page.title()
+            result["rendered_repeating_candidates"] = rendered_candidates
+            result["rendered_extractor"] = build_extractor_suggestion(rendered_candidates)
             result["xhr_candidates"] = unique_dicts(xhr_candidates, "url")[:50]
             result["screenshot_available"] = True
             await browser.close()
@@ -156,14 +166,14 @@ def detect_repeating_candidates(soup: BeautifulSoup) -> list[dict[str, Any]]:
         except Exception:
             continue
         fields = infer_repeating_fields(containers[0]) if containers else []
-        candidate: dict[str, Any] = {"selector": selector, "count": count}
+        candidate: dict[str, Any] = {"selector": selector, "count": count, "direct_link": selector.startswith("a.")}
         if fields:
             candidate["fields"] = fields
         link = next((field for field in fields if field.get("name") == "url"), None)
         if link:
             candidate["link_field"] = link
         candidates.append(candidate)
-        if len(candidates) >= 20:
+        if len(candidates) >= 100:
             break
     return candidates
 
@@ -189,6 +199,8 @@ def infer_repeating_fields(container: Any) -> list[dict[str, Any]]:
         link_classes = [str(item) for item in (link.get("class") or [])]
         selector = "." + ".".join(link_classes) if link_classes else "a[href]"
         add("url", selector, attribute="href")
+        if link.get_text(" ", strip=True):
+            add("title", selector)
 
     def semantic_selector(tokens: tuple[str, ...]) -> str:
         for element in descendants[1:]:
@@ -221,15 +233,11 @@ def build_extractor_suggestion(candidates: list[dict[str, Any]]) -> dict[str, An
     def score(item: dict[str, Any]) -> tuple[int, int, int, int]:
         fields = item.get("fields") or []
         names = {field.get("name") for field in fields if isinstance(field, dict)}
-        selector = str(item.get("selector") or "")
-        # A repeated business item with a detail link is more useful than a
-        # repeated navigation/layout element with the same number of fields.
-        # The compound service-item markup used by Belinvestbank naturally
-        # wins this score without being hard-coded into the workflow graph.
-        business_shape = int("services-item" in selector and "js-service-item" in selector)
+        # Prefer a repeated item that exposes a detail link and a title.  The
+        # profiler never needs to know the vocabulary or markup of one site.
         return (
+            int(bool(item.get("direct_link"))),
             int("url" in names and "title" in names),
-            business_shape,
             len(fields),
             min(int(item.get("count") or 0), 500),
         )

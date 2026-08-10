@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
+import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -10,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.audit import audit
 from app.database import get_db
 from app.dependencies import get_current_user, require_roles
-from app.models import User, Workflow, WorkflowTemplate
+from app.models import Dataset, Source, User, Workflow, WorkflowTemplate
 from app.schemas import (
     WorkflowOut,
     WorkflowTemplateCreate,
@@ -32,6 +34,42 @@ def _graph(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> dict[str
 # code so every project receives the same reviewed starting point, while user
 # templates below are immutable snapshots stored in the database.
 SYSTEM_TEMPLATES: list[dict[str, Any]] = [
+    {
+        "id": "system-list-detail-crawl",
+        "name": "Список ссылок → detail-карточки",
+        "description": "Универсальный fan-out/fan-in: выбранный источник даёт список ссылок, каждая detail-страница превращается в запись через Mapping и сохраняется в результат workflow.",
+        "tags": ["web", "crawl", "detail", "fan-out"],
+        "is_system": True,
+        "graph_json": _graph(
+            [
+                {"id": "trigger", "type": "manual_trigger", "position": {"x": 20, "y": 160}, "config": {}},
+                {"id": "crawl", "type": "crawl_links", "position": {"x": 300, "y": 160}, "config": {
+                    "listing_url": "", "listing_query": {}, "items_path": "", "url_path": "url", "link_selector": "", "detail_fetch_mode": "AUTO",
+                    "pagination_enabled": True, "pagination_max_pages": 25, "tabs_enabled": True, "tabs_wait_ms": 700,
+                    "pagination_next_selector": "li[aria-label='Next page'] a", "pagination_wait_ms": 500,
+                    "url_pattern": "", "max_items": 5000, "concurrency": 10, "delay_ms": 250, "request_retries": 2,
+                    "request_timeout": 45, "timeout": 900, "same_origin_only": True, "headers": {},
+                    "title_selector": "", "date_selector": "", "body_selector": "", "tag_selector": "",
+                    "attachment_selector": "a[href$='.pdf'],a[href$='.doc'],a[href$='.docx'],a[href$='.xls'],a[href$='.xlsx'],a[href$='.zip']",
+                    "language": "", "source_name": "{{source.name}}", "save_artifacts": True,
+                }},
+                {"id": "mapping", "type": "mapping", "position": {"x": 620, "y": 160}, "config": {"input_path": "records", "fields": [
+                    {"target": "record_id", "source_path": "record_id"},
+                    {"target": "title", "source_path": "title"},
+                    {"target": "published_at", "source_path": "published_at"}, {"target": "url", "source_path": "url"},
+                    {"target": "body_text", "source_path": "body_text"}, {"target": "body_html", "source_path": "body_html"},
+                    {"target": "tags", "source_path": "tags"}, {"target": "attachments_json", "source_path": "attachments_json"},
+                    {"target": "language", "source_path": "language"}, {"target": "source_name", "source_path": "source_name"},
+                    {"target": "observed_at", "source_path": "observed_at"},
+                ]}},
+                {"id": "output", "type": "output", "position": {"x": 940, "y": 160}, "config": {"input_path": "records", "natural_key_fields": ["url"], "on_empty": "warning", "name": "detail_records"}},
+            ],
+            [
+                {"id": "e1", "source": "trigger", "target": "crawl"}, {"id": "e2", "source": "crawl", "target": "mapping"},
+                {"id": "e3", "source": "mapping", "target": "output"},
+            ],
+        ),
+    },
     {
         "id": "system-web-page",
         "name": "Веб-страница: таблицы и карточки",
@@ -92,20 +130,86 @@ SYSTEM_TEMPLATES: list[dict[str, Any]] = [
 ]
 
 
+_LITERAL_URL = re.compile(r"https?://[^\s}]+", re.I)
+_SITE_MARKER = re.compile(r"(?:bcse|бвфб|press[-_]center|bcsenews)", re.I)
+
+
 def _clean_graph(graph: dict[str, Any]) -> dict[str, Any]:
+    """Return a portable graph suitable for a reusable template.
+
+    A workflow may contain source-specific tuning, but a template is a
+    contract, not a copy of one site's implementation. Known source-bound
+    crawl/fetch settings are reset to source placeholders/fallbacks before
+    the graph is persisted or instantiated.
+    """
     result = deepcopy(graph)
     settings = result.setdefault("settings", {})
     settings.pop("source_id", None)
     settings.pop("dataset_id", None)
-    # Dataset/source bindings may live on output or fetch nodes as well as in
-    # graph settings.  A template must be a real blueprint, never a hidden
-    # pointer to the data space of the workflow it was saved from.
+    if isinstance(settings.get("natural_key_fields"), (str, list)):
+        settings["natural_key_fields"] = ["url"]
     for node in result.get("nodes", []):
         config = node.get("config") if isinstance(node, dict) else None
-        if isinstance(config, dict):
-            config.pop("source_id", None)
+        if not isinstance(config, dict):
+            continue
+        node_type = str(node.get("type") or "")
+        config.pop("source_id", None)
+        config.pop("dataset_id", None)
+        if node_type in {"http_request", "browser_open", "download_file"} and "url" in config:
+            config["url"] = "{{source.url}}"
+        if node_type == "crawl_links":
+            config.update({
+                "listing_url": "",
+                "listing_query": {},
+                "items_path": "",
+                "url_path": "url",
+                "link_selector": "",
+                "url_pattern": "",
+                "base_url": "",
+                "title_selector": "",
+                "date_selector": "",
+                "body_selector": "",
+                "tag_selector": "",
+                "language": "",
+                "source_name": "{{source.name}}",
+                "detail_fetch_mode": "AUTO",
+            })
+        if node_type == "validate":
+            schema_text = json.dumps(config.get("schema", {}), ensure_ascii=False)
+            if _SITE_MARKER.search(schema_text) or _LITERAL_URL.search(schema_text):
+                config["schema"] = {}
+                config["required"] = []
+                config["fail_on_error"] = False
+        if node_type == "output":
             config.pop("dataset_id", None)
+            config["natural_key_fields"] = ["url"]
+            config["name"] = "records"
     return result
+
+
+def _template_issues(graph: dict[str, Any]) -> list[str]:
+    """Find literal source bindings that must never enter a template."""
+    issues: list[str] = []
+
+    def visit(value: Any, path: str = "") -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == "$schema":
+                    continue
+                if key in {"source_id", "dataset_id"} and child:
+                    issues.append(f"binding at {path}.{key}" if path else f"binding at {key}")
+                visit(child, f"{path}.{key}" if path else key)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, f"{path}[{index}]")
+        elif isinstance(value, str):
+            if _LITERAL_URL.search(value) and "{{source." not in value:
+                issues.append(f"literal URL at {path}")
+            if _SITE_MARKER.search(value):
+                issues.append(f"site marker at {path}")
+
+    visit(graph)
+    return issues
 
 
 def _system_template(template_id: str) -> dict[str, Any] | None:
@@ -115,7 +219,7 @@ def _system_template(template_id: str) -> dict[str, Any] | None:
 def _template_out(item: WorkflowTemplate) -> dict[str, Any]:
     return {
         "id": item.id, "project_id": item.project_id, "name": item.name,
-        "description": item.description, "tags": item.tags, "graph_json": item.graph_json,
+        "description": item.description, "tags": item.tags, "graph_json": _clean_graph(item.graph_json),
         "is_system": item.is_builtin, "created_at": item.created_at, "updated_at": item.updated_at,
     }
 
@@ -127,13 +231,18 @@ def list_templates(project_id: str | None = None, db: Session = Depends(get_db),
     # A template is a portable graph snapshot: source and dataset bindings are
     # stripped on save.  Its project is only the ownership/audit context, not
     # an access boundary, so a proven parser can be reused in another project.
-    items.extend(_template_out(item) for item in db.scalars(stmt).all())
+    # Legacy/site-specific snapshots remain auditable in the database, but
+    # must not appear in the reusable-template picker.
+    items.extend(_template_out(item) for item in db.scalars(stmt).all() if not _template_issues(item.graph_json))
     return items
 
 
 @router.post("", response_model=WorkflowTemplateOut, status_code=201)
 def create_template(payload: WorkflowTemplateCreate, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> WorkflowTemplate:
     graph = _clean_graph(payload.graph_json)
+    issues = _template_issues(graph)
+    if issues:
+        raise HTTPException(status_code=422, detail={"message": "Шаблон должен быть универсальным", "issues": issues[:20]})
     errors = validate_dag(graph)
     if errors:
         raise HTTPException(status_code=422, detail=errors)
@@ -150,6 +259,9 @@ def save_workflow_as_template(workflow_id: str, payload: WorkflowTemplateFromWor
     if workflow.project_id != payload.project_id:
         raise HTTPException(status_code=422, detail="Шаблон можно сохранить только в проект этого workflow")
     graph = _clean_graph(workflow.graph_json)
+    issues = _template_issues(graph)
+    if issues:
+        raise HTTPException(status_code=422, detail={"message": "Workflow содержит site-specific настройки; очистите их перед сохранением шаблона", "issues": issues[:20]})
     item = WorkflowTemplate(project_id=workflow.project_id, name=payload.name, description=payload.description or workflow.description, tags=payload.tags, graph_json=graph, created_by=user.id)
     db.add(item); db.flush(); audit(db, user.id, "CREATE", "workflow_template", item.id, after={"workflow_id": workflow.id, "name": item.name}); db.commit(); db.refresh(item)
     return item
@@ -188,7 +300,21 @@ def instantiate_template(template_id: str, payload: WorkflowTemplateInstantiateR
         item = db.get(WorkflowTemplate, template_id)
         if not item:
             raise HTTPException(status_code=404, detail="Шаблон не найден")
+        if _template_issues(item.graph_json):
+            raise HTTPException(status_code=422, detail="Этот legacy-шаблон содержит привязку к сайту и больше недоступен. Используйте системный универсальный шаблон.")
         name, description, graph = item.name, item.description, item.graph_json
-    workflow = Workflow(project_id=payload.project_id, name=payload.name or f"{name} — копия", description=description, graph_json=_clean_graph(graph))
+    copied_graph = _clean_graph(graph)
+    settings = copied_graph.setdefault("settings", {})
+    if payload.source_id:
+        source = db.get(Source, payload.source_id)
+        if not source or source.project_id != payload.project_id:
+            raise HTTPException(status_code=422, detail="Источник должен принадлежать выбранному проекту")
+        settings["source_id"] = source.id
+    if payload.dataset_id:
+        dataset = db.get(Dataset, payload.dataset_id)
+        if not dataset or dataset.project_id != payload.project_id:
+            raise HTTPException(status_code=422, detail="Dataset должен принадлежать выбранному проекту")
+        settings["dataset_id"] = dataset.id
+    workflow = Workflow(project_id=payload.project_id, name=payload.name or f"{name} — копия", description=description, graph_json=copied_graph)
     db.add(workflow); db.flush(); audit(db, user.id, "CREATE", "workflow", workflow.id, after={"template_id": template_id, "name": workflow.name}); db.commit(); db.refresh(workflow)
     return workflow

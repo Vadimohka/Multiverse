@@ -209,6 +209,8 @@ class WorkflowTemplateUpdate(BaseModel):
 class WorkflowTemplateInstantiateRequest(BaseModel):
     project_id: str
     name: str | None = None
+    source_id: str | None = None
+    dataset_id: str | None = None
 
 
 class WorkflowTemplateFromWorkflowRequest(BaseModel):

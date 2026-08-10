@@ -41,6 +41,13 @@ BCSE_NEWS_SCHEMA = {
 
 
 def bcse_news_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
+    mapping_fields = [
+        {"target": name, "source_path": name}
+        for name in (
+            "news_id", "title", "published_at", "url", "body_text", "body_html",
+            "tags", "attachments_json", "language", "source_name", "observed_at",
+        )
+    ]
     crawl_config = {
         "listing_url": "https://www.bcse.by/press_center/calendar",
         "listing_query": {} if incremental else {"sFrom": "01.01.2000", "sTo": "31.12.2035"},
@@ -58,8 +65,14 @@ def bcse_news_graph(source_id: str, dataset_id: str, *, incremental: bool = Fals
         "nodes": [
             {"id": "trigger", "type": "manual_trigger", "position": {"x": 30, "y": 180}, "config": {}},
             {"id": "crawl", "type": "crawl_links", "position": {"x": 280, "y": 180}, "config": crawl_config},
-            {"id": "validate", "type": "validate", "position": {"x": 620, "y": 180}, "config": {"input_path": "records", "required": ["news_id", "title", "published_at", "url", "body_text", "language", "source_name"], "schema": BCSE_NEWS_SCHEMA, "fail_on_error": True}},
-            {"id": "output", "type": "output", "position": {"x": 900, "y": 180}, "config": {"input_path": "records", "name": "bcse_news"}},
+            {"id": "mapping", "type": "mapping", "position": {"x": 590, "y": 180}, "config": {"input_path": "records", "fields": mapping_fields}},
+            {"id": "validate", "type": "validate", "position": {"x": 850, "y": 180}, "config": {"input_path": "records", "required": ["news_id", "title", "published_at", "url", "body_text", "language", "source_name"], "schema": BCSE_NEWS_SCHEMA, "fail_on_error": True}},
+            {"id": "output", "type": "output", "position": {"x": 1120, "y": 180}, "config": {"input_path": "records", "name": "bcse_news"}},
         ],
-        "edges": [{"id": "e1", "source": "trigger", "target": "crawl"}, {"id": "e2", "source": "crawl", "target": "validate"}, {"id": "e3", "source": "validate", "target": "output"}],
+        "edges": [
+            {"id": "e1", "source": "trigger", "target": "crawl"},
+            {"id": "e2", "source": "crawl", "target": "mapping"},
+            {"id": "e3", "source": "mapping", "target": "validate"},
+            {"id": "e4", "source": "validate", "target": "output"},
+        ],
     }

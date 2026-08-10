@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
@@ -53,6 +54,24 @@ from app.services.artifact_storage import ArtifactStorage
 
 router = APIRouter(prefix="/workflows", tags=["Workflows"])
 settings = get_settings()
+_LITERAL_URL = re.compile(r"https?://[^\s}]+", re.I)
+_SITE_MARKER = re.compile(r"(?:bcse|бвфб|press[-_]center|bcsenews)", re.I)
+
+
+def _is_legacy_site_workflow(workflow: Workflow) -> bool:
+    graph_text = json.dumps(workflow.graph_json, ensure_ascii=False)
+    if _SITE_MARKER.search(graph_text):
+        return True
+    for node in workflow.graph_json.get("nodes", []):
+        node_type = str(node.get("type") or "")
+        if node_type not in {"http_request", "browser_open", "download_file", "crawl_links"}:
+            continue
+        config = node.get("config") if isinstance(node.get("config"), dict) else {}
+        for key in ("url", "listing_url", "base_url"):
+            value = str(config.get(key) or "")
+            if _LITERAL_URL.search(value) and "{{source." not in value:
+                return True
+    return False
 
 
 @router.get("/catalog")
@@ -75,7 +94,7 @@ def list_workflows(
     # Keep them for backwards compatibility, but do not confuse the main list:
     # the normal operation model is one reusable workflow plus many sources.
     if not include_legacy:
-        workflows = [workflow for workflow in workflows if not (workflow.graph_json.get("settings", {}) or {}).get("source_id")]
+        workflows = [workflow for workflow in workflows if not (workflow.graph_json.get("settings", {}) or {}).get("source_id") and not _is_legacy_site_workflow(workflow)]
     return workflows
 
 
@@ -340,13 +359,6 @@ def _source_extractor_config(source: Source) -> dict[str, Any]:
     fields = [dict(item) for item in (fields or []) if isinstance(item, dict) and item.get("name") and item.get("selector")]
     if not fields and container_selector:
         fields = [{"name": "url", "selector": "a[href]", "attribute": "href"}]
-    # Belinvestbank keeps the product name and detail URL in the same link.
-    # Give this stable site markup the dataset-friendly name while preserving
-    # the profiler's selector and href extraction.
-    for index, field in enumerate(fields):
-        selector = str(field.get("selector") or "")
-        if field.get("name") == "title" and ("item-description-link" in selector or "deposit_name_" in selector):
-            fields[index] = {**field, "name": "product_name"}
     link_field = next((item for item in fields if item.get("name") in {"url", "link", "href"} and item.get("attribute") == "href"), None)
     if link_field and link_field.get("name") != "url":
         link_field = {**link_field, "name": "url"}
@@ -354,15 +366,6 @@ def _source_extractor_config(source: Source) -> dict[str, Any]:
     detail = configured.get("detail") if isinstance(configured.get("detail"), dict) else settings.get("detail")
     if not isinstance(detail, dict):
         detail = {}
-    if link_field and not detail.get("table"):
-        # Detail pages contain the published rate/term/currency table.  The
-        # node tolerates pages without a table, but when one exists it exposes
-        # stable aliases (rate/term/currency) alongside raw headings.
-        detail = {
-            **detail,
-            "table": {"selector": "table", "header_row": 0, "normalize_fields": True},
-            "field_names": ["rate", "term", "currency"],
-        }
     return {
         "container_selector": container_selector,
         "fields": fields,
@@ -666,6 +669,7 @@ def build_execution_variables(db: Session, source: Source | None) -> tuple[dict[
             "name": source.name if source else "",
             "url": source.entry_url if source else "",
             "base_url": source.base_url if source else "",
+            "fetch_mode": source.fetch_mode if source else "",
             "settings": source.settings if source else {},
         },
         "deepseek_base_url": settings.deepseek_base_url,
@@ -786,6 +790,8 @@ async def run_workflow(
     workflow = db.get(Workflow, workflow_id)
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow не найден")
+    if _is_legacy_site_workflow(workflow):
+        raise HTTPException(status_code=422, detail="Этот workflow содержит legacy-привязку к сайту. Создайте копию системного универсального шаблона и выберите источник запуска.")
     source_id = payload.source_id or workflow.graph_json.get("settings", {}).get("source_id")
     if source_id and not db.get(Source, source_id):
         raise HTTPException(status_code=404, detail="Источник не найден")
@@ -882,7 +888,7 @@ def enqueue_run(run_id: str) -> None:
         source = db.get(Source, run.source_id) if run and run.source_id else None
         node_types = {node.get("type") or node.get("data", {}).get("type") for node in graph.get("nodes", [])}
         source_profile = (source.settings or {}).get("profile", {}) if source else {}
-        needs_browser = bool(source_profile.get("requires_javascript")) or (source.settings or {}).get("fetch_mode") == "PLAYWRIGHT" if source else False
+        needs_browser = bool(source_profile.get("requires_javascript")) or (source.fetch_mode or "").upper() == "PLAYWRIGHT" if source else False
         queue = "browser" if needs_browser or "browser_open" in node_types else "documents" if node_types & {"parse_document", "download_file"} else "llm" if node_types & {"llm_extract", "llm_classify"} else "exports" if "export_file" in node_types else "default"
     finally:
         db.close()

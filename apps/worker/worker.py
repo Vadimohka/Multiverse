@@ -88,7 +88,7 @@ def schedule_tick() -> int:
 def queue_for_graph(graph: dict, source: Source | None = None) -> str:
     types = {node.get("type") or node.get("data", {}).get("type") for node in graph.get("nodes", [])}
     profile = (source.settings or {}).get("profile", {}) if source else {}
-    if "browser_open" in types or profile.get("requires_javascript") or (source.settings or {}).get("fetch_mode") == "PLAYWRIGHT" if source else "browser_open" in types:
+    if "browser_open" in types or profile.get("requires_javascript") or (source.fetch_mode or "").upper() == "PLAYWRIGHT" if source else "browser_open" in types:
         return "browser"
     if types & {"parse_document", "download_file"}:
         return "documents"

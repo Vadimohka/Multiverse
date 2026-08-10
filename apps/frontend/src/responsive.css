@@ -3,6 +3,7 @@
 .table-wrap table{min-width:720px}
 
 @media(max-width:1000px){
+  .node-inspector{position:static;width:auto;box-shadow:none}
   aside{padding:18px 10px}
   .brand{padding:5px 0 20px;text-align:center}
   nav{align-items:center;scrollbar-width:none}
@@ -20,4 +21,8 @@
   header{align-items:stretch}
   header .toolbar{width:100%}
   header .toolbar>*{flex:1}
+}
+
+@media(max-width:1000px){
+  .node-inspector{position:static!important;right:auto!important;top:auto!important;bottom:auto!important;width:auto!important;box-shadow:none!important}
 }
