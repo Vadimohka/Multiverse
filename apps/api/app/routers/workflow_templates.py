@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from copy import deepcopy
-import json
 import re
+from copy import deepcopy
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from workflow_engine import validate_dag
 
 from app.audit import audit
 from app.database import get_db
@@ -21,7 +21,6 @@ from app.schemas import (
     WorkflowTemplateOut,
     WorkflowTemplateUpdate,
 )
-from workflow_engine import validate_dag
 
 router = APIRouter(prefix="/workflow-templates", tags=["Workflow templates"])
 
@@ -45,22 +44,16 @@ SYSTEM_TEMPLATES: list[dict[str, Any]] = [
                 {"id": "trigger", "type": "manual_trigger", "position": {"x": 20, "y": 160}, "config": {}},
                 {"id": "crawl", "type": "crawl_links", "position": {"x": 300, "y": 160}, "config": {
                     "listing_url": "", "listing_query": {}, "items_path": "", "url_path": "url", "link_selector": "", "detail_fetch_mode": "AUTO",
-                    "pagination_enabled": True, "pagination_max_pages": 25, "tabs_enabled": True, "tabs_wait_ms": 700,
+                    "pagination_enabled": True, "pagination_max_pages": 25, "tabs_enabled": False, "tabs_wait_ms": 700,
                     "pagination_next_selector": "li[aria-label='Next page'] a", "pagination_wait_ms": 500,
                     "url_pattern": "", "max_items": 5000, "concurrency": 10, "delay_ms": 250, "request_retries": 2,
                     "request_timeout": 45, "timeout": 900, "same_origin_only": True, "headers": {},
-                    "title_selector": "", "date_selector": "", "body_selector": "", "tag_selector": "",
-                    "attachment_selector": "a[href$='.pdf'],a[href$='.doc'],a[href$='.docx'],a[href$='.xls'],a[href$='.xlsx'],a[href$='.zip']",
-                    "language": "", "source_name": "{{source.name}}", "save_artifacts": True,
+                    "detail_fields": [], "detail_constants": {}, "include_listing_fields": True,
+                    "drop_query_params": [], "save_artifacts": True,
                 }},
                 {"id": "mapping", "type": "mapping", "position": {"x": 620, "y": 160}, "config": {"input_path": "records", "fields": [
                     {"target": "record_id", "source_path": "record_id"},
-                    {"target": "title", "source_path": "title"},
-                    {"target": "published_at", "source_path": "published_at"}, {"target": "url", "source_path": "url"},
-                    {"target": "body_text", "source_path": "body_text"}, {"target": "body_html", "source_path": "body_html"},
-                    {"target": "tags", "source_path": "tags"}, {"target": "attachments_json", "source_path": "attachments_json"},
-                    {"target": "language", "source_path": "language"}, {"target": "source_name", "source_path": "source_name"},
-                    {"target": "observed_at", "source_path": "observed_at"},
+                    {"target": "url", "source_path": "url"},
                 ]}},
                 {"id": "output", "type": "output", "position": {"x": 940, "y": 160}, "config": {"input_path": "records", "natural_key_fields": ["url"], "on_empty": "warning", "name": "detail_records"}},
             ],
@@ -131,7 +124,6 @@ SYSTEM_TEMPLATES: list[dict[str, Any]] = [
 
 
 _LITERAL_URL = re.compile(r"https?://[^\s}]+", re.I)
-_SITE_MARKER = re.compile(r"(?:bcse|бвфб|press[-_]center|bcsenews)", re.I)
 
 
 def _clean_graph(graph: dict[str, Any]) -> dict[str, Any]:
@@ -166,20 +158,17 @@ def _clean_graph(graph: dict[str, Any]) -> dict[str, Any]:
                 "link_selector": "",
                 "url_pattern": "",
                 "base_url": "",
-                "title_selector": "",
-                "date_selector": "",
-                "body_selector": "",
-                "tag_selector": "",
-                "language": "",
-                "source_name": "{{source.name}}",
+                "detail_fields": [],
+                "detail_constants": {},
+                "date_range_query": {},
                 "detail_fetch_mode": "AUTO",
             })
+            for legacy_key in ("title_selector", "date_selector", "body_selector", "tag_selector", "language", "source_name", "attachment_selector", "lookback_days"):
+                config.pop(legacy_key, None)
         if node_type == "validate":
-            schema_text = json.dumps(config.get("schema", {}), ensure_ascii=False)
-            if _SITE_MARKER.search(schema_text) or _LITERAL_URL.search(schema_text):
-                config["schema"] = {}
-                config["required"] = []
-                config["fail_on_error"] = False
+            config["schema"] = {}
+            config["required"] = []
+            config["fail_on_error"] = False
         if node_type == "output":
             config.pop("dataset_id", None)
             config["natural_key_fields"] = ["url"]
@@ -205,8 +194,6 @@ def _template_issues(graph: dict[str, Any]) -> list[str]:
         elif isinstance(value, str):
             if _LITERAL_URL.search(value) and "{{source." not in value:
                 issues.append(f"literal URL at {path}")
-            if _SITE_MARKER.search(value):
-                issues.append(f"site marker at {path}")
 
     visit(graph)
     return issues

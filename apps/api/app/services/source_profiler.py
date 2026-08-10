@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlsplit
 
@@ -166,7 +165,20 @@ def detect_repeating_candidates(soup: BeautifulSoup) -> list[dict[str, Any]]:
         except Exception:
             continue
         fields = infer_repeating_fields(containers[0]) if containers else []
-        candidate: dict[str, Any] = {"selector": selector, "count": count, "direct_link": selector.startswith("a.")}
+        populations = [
+            sum(1 for field in fields if container.select_one(str(field.get("selector") or ""))) / len(fields)
+            for container in containers[:10]
+        ] if fields else [0.0]
+        candidate: dict[str, Any] = {
+            "selector": selector,
+            "count": count,
+            "direct_link": selector.startswith("a."),
+            "field_population": sum(populations) / len(populations),
+            "descendant_count": min(
+                (len(container.select("*")) for container in containers[:10]),
+                default=0,
+            ),
+        }
         if fields:
             candidate["fields"] = fields
         link = next((field for field in fields if field.get("name") == "url"), None)
@@ -202,25 +214,21 @@ def infer_repeating_fields(container: Any) -> list[dict[str, Any]]:
         if link.get_text(" ", strip=True):
             add("title", selector)
 
-    def semantic_selector(tokens: tuple[str, ...]) -> str:
-        for element in descendants[1:]:
-            haystack = " ".join([str(element.get("id") or ""), *(str(item) for item in (element.get("class") or []))]).lower()
-            if any(token in haystack for token in tokens):
-                classes = [str(item) for item in (element.get("class") or [])]
-                if classes:
-                    return "." + ".".join(classes)
-                if element.get("id"):
-                    element_id = str(element.get("id"))
-                    match = re.match(r"^(.*?[_-])?\d+$", element_id)
-                    if match and match.group(1):
-                        return f'{element.name}[id^="{match.group(1)}"]'
-                    return f"#{element_id}"
-        return ""
-
-    add("title", semantic_selector(("title", "name", "product", "description", "service", "caption")))
-    add("rate", semantic_selector(("rate", "interest", "percent", "yield", "stavk")))
-    add("term", semantic_selector(("term", "period", "month", "day", "srok", "срок")))
-    add("currency", semantic_selector(("currency", "curr", "valut", "byn", "usd", "eur")))
+    if not any(field.get("name") == "title" for field in fields):
+        heading = container.select_one("h1, h2, h3, h4, h5, h6, [itemprop='headline']")
+        if heading:
+            classes = [str(item) for item in (heading.get("class") or [])]
+            selector = "." + ".".join(classes) if classes else heading.name
+            add("title", selector)
+    image = container.select_one("img[src]")
+    if image:
+        classes = [str(item) for item in (image.get("class") or [])]
+        add("image", "." + ".".join(classes) if classes else "img[src]", attribute="src")
+    published = container.select_one("time[datetime], [itemprop='datePublished']")
+    if published:
+        classes = [str(item) for item in (published.get("class") or [])]
+        selector = "." + ".".join(classes) if classes else published.name
+        add("source_published_at", selector, attribute="datetime" if published.get("datetime") else None)
     return fields
 
 
@@ -230,16 +238,18 @@ def build_extractor_suggestion(candidates: list[dict[str, Any]]) -> dict[str, An
     if not usable:
         return {"container_selector": "", "fields": [], "follow_links": False}
 
-    def score(item: dict[str, Any]) -> tuple[int, int, int, int]:
+    def score(item: dict[str, Any]) -> tuple[float, int, int, int, int, int]:
         fields = item.get("fields") or []
         names = {field.get("name") for field in fields if isinstance(field, dict)}
         # Prefer a repeated item that exposes a detail link and a title.  The
         # profiler never needs to know the vocabulary or markup of one site.
         return (
-            int(bool(item.get("direct_link"))),
+            float(item.get("field_population") or 0),
             int("url" in names and "title" in names),
+            min(int(item.get("descendant_count") or 0), 20),
             len(fields),
             min(int(item.get("count") or 0), 500),
+            int(not item.get("direct_link")),
         )
 
     selected = max(usable, key=score)

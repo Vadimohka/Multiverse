@@ -179,16 +179,37 @@ For unfiltered current records without an observation, fallback ordering is `(re
 
 ## БВФБ agent examples
 
-All current БВФБ news published from a date:
+The external agent computes the requested civil-time interval. Multiverse only
+applies that explicit interval to source publication timestamps; it does not
+interpret phrases such as "yesterday".
+
+Create a revocable read-only credential once (the cleartext `token` is returned
+only by this response):
 
 ```http
-GET /api/v1/datasets/bcse-news/records?view=current&time_basis=source_published_at&from=2026-08-10T00:00:00+03:00&limit=100
+POST /api/v1/api-tokens
+Authorization: Bearer <administrator-JWT>
+Content-Type: application/json
+
+{
+  "name": "BCSE news agent",
+  "scopes": ["datasets:read"],
+  "dataset_ids": ["<bcse-dataset-uuid>"]
+}
+```
+
+All current БВФБ news published during 10 August in `Europe/Minsk`. The `+`
+in an offset must be URL-encoded as `%2B`:
+
+```http
+GET /api/v1/datasets/bcse-news/records?view=current&time_basis=source_published_at&from=2026-08-10T00:00:00%2B03:00&to=2026-08-11T00:00:00%2B03:00&sort=asc&limit=100
+Authorization: Bearer mv_<service-token>
 ```
 
 Continue:
 
 ```http
-GET /api/v1/datasets/bcse-news/records?view=current&time_basis=source_published_at&from=2026-08-10T00:00:00+03:00&limit=100&cursor=<opaque>
+GET /api/v1/datasets/bcse-news/records?view=current&time_basis=source_published_at&from=2026-08-10T00:00:00%2B03:00&to=2026-08-11T00:00:00%2B03:00&sort=asc&limit=100&cursor=<opaque>
 ```
 
 Only what the latest scheduled parser run saw:
@@ -226,4 +247,3 @@ Existing JWT bearer tokens continue to work. Scoped service tokens use the same 
 ## OpenAPI requirements
 
 OpenAPI enumerates views/time bases, mutual exclusions, aware datetime formats, response envelope, cursor behavior and error schemas. Examples above are included in endpoint documentation and tested against generated schema.
-

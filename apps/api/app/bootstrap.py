@@ -4,7 +4,12 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models import DataSchema, Dataset, Project, Prompt, Source, User, UserRole, Workflow
 from app.security import hash_password
-from app.seed_templates import BANK_DEPOSIT_SCHEMA, DEPOSIT_SYSTEM_PROMPT
+from app.seed_templates import (
+    BANK_DEPOSIT_SCHEMA,
+    BCSE_NEWS_SCHEMA,
+    DEPOSIT_SYSTEM_PROMPT,
+    bcse_news_graph,
+)
 
 
 def seed(db: Session) -> None:
@@ -19,6 +24,7 @@ def seed(db: Session) -> None:
         )
         db.add(admin)
         db.flush()
+    ensure_bcse_news_preset(db, admin)
     project = db.scalar(select(Project).where(Project.slug == "demo-bank-deposits"))
     if project:
         db.commit()
@@ -57,7 +63,9 @@ def seed(db: Session) -> None:
             ]}},
             {"id": "normalize", "type": "transform", "position": {"x": 910, "y": 160}, "config": {"input_path": "records", "operations": [
                 {"type": "currency", "field": "currency"}, {"type": "term", "field": "term"}, {"type": "rate", "field": "rate"},
-                {"type": "constant", "field": "customer_segment", "value": "INDIVIDUAL"}, {"type": "constant", "field": "confidence", "value": 1.0},
+                {"type": "constant", "field": "customer_segment", "value": "INDIVIDUAL"},
+                {"type": "constant", "field": "source_url", "value": "{{source.url}}"},
+                {"type": "constant", "field": "confidence", "value": 1.0},
             ]}},
             {"id": "mapping", "type": "mapping", "position": {"x": 1030, "y": 160}, "config": {"input_path": "records", "fields": []}},
             {"id": "validate", "type": "validate", "position": {"x": 1140, "y": 160}, "config": {"input_path": "records", "required": ["institution_name", "product_name", "currency", "term_original"], "fail_on_error": True}},
@@ -88,4 +96,67 @@ def seed(db: Session) -> None:
     db.add(Workflow(project_id=project.id, name="Нормализация депозитов", description="Workflow для входных JSON-записей", graph_json=input_graph, published_version=None))
     db.add(Workflow(project_id=project.id, name="Демо-парсер депозитов", description="Рабочий HTTP → HTML cards → normalization → validation → dataset workflow", graph_json=graph, published_version=None))
     db.add(Prompt(project_id=project.id, name="Извлечение депозитных ставок", provider="mock", model="mock", system_prompt=DEPOSIT_SYSTEM_PROMPT, user_prompt="Контент:\n{{content}}\nСхема:\n{{schema}}", response_schema=BANK_DEPOSIT_SCHEMA, published=True))
+    db.commit()
+
+
+def ensure_bcse_news_preset(db: Session, admin: User) -> None:
+    """Install a ready site preset while keeping every selector out of core."""
+    project = db.scalar(select(Project).where(Project.slug == "bcse-news"))
+    if project is None:
+        project = Project(
+            name="Новости БВФБ",
+            slug="bcse-news",
+            description="Готовый site preset: календарь БВФБ → news detail → versioned dataset",
+            created_by=admin.id,
+        )
+        db.add(project)
+        db.flush()
+    schema = db.scalar(select(DataSchema).where(DataSchema.project_id == project.id, DataSchema.name == "BCSENews"))
+    if schema is None:
+        schema = DataSchema(
+            project_id=project.id,
+            name="BCSENews",
+            description="Структурированная новость БВФБ",
+            schema_json=BCSE_NEWS_SCHEMA,
+            published=True,
+        )
+        db.add(schema)
+        db.flush()
+    dataset = db.scalar(select(Dataset).where(Dataset.slug == "bcse-news"))
+    if dataset is None:
+        dataset = Dataset(
+            project_id=project.id,
+            schema_id=schema.id,
+            name="Новости БВФБ",
+            slug="bcse-news",
+            natural_key_fields=["news_id"],
+            review_policy={"new": False, "changed": True, "confidence_below": 0.8},
+        )
+        db.add(dataset)
+        db.flush()
+    source = db.scalar(select(Source).where(
+        Source.project_id == project.id,
+        Source.entry_url == "https://www.bcse.by/press_center/calendar",
+    ))
+    if source is None:
+        source = Source(
+            project_id=project.id,
+            name="БВФБ — календарь новостей",
+            source_type="WEB_SITE",
+            entry_url="https://www.bcse.by/press_center/calendar",
+            base_url="https://www.bcse.by",
+            fetch_mode="HTTP",
+            description="Site preset; selectors and query parameters live in workflow configuration",
+            settings={"access_status": "PUBLIC"},
+        )
+        db.add(source)
+        db.flush()
+    workflow = db.scalar(select(Workflow).where(Workflow.project_id == project.id, Workflow.name == "БВФБ: новости"))
+    if workflow is None:
+        db.add(Workflow(
+            project_id=project.id,
+            name="БВФБ: новости",
+            description="Конфигурационный preset list → detail с source publication timestamp",
+            graph_json=bcse_news_graph(source.id, dataset.id, incremental=True),
+        ))
     db.commit()

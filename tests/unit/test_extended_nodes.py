@@ -10,6 +10,8 @@ from workflow_engine.nodes import (
     LLMExtractNode,
     ParseDocumentNode,
     ParseTableNode,
+    collect_paginated_html,
+    dedupe_extracted_records,
     extract_article_record,
 )
 from workflow_engine.types import ExecutionContext
@@ -91,22 +93,90 @@ async def test_condition_skips_inactive_branch():
     assert result["skipped_nodes"] == ["no"]
 
 
-def test_crawl_links_article_extractor_uses_stable_bcse_fields():
+def test_compatibility_article_extractor_uses_standard_semantics_only():
     record = extract_article_record(
-        """<html><span id='title'> Новость&nbsp;БВФБ </span>
-        <div class='dynamic-publicationdate'>28 июля 2026</div>
-        <div id='pc_body'><p>Первый абзац.</p><p>Второй абзац.</p><a href='/files/rules.pdf'>Правила</a></div></html>""",
-        "https://www.bcse.by/press-center/news/n280720261/2026-07-28T17:28:35?utm=x",
-        {"news_id": "n280720261", "item": {}},
+        """<html><article itemscope><h1 itemprop='headline'> Release&nbsp;note </h1>
+        <time itemprop='datePublished' datetime='2026-07-28T17:28:35Z'>28 July</time>
+        <div itemprop='articleBody'><p>First paragraph.</p><p>Second paragraph.</p>
+        <a href='/files/rules.pdf'>Rules</a></div></article></html>""",
+        "https://news.example.test/releases/42?utm_source=test",
+        {"record_id": "42", "item": {}},
         {},
         None,
     )
-    assert record["news_id"] == "n280720261"
-    assert record["title"] == "Новость БВФБ"
-    assert record["published_at"] == "2026-07-28"
-    assert record["url"] == "https://www.bcse.by/press-center/news/n280720261/2026-07-28T17:28:35"
-    assert record["body_text"] == "Первый абзац.\n\nВторой абзац.\n\nПравила"
-    assert record["attachments_json"] == '[{"title": "Правила", "url": "https://www.bcse.by/files/rules.pdf"}]'
+    assert record["record_id"] == "42"
+    assert record["title"] == "Release note"
+    assert record["published_at"] == "2026-07-28T17:28:35"
+    assert record["url"] == "https://news.example.test/releases/42"
+    assert record["body_text"] == "First paragraph.\n\nSecond paragraph.\n\nRules"
+    assert record["attachments_json"] == '[{"title": "Rules", "url": "https://news.example.test/files/rules.pdf"}]'
+
+
+@pytest.mark.asyncio
+async def test_browser_tabs_are_opt_in(monkeypatch):
+    calls = []
+
+    async def discover(_page):
+        calls.append(True)
+        return []
+
+    class Page:
+        url = "https://example.test/list"
+
+        async def content(self):
+            return "<main>ready</main>"
+
+    monkeypatch.setattr("workflow_engine.nodes.discover_tab_descriptors", discover)
+
+    html = await collect_paginated_html(Page(), {}, 1000)
+
+    assert html == "<main>ready</main>"
+    assert calls == []
+
+
+def test_detail_extractor_emits_configured_arbitrary_fields_and_aware_timestamp():
+    record = extract_article_record(
+        """<html><h2 class='headline'>System status</h2>
+        <time class='released' datetime='2026-08-10T15:34:56'>10 August</time>
+        <div class='payload'>All services operational</div></html>""",
+        "https://status.example.test/incidents/42?region=eu",
+        {
+            "record_id": "42",
+            "fetched_at": "2026-08-10T15:35:02.123456Z",
+            "item": {"category": "availability"},
+        },
+        {
+            "detail_fields": [
+                {"name": "headline", "selector": ".headline"},
+                {"name": "message", "selector": ".payload"},
+                {
+                    "name": "source_published_at",
+                    "selector": "time.released",
+                    "attribute": "datetime",
+                    "timezone": "Europe/Minsk",
+                },
+                {
+                    "name": "attachments_json",
+                    "selector": ".payload a[href]",
+                    "multiple": True,
+                    "value": "links",
+                },
+            ],
+            "include_listing_fields": True,
+        },
+        None,
+    )
+
+    assert record == {
+        "record_id": "42",
+        "category": "availability",
+        "headline": "System status",
+        "message": "All services operational",
+        "source_published_at": "2026-08-10T12:34:56Z",
+        "attachments_json": "[]",
+        "fetched_at": "2026-08-10T15:35:02.123456Z",
+        "url": "https://status.example.test/incidents/42?region=eu",
+    }
 
 
 @pytest.mark.asyncio
@@ -114,3 +184,14 @@ async def test_crawl_links_filters_and_deduplicates_json_items():
     node = CrawlLinksNode()
     items = node._listing_items({"tabs": [{"contents": [{"url": "press-center/news/n010120261"}]}]}, {"items_path": "tabs.0.contents"})
     assert items == [{"url": "press-center/news/n010120261"}]
+
+
+def test_llm_record_deduplication_uses_payload_or_configured_keys():
+    records = [
+        {"incident_id": "one", "state": "open"},
+        {"incident_id": "two", "state": "open"},
+        {"incident_id": "one", "state": "open"},
+    ]
+
+    assert dedupe_extracted_records(records) == records[:2]
+    assert dedupe_extracted_records(records, ["state"]) == [records[0]]

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
@@ -25,10 +24,12 @@ from app.models import (
     DatabaseConnection,
     DataSchema,
     Dataset,
+    DatasetRun,
     LLMCall,
     NodeRun,
     RawDocument,
     Record,
+    RecordObservation,
     RecordVersion,
     ReviewTask,
     Run,
@@ -38,6 +39,7 @@ from app.models import (
     User,
     Workflow,
     WorkflowVersion,
+    utcnow,
 )
 from app.schemas import (
     NodeTestRequest,
@@ -54,24 +56,6 @@ from app.services.artifact_storage import ArtifactStorage
 
 router = APIRouter(prefix="/workflows", tags=["Workflows"])
 settings = get_settings()
-_LITERAL_URL = re.compile(r"https?://[^\s}]+", re.I)
-_SITE_MARKER = re.compile(r"(?:bcse|бвфб|press[-_]center|bcsenews)", re.I)
-
-
-def _is_legacy_site_workflow(workflow: Workflow) -> bool:
-    graph_text = json.dumps(workflow.graph_json, ensure_ascii=False)
-    if _SITE_MARKER.search(graph_text):
-        return True
-    for node in workflow.graph_json.get("nodes", []):
-        node_type = str(node.get("type") or "")
-        if node_type not in {"http_request", "browser_open", "download_file", "crawl_links"}:
-            continue
-        config = node.get("config") if isinstance(node.get("config"), dict) else {}
-        for key in ("url", "listing_url", "base_url"):
-            value = str(config.get(key) or "")
-            if _LITERAL_URL.search(value) and "{{source." not in value:
-                return True
-    return False
 
 
 @router.get("/catalog")
@@ -90,11 +74,6 @@ def list_workflows(
     if project_id:
         stmt = stmt.where(Workflow.project_id == project_id)
     workflows = list(db.scalars(stmt).all())
-    # Source-bound workflows were created by old versions of the source wizard.
-    # Keep them for backwards compatibility, but do not confuse the main list:
-    # the normal operation model is one reusable workflow plus many sources.
-    if not include_legacy:
-        workflows = [workflow for workflow in workflows if not (workflow.graph_json.get("settings", {}) or {}).get("source_id") and not _is_legacy_site_workflow(workflow)]
     return workflows
 
 
@@ -535,19 +514,33 @@ def persist_result(db: Session, workflow: Workflow, run: Run, result: dict[str, 
             record = Record(dataset_id=dataset_id, natural_key=natural_key, current_version=1, data_json=item, data_hash=data_hash, confidence=confidence, review_status="PENDING" if requires_review else "APPROVED")
             db.add(record)
             db.flush()
-            db.add(RecordVersion(record_id=record.id, run_id=run.id, version_number=1, data_json=item, data_hash=data_hash, confidence=confidence, review_status=record.review_status))
+            version = RecordVersion(record_id=record.id, run_id=run.id, version_number=1, data_json=item, data_hash=data_hash, confidence=confidence, review_status=record.review_status)
+            db.add(version)
+            db.flush()
+            add_record_observation(db, dataset, record, version, run, item, content_changed=True)
             if requires_review:
                 db.add(ReviewTask(project_id=workflow.project_id, record_id=record.id, run_id=run.id, reason="NEW_RECORD", old_data={}, new_data=item, evidence=evidence_from_item(item)))
                 counters["review_tasks"] += 1
             counters["created"] += 1
             continue
         if record.data_hash == data_hash:
+            version = db.scalar(
+                select(RecordVersion)
+                .where(RecordVersion.record_id == record.id, RecordVersion.data_hash == data_hash)
+                .order_by(RecordVersion.version_number.desc())
+            )
+            if version is None:
+                raise ValueError(f"Current version is missing for record {record.id}")
+            add_record_observation(db, dataset, record, version, run, item, content_changed=False)
             counters["unchanged"] += 1
             unchanged_candidates.append((record, item))
             continue
         requires_review = bool(review_policy.get("changed", True) or item.get("requires_review") or confidence < float(review_policy.get("confidence_below", 0.8)))
         next_version = record.current_version + 1
-        db.add(RecordVersion(record_id=record.id, run_id=run.id, version_number=next_version, data_json=item, data_hash=data_hash, confidence=confidence, review_status="PENDING" if requires_review else "APPROVED"))
+        version = RecordVersion(record_id=record.id, run_id=run.id, version_number=next_version, data_json=item, data_hash=data_hash, confidence=confidence, review_status="PENDING" if requires_review else "APPROVED")
+        db.add(version)
+        db.flush()
+        add_record_observation(db, dataset, record, version, run, item, content_changed=True)
         if requires_review:
             db.add(ReviewTask(project_id=workflow.project_id, record_id=record.id, run_id=run.id, reason="CHANGED_RECORD", old_data=record.data_json, new_data=item, evidence=evidence_from_item(item)))
             counters["review_tasks"] += 1
@@ -582,7 +575,72 @@ def persist_result(db: Session, workflow: Workflow, run: Run, result: dict[str, 
             ))
         counters["review_tasks"] += len(sample)
         counters["sampled_for_review"] = len(sample)
+    dataset_run = db.scalar(select(DatasetRun).where(DatasetRun.run_id == run.id, DatasetRun.dataset_id == dataset.id))
+    if dataset_run is None:
+        db.add(DatasetRun(
+            run_id=run.id,
+            dataset_id=dataset.id,
+            observed_count=counters["created"] + counters["updated"] + counters["unchanged"],
+        ))
     return counters
+
+
+def add_record_observation(
+    db: Session,
+    dataset: Dataset,
+    record: Record,
+    version: RecordVersion,
+    run: Run,
+    item: dict[str, Any],
+    *,
+    content_changed: bool,
+) -> None:
+    raw_document = raw_document_for_item(db, run.id, item)
+    fetched_at = metadata_datetime(item.get("fetched_at")) or (raw_document.created_at if raw_document else None)
+    db.add(RecordObservation(
+        dataset_id=dataset.id,
+        record_id=record.id,
+        record_version_id=version.id,
+        run_id=run.id,
+        source_id=run.source_id,
+        raw_document_id=raw_document.id if raw_document else None,
+        natural_key=record.natural_key,
+        content_changed=content_changed,
+        source_published_at=metadata_datetime(item.get("source_published_at") or item.get("published_at")),
+        source_modified_at=metadata_datetime(item.get("source_modified_at")),
+        fetched_at=fetched_at,
+        observed_at=utcnow(),
+    ))
+
+
+def metadata_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        text = value.strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def raw_document_for_item(db: Session, run_id: str, item: dict[str, Any]) -> RawDocument | None:
+    explicit_id = item.get("raw_document_id")
+    if explicit_id:
+        document = db.get(RawDocument, str(explicit_id))
+        if document and document.run_id == run_id:
+            return document
+    artifact = item.get("raw_artifact") if isinstance(item.get("raw_artifact"), dict) else {}
+    sha256 = artifact.get("sha256")
+    stmt = select(RawDocument).where(RawDocument.run_id == run_id)
+    if sha256:
+        stmt = stmt.where(RawDocument.sha256 == str(sha256))
+    return db.scalar(stmt.order_by(RawDocument.created_at.desc()))
 
 
 def evidence_from_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -628,6 +686,8 @@ def node_recommendations(node_type: str, output: dict[str, Any], error: dict[str
 
 def determine_run_status(graph: dict[str, Any], result: dict[str, Any], persistence: dict[str, Any]) -> str:
     """Report empty extraction honestly instead of calling it SUCCESS."""
+    if persistence.get("blocked"):
+        return "FAILED"
     if persistence.get("review_tasks"):
         return "WAITING_FOR_REVIEW"
     outputs = result.get("node_outputs", {})
@@ -652,7 +712,7 @@ def determine_run_status(graph: dict[str, Any], result: dict[str, Any], persiste
 
 def stable_record_hash(item: dict[str, Any]) -> str:
     """Hash business data only; run evidence and observation time must not create a revision."""
-    volatile = {"observed_at", "evidence", "raw_artifact", "status_code", "artifacts"}
+    volatile = {"fetched_at", "observed_at", "evidence", "raw_artifact", "status_code", "artifacts"}
     comparable = {key: value for key, value in item.items() if key not in volatile}
     return hashlib.sha256(json.dumps(comparable, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
 
@@ -765,9 +825,16 @@ async def execute_run(run_id: str) -> None:
         for artifact in context.artifacts:
             if artifact.get("storage_key"):
                 db.add(RawDocument(run_id=run.id, source_id=run.source_id, url=artifact.get("url", ""), content_type=artifact.get("content_type", ""), sha256=artifact.get("sha256", ""), storage_key=artifact["storage_key"], metadata_json={key: value for key, value in artifact.items() if key != "storage_key"}))
+        db.flush()
         persistence = persist_result(db, workflow, run, result)
         run.output_json = {**result, "persistence": persistence}
         run.status = determine_run_status(graph, result, persistence)
+        if persistence.get("blocked"):
+            run.error_json = {
+                "code": "PERSISTENCE_BLOCKED",
+                "message": persistence.get("warning") or "Dataset persistence validation failed",
+                "details": persistence.get("validation_errors") or [],
+            }
         run.finished_at = datetime.now(UTC)
         db.commit()
     except Exception as exc:
@@ -790,8 +857,6 @@ async def run_workflow(
     workflow = db.get(Workflow, workflow_id)
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow не найден")
-    if _is_legacy_site_workflow(workflow):
-        raise HTTPException(status_code=422, detail="Этот workflow содержит legacy-привязку к сайту. Создайте копию системного универсального шаблона и выберите источник запуска.")
     source_id = payload.source_id or workflow.graph_json.get("settings", {}).get("source_id")
     if source_id and not db.get(Source, source_id):
         raise HTTPException(status_code=404, detail="Источник не найден")

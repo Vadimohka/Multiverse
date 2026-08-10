@@ -2,6 +2,16 @@
 
 > Execution rule: add a failing generic or contract test before each behavior change. Site preset tests may use site selectors; core tests may not.
 
+## Implemented in the restoration change
+
+The P0 vertical slice and the P1 core-universality work in this plan are now
+implemented: per-run observations/dataset runs, timestamped Data API views,
+cursor pagination, scoped dataset tokens, the executable БВФБ preset, generic
+detail field/date-range configuration, neutral profiler scoring, generic URL
+identity/deduplication, honest blocked/empty run statuses, and matching no-code
+controls. Remaining scale optimizations and broader fixture coverage stay
+prioritized below rather than being represented as completed functionality.
+
 ## Delivery order
 
 1. P0 БВФБ/Data API vertical slice.
@@ -348,4 +358,3 @@ After all required checks pass:
 5. Confirm `git branch` lists only `main`, status is clean, refs/history remain reachable through `main`.
 
 No reset, clean, forced deletion or history rewrite is permitted.
-

@@ -32,6 +32,17 @@ class RunStatus(StrEnum):
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     TIMED_OUT = "TIMED_OUT"
+    SUCCESS_EMPTY_ALLOWED = "SUCCESS_EMPTY_ALLOWED"
+    SUCCESS_EMPTY_UNEXPECTED = "SUCCESS_EMPTY_UNEXPECTED"
+
+
+TERMINAL_RUN_STATUSES = frozenset(status.value for status in RunStatus if status not in {RunStatus.QUEUED, RunStatus.RUNNING})
+SUCCESSFUL_RUN_STATUSES = frozenset({
+    RunStatus.SUCCESS.value,
+    RunStatus.PARTIAL_SUCCESS.value,
+    RunStatus.WAITING_FOR_REVIEW.value,
+    RunStatus.SUCCESS_EMPTY_ALLOWED.value,
+})
 
 
 class ReviewStatus(StrEnum):
