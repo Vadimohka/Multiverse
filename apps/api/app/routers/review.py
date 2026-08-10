@@ -4,7 +4,7 @@ import hashlib
 import json
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.audit import audit
@@ -39,9 +39,17 @@ def decide(task_id: str, status: str, payload: ReviewDecision, db: Session, user
     task.status = status
     task.decision_by = user.id
     task.decision_comment = payload.comment
+    # A sample audits an existing visible record, not a proposed replacement.
+    # Rejecting it must not make data disappear from an export.
+    is_sample = task.reason == "SAMPLED_RECORD"
     if task.record_id:
         record = db.get(Record, task.record_id)
         if record:
+            if is_sample and status != "CORRECTED":
+                audit(db, user.id, status, "review_task", task.id, after={"comment": payload.comment})
+                db.commit()
+                db.refresh(task)
+                return task
             pending_version = db.scalar(
                 select(RecordVersion)
                 .where(RecordVersion.record_id == record.id, RecordVersion.run_id == task.run_id)
@@ -52,13 +60,17 @@ def decide(task_id: str, status: str, payload: ReviewDecision, db: Session, user
                 data_hash = stable_record_hash(accepted) if isinstance(accepted, dict) else hashlib.sha256(
                     json.dumps(accepted, ensure_ascii=False, sort_keys=True, default=str).encode()
                 ).hexdigest()
-                version_number = pending_version.version_number if pending_version else record.current_version + 1
+                version_number = pending_version.version_number if pending_version and not is_sample else (
+                    db.scalar(
+                        select(func.max(RecordVersion.version_number)).where(RecordVersion.record_id == record.id)
+                    ) or 0
+                ) + 1
                 record.data_json = accepted
                 record.data_hash = data_hash
                 record.current_version = version_number
                 record.review_status = status
                 record.confidence = float(accepted.get("confidence", record.confidence) or 0) if isinstance(accepted, dict) else record.confidence
-                if pending_version:
+                if pending_version and not is_sample:
                     pending_version.data_json = accepted
                     pending_version.data_hash = data_hash
                     pending_version.review_status = status

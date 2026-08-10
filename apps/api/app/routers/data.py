@@ -1,15 +1,37 @@
+import base64
 import csv
 import io
 import json
+from datetime import UTC, datetime, timedelta
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.audit import audit
 from app.database import get_db
-from app.dependencies import get_current_user, require_roles
-from app.models import DataSchema, Dataset, Record, RecordVersion, User
-from app.schemas import DatasetCreate, DatasetOut, DatasetUpdate
+from app.dependencies import (
+    DataPrincipal,
+    authorize_dataset_read,
+    get_current_user,
+    get_data_principal,
+    require_roles,
+    role_names,
+)
+from app.enums import SUCCESSFUL_RUN_STATUSES
+from app.models import (
+    DataSchema,
+    Dataset,
+    DatasetRun,
+    Record,
+    RecordObservation,
+    RecordVersion,
+    ReviewTask,
+    Run,
+    User,
+)
+from app.schemas import DataRecordsResponse, DatasetCreate, DatasetOut, DatasetUpdate
 from app.services.exporter import export_xlsx
 
 router = APIRouter(tags=["Данные и экспорт"])
@@ -59,20 +81,382 @@ def update_dataset(dataset_id: str, payload: DatasetUpdate, db: Session = Depend
     return dataset
 
 
-@router.get("/datasets/{dataset_id}/records")
-def list_records(dataset_id: str, limit: int = 100, offset: int = 0, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict:
-    if not db.get(Dataset, dataset_id): raise HTTPException(status_code=404, detail="Dataset не найден")
-    # The data catalogue is the confirmed-data view. Pending/rejected versions
-    # are available to operators through the dedicated review queue instead.
-    filters = (Record.dataset_id == dataset_id, Record.status == "ACTIVE", Record.review_status == "APPROVED")
-    total = db.scalar(select(func.count()).select_from(Record).where(*filters)) or 0
-    records = db.scalars(
-        select(Record).where(*filters)
-        .order_by(Record.updated_at.desc())
-        .offset(offset)
-        .limit(min(limit, 1000))
-    ).all()
-    return {"items": [{"id": r.id, "natural_key": r.natural_key, "status": r.status, "data": r.data_json, "confidence": r.confidence, "review_status": r.review_status, "updated_at": r.updated_at} for r in records], "limit": limit, "offset": offset, "total": total}
+def clear_dataset_records(db: Session, dataset_id: str) -> int:
+    """Remove only data owned by a dataset, including its review tasks."""
+    records = list(db.scalars(select(Record).where(Record.dataset_id == dataset_id)).all())
+    record_ids = [record.id for record in records]
+    if record_ids:
+        for task in db.scalars(select(ReviewTask).where(ReviewTask.record_id.in_(record_ids))).all():
+            db.delete(task)
+    for record in records:
+        db.delete(record)
+    return len(records)
+
+
+@router.delete("/datasets/{dataset_id}/records")
+def clear_dataset(dataset_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> dict:
+    if not db.get(Dataset, dataset_id):
+        raise HTTPException(status_code=404, detail="Dataset не найден")
+    removed = clear_dataset_records(db, dataset_id)
+    audit(db, user.id, "CLEAR", "dataset", dataset_id, after={"removed_records": removed})
+    db.commit()
+    return {"removed_records": removed}
+
+
+@router.delete("/datasets/{dataset_id}", status_code=204)
+def delete_dataset(dataset_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> None:
+    dataset = db.get(Dataset, dataset_id)
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset не найден")
+    removed = clear_dataset_records(db, dataset_id)
+    audit(db, user.id, "DELETE", "dataset", dataset_id, before={"name": dataset.name, "removed_records": removed})
+    db.delete(dataset)
+    db.commit()
+
+
+@router.get("/datasets/{dataset_id}/summary")
+def dataset_summary(dataset_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict:
+    if not db.get(Dataset, dataset_id):
+        raise HTTPException(status_code=404, detail="Dataset не найден")
+    base = (Record.dataset_id == dataset_id, Record.status == "ACTIVE")
+    return {
+        "approved": db.scalar(select(func.count()).select_from(Record).where(*base, Record.review_status == "APPROVED")) or 0,
+        "pending": db.scalar(select(func.count()).select_from(Record).where(*base, Record.review_status == "PENDING")) or 0,
+        "rejected": db.scalar(select(func.count()).select_from(Record).where(Record.dataset_id == dataset_id, Record.status == "REJECTED")) or 0,
+        "pending_initial": db.scalar(select(func.count()).select_from(Record).where(*base, Record.review_status == "PENDING", Record.current_version == 1)) or 0,
+    }
+
+
+@router.get("/datasets/{dataset_id}/records", response_model=DataRecordsResponse)
+def list_records(
+    dataset_id: str,
+    view: Literal["current", "latest_run", "run", "history"] = "current",
+    run_id: str | None = None,
+    time_basis: Literal["source_published_at", "source_modified_at", "fetched_at", "observed_at"] = "observed_at",
+    from_: datetime | None = Query(default=None, alias="from"),
+    to: datetime | None = None,
+    at: datetime | None = None,
+    cursor: str | None = None,
+    sort: Literal["asc", "desc"] = "desc",
+    limit: int = 100,
+    offset: int = 0,
+    include_pending: bool = False,
+    db: Session = Depends(get_db),
+    principal: DataPrincipal = Depends(get_data_principal),
+) -> dict:
+    dataset = resolve_dataset(db, dataset_id)
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset не найден")
+    authorize_dataset_read(principal, dataset.id)
+    if include_pending and (
+        principal.api_token or not role_names(principal.user).intersection({"ADMINISTRATOR", "OPERATOR"})
+    ):
+        raise HTTPException(status_code=403, detail="Pending records require a review role")
+    if view not in {"current", "latest_run", "run", "history"}:
+        raise HTTPException(status_code=422, detail="view must be current, latest_run, run or history")
+    if time_basis not in {"source_published_at", "source_modified_at", "fetched_at", "observed_at"}:
+        raise HTTPException(status_code=422, detail="Unsupported time_basis")
+    requested_at = at
+    from_, to = validate_time_range(from_, to, at)
+    if sort not in {"asc", "desc"}:
+        raise HTTPException(status_code=422, detail="sort must be asc or desc")
+    if cursor and offset:
+        raise HTTPException(status_code=422, detail="cursor cannot be combined with offset")
+    if view == "run" and not run_id:
+        raise HTTPException(status_code=422, detail="run_id is required for view=run")
+    if view != "run" and run_id:
+        raise HTTPException(status_code=422, detail="run_id is only valid for view=run")
+
+    selected_run_id = run_id
+    rows: list[tuple[Record, RecordVersion | None, RecordObservation | None]] = []
+    if view == "current":
+        filters = (Record.dataset_id == dataset.id, Record.status == "ACTIVE")
+        if not include_pending:
+            filters += (Record.review_status == "APPROVED",)
+        for record in db.scalars(select(Record).where(*filters)).all():
+            version = db.scalar(select(RecordVersion).where(
+                RecordVersion.record_id == record.id,
+                RecordVersion.version_number == record.current_version,
+            ))
+            observation = None
+            if version:
+                observation = db.scalar(select(RecordObservation).where(
+                    RecordObservation.record_id == record.id,
+                    RecordObservation.record_version_id == version.id,
+                ).order_by(RecordObservation.observed_at.desc(), RecordObservation.id.desc()))
+            rows.append((record, version, observation))
+    else:
+        if view == "latest_run":
+            selected_run_id = db.scalar(
+                select(DatasetRun.run_id)
+                .join(Run, Run.id == DatasetRun.run_id)
+                .where(
+                    DatasetRun.dataset_id == dataset.id,
+                    Run.status.in_(SUCCESSFUL_RUN_STATUSES),
+                )
+                .order_by(Run.finished_at.desc(), Run.created_at.desc(), Run.id.desc())
+                .limit(1)
+            )
+        elif view == "run":
+            dataset_run = db.scalar(select(DatasetRun).where(DatasetRun.dataset_id == dataset.id, DatasetRun.run_id == selected_run_id))
+            if not db.get(Run, selected_run_id) or not dataset_run:
+                raise HTTPException(status_code=404, detail="Run не найден для dataset")
+        observation_stmt = select(RecordObservation).where(RecordObservation.dataset_id == dataset.id)
+        if selected_run_id:
+            observation_stmt = observation_stmt.where(RecordObservation.run_id == selected_run_id)
+        elif view == "latest_run":
+            observation_stmt = observation_stmt.where(False)
+        for observation in db.scalars(observation_stmt).all():
+            record = db.get(Record, observation.record_id)
+            version = db.get(RecordVersion, observation.record_version_id)
+            if not record or not version:
+                continue
+            if not include_pending and version.review_status != "APPROVED":
+                continue
+            rows.append((record, version, observation))
+
+    filtered = [row for row in rows if observation_matches_time(row[2], time_basis, from_, to)]
+    sort_observation_rows(filtered, time_basis, sort)
+    total = len(filtered)
+    cursor_context = {
+        "dataset_id": dataset.id,
+        "view": view,
+        "run_id": selected_run_id,
+        "time_basis": time_basis,
+        "from": iso_utc(from_),
+        "to": iso_utc(to),
+        "sort": sort,
+        "include_pending": include_pending,
+    }
+    if cursor:
+        cursor_payload = decode_cursor(cursor)
+        if cursor_payload.get("context") != cursor_context:
+            raise HTTPException(status_code=400, detail="Cursor does not match request filters")
+        cursor_key = (cursor_payload["null_rank"], cursor_payload["parsed_timestamp"], cursor_payload["id"])
+        filtered = [
+            row for row in filtered
+            if observation_key_is_after(observation_sort_key(row[2], time_basis, row[0]), cursor_key, sort)
+        ]
+    page_limit = min(max(limit, 1), 1000)
+    start = max(offset, 0) if not cursor else 0
+    page = filtered[start:start + page_limit]
+    has_more = len(filtered) > start + len(page)
+    next_cursor = encode_cursor(page[-1], time_basis, cursor_context) if page and has_more else None
+    items = [record_api_item(*row) for row in page]
+    return {
+        "items": items,
+        "pagination": {"limit": page_limit, "next_cursor": next_cursor},
+        "meta": {
+            "dataset_id": dataset.id,
+            "dataset_slug": dataset.slug,
+            "view": view,
+            "run_id": selected_run_id,
+            "time_basis": time_basis,
+            "from": iso_utc(from_),
+            "to": iso_utc(to),
+            "at": iso_utc(requested_at),
+        },
+        # Compatibility fields for the existing frontend and API consumers.
+        "limit": page_limit,
+        "offset": max(offset, 0),
+        "total": total,
+    }
+
+
+def resolve_dataset(db: Session, dataset_ref: str) -> Dataset | None:
+    return db.get(Dataset, dataset_ref) or db.scalar(select(Dataset).where(Dataset.slug == dataset_ref))
+
+
+def validate_time_range(
+    from_: datetime | None,
+    to: datetime | None,
+    at: datetime | None,
+) -> tuple[datetime | None, datetime | None]:
+    values = [value for value in (from_, to, at) if value is not None]
+    if any(value.tzinfo is None or value.utcoffset() is None for value in values):
+        raise HTTPException(status_code=422, detail="Timestamps must include a timezone")
+    if at and (from_ or to):
+        raise HTTPException(status_code=422, detail="at cannot be combined with from/to")
+    if at:
+        start = at.astimezone(UTC).replace(microsecond=0)
+        return start, start + timedelta(seconds=1)
+    start = from_.astimezone(UTC) if from_ else None
+    end = to.astimezone(UTC) if to else None
+    if start and end and end <= start:
+        raise HTTPException(status_code=422, detail="to must be later than from")
+    return start, end
+
+
+def observation_matches_time(
+    observation: RecordObservation | None,
+    time_basis: str,
+    from_: datetime | None,
+    to: datetime | None,
+) -> bool:
+    if from_ is None and to is None:
+        return True
+    if observation is None:
+        return False
+    value = getattr(observation, time_basis)
+    if value is None:
+        return False
+    value = ensure_utc(value)
+    return not ((from_ and value < from_) or (to and value >= to))
+
+
+def observation_sort_key(
+    observation: RecordObservation | None,
+    time_basis: str,
+    record: Record,
+) -> tuple[int, datetime, str]:
+    if observation is None:
+        return 0, ensure_utc(record.created_at), record.id
+    value = getattr(observation, time_basis)
+    if value is None:
+        return 1, datetime.min.replace(tzinfo=UTC), observation.id
+    return 0, ensure_utc(value), observation.id
+
+
+def sort_observation_rows(
+    rows: list[tuple[Record, RecordVersion | None, RecordObservation | None]],
+    time_basis: str,
+    direction: str,
+) -> None:
+    # The stable second sort keeps NULL timestamps last for both directions.
+    rows.sort(
+        key=lambda row: observation_sort_key(row[2], time_basis, row[0])[1:],
+        reverse=direction == "desc",
+    )
+    rows.sort(key=lambda row: observation_sort_key(row[2], time_basis, row[0])[0])
+
+
+def observation_key_is_after(
+    key: tuple[int, datetime, str],
+    cursor_key: tuple[int, datetime, str],
+    direction: str,
+) -> bool:
+    if key[0] != cursor_key[0]:
+        return key[0] > cursor_key[0]
+    return key[1:] < cursor_key[1:] if direction == "desc" else key[1:] > cursor_key[1:]
+
+
+def record_api_item(
+    record: Record,
+    version: RecordVersion | None,
+    observation: RecordObservation | None,
+) -> dict:
+    data = version.data_json if version else record.data_json
+    return {
+        "id": record.id,
+        "record_id": record.id,
+        "record_version_id": version.id if version else None,
+        "natural_key": record.natural_key,
+        "status": record.status,
+        "data": data,
+        "timestamps": {
+            "source_published_at": iso_utc(observation.source_published_at if observation else None),
+            "source_modified_at": iso_utc(observation.source_modified_at if observation else None),
+            "fetched_at": iso_utc(observation.fetched_at if observation else None),
+            "observed_at": iso_utc(observation.observed_at if observation else None),
+        },
+        "provenance": {
+            "run_id": observation.run_id if observation else (version.run_id if version else None),
+            "source_id": observation.source_id if observation else None,
+            "raw_document_id": observation.raw_document_id if observation else None,
+        },
+        "confidence": version.confidence if version else record.confidence,
+        "review_status": version.review_status if version else record.review_status,
+        "updated_at": iso_utc(record.updated_at),
+    }
+
+
+def ensure_utc(value: datetime) -> datetime:
+    return (value.replace(tzinfo=UTC) if value.tzinfo is None else value).astimezone(UTC)
+
+
+def iso_utc(value: datetime | None) -> str | None:
+    return ensure_utc(value).isoformat().replace("+00:00", "Z") if value else None
+
+
+def encode_cursor(
+    row: tuple[Record, RecordVersion | None, RecordObservation | None],
+    time_basis: str,
+    context: dict,
+) -> str:
+    null_rank, timestamp, item_id = observation_sort_key(row[2], time_basis, row[0])
+    raw = json.dumps(
+        {
+            "null_rank": null_rank,
+            "timestamp": None if null_rank else iso_utc(timestamp),
+            "id": item_id,
+            "context": context,
+        },
+        separators=(",", ":"),
+    ).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def decode_cursor(cursor: str) -> dict:
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        value = json.loads(base64.urlsafe_b64decode(cursor + padding))
+        if not isinstance(value, dict) or not {"null_rank", "timestamp", "id", "context"} <= value.keys():
+            raise ValueError
+        if value["null_rank"] not in {0, 1} or not isinstance(value["id"], str) or not value["id"]:
+            raise ValueError
+        if not isinstance(value["context"], dict):
+            raise ValueError
+        if value["null_rank"] == 1:
+            if value["timestamp"] is not None:
+                raise ValueError
+            parsed = datetime.min.replace(tzinfo=UTC)
+        else:
+            if not isinstance(value["timestamp"], str):
+                raise ValueError
+            parsed = datetime.fromisoformat(value["timestamp"].replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError
+            parsed = parsed.astimezone(UTC)
+        value["parsed_timestamp"] = parsed
+        return value
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid cursor") from exc
+
+
+@router.post("/datasets/{dataset_id}/accept-baseline")
+def accept_baseline(dataset_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "OPERATOR"))) -> dict:
+    """Publish only first-observation records after an operator reviewed a sample.
+
+    Later changed versions keep their own Review Queue tasks and are never
+    silently accepted by this convenience action.
+    """
+    if not db.get(Dataset, dataset_id):
+        raise HTTPException(status_code=404, detail="Dataset не найден")
+    records = list(db.scalars(select(Record).where(
+        Record.dataset_id == dataset_id,
+        Record.status == "ACTIVE",
+        Record.review_status == "PENDING",
+        Record.current_version == 1,
+    )).all())
+    record_ids = [record.id for record in records]
+    for record in records:
+        record.review_status = "APPROVED"
+    if record_ids:
+        versions = db.scalars(select(RecordVersion).where(RecordVersion.record_id.in_(record_ids), RecordVersion.version_number == 1)).all()
+        for version in versions:
+            version.review_status = "APPROVED"
+        tasks = db.scalars(select(ReviewTask).where(
+            ReviewTask.record_id.in_(record_ids),
+            ReviewTask.reason == "NEW_RECORD",
+            ReviewTask.status == "PENDING",
+        )).all()
+        for task in tasks:
+            task.status = "APPROVED"
+            task.decision_by = user.id
+            task.decision_comment = "Базовый срез принят оператором после выборочной проверки"
+    audit(db, user.id, "ACCEPT_BASELINE", "dataset", dataset_id, after={"approved_records": len(records)})
+    db.commit()
+    return {"approved_records": len(records)}
 
 
 @router.get("/records/{record_id}/history")

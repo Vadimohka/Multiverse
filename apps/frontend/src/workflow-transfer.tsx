@@ -1,0 +1,13 @@
+import {useState} from 'react';
+import {useQuery} from '@tanstack/react-query';
+import {api} from './api';
+import {ErrorPanel,Header,Loading} from './components';
+
+export function WorkflowTransferPage(){
+ const workflows=useQuery({queryKey:['workflows'],queryFn:()=>api<any[]>('/workflows')}); const projects=useQuery({queryKey:['projects'],queryFn:()=>api<any[]>('/projects')});
+ const [workflowId,setWorkflowId]=useState('');const [projectId,setProjectId]=useState('');const [file,setFile]=useState<File|null>(null);const [message,setMessage]=useState('');
+ async function download(){if(!workflowId)return;const blob=await api<Blob>(`/workflows/${workflowId}/export`);const item=(workflows.data||[]).find(x=>x.id===workflowId);const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download=`${item?.name||'workflow'}.parser-workflow.json`;link.click();URL.revokeObjectURL(link.href);setMessage('Конфигурация скачана: URL запуска и секреты в файл не попадают.')}
+ async function upload(){if(!file||!projectId)return;const raw=JSON.parse(await file.text());if(raw.format!=='parser-studio-workflow/v1'||!raw.graph_json)throw new Error('Это не файл workflow Parser Studio');const created=await api<any>('/workflows/import',{method:'POST',body:JSON.stringify({project_id:projectId,name:raw.name||file.name.replace(/\.json$/,''),description:raw.description||'',graph_json:raw.graph_json})});setMessage(`Workflow «${created.name}» импортирован.`)}
+ if(workflows.isLoading||projects.isLoading)return <Loading/>;if(workflows.error||projects.error)return <ErrorPanel error={workflows.error||projects.error}/>;
+ return <><Header title="Импорт и экспорт workflow"/><div className="split"><section className="panel form"><h2>Скачать конфигурацию</h2><label>Workflow<select value={workflowId} onChange={e=>setWorkflowId(e.target.value)}><option value="">Выберите workflow</option>{workflows.data?.map(x=><option key={x.id} value={x.id}>{x.name}</option>)}</select></label><button disabled={!workflowId} onClick={download}>Скачать JSON</button></section><section className="panel form"><h2>Загрузить конфигурацию</h2><label>Проект<select value={projectId} onChange={e=>setProjectId(e.target.value)}><option value="">Выберите проект</option>{projects.data?.map(x=><option key={x.id} value={x.id}>{x.name}</option>)}</select></label><label>Файл workflow<input type="file" accept="application/json,.json" onChange={e=>setFile(e.target.files?.[0]||null)}/></label><button disabled={!file||!projectId} onClick={upload}>Импортировать JSON</button></section></div>{message&&<div className="notice">{message}</div>}</>;
+}

@@ -13,7 +13,7 @@ from datetime import time as datetime_time
 from html import escape
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -40,6 +40,16 @@ class HTTPRequestNode:
         url = render_template(str(config.get("url") or "{{source.url}}"), context, inputs)
         if not url:
             raise ValueError("HTTP Request: URL не задан")
+        source_settings = context.variables.get("source", {}).get("settings", {})
+        profile = source_settings.get("profile", {}) if isinstance(source_settings, dict) else {}
+        # Source Profiler runs in the UI before a source is created. Reuse its
+        # verdict so public pages rendered by JavaScript are not parsed as an
+        # empty static shell.
+        needs_browser = bool(profile.get("requires_javascript")) or source_settings.get("fetch_mode") == "PLAYWRIGHT"
+        if needs_browser and not config.get("_force_http"):
+            return await BrowserOpenNode().execute(
+                context, inputs, {**config, "url": url, "http_fallback": True, "_force_http": True}
+            )
         method = str(config.get("method", "GET")).upper()
         timeout = float(config.get("timeout", 30))
         headers = render_object(config.get("headers") or {}, context, inputs)
@@ -83,7 +93,8 @@ class BrowserOpenNode:
                 await page.goto(url, wait_until=str(config.get("wait_until", "networkidle")), timeout=timeout_ms)
                 for action in config.get("actions", []):
                     await perform_browser_action(page, action, timeout_ms)
-                rendered_html = await page.content()
+                tab_descriptors = await discover_tab_descriptors(page) if config.get("tabs_enabled", False) else []
+                rendered_html = await collect_paginated_html(page, config, timeout_ms, start_url=page.url)
                 screenshot = await page.screenshot(full_page=bool(config.get("full_page", True)), type="png")
                 title = await page.title()
                 final_url = page.url
@@ -109,6 +120,8 @@ class BrowserOpenNode:
                 "html": rendered_html,
                 "text": BeautifulSoup(rendered_html, "lxml").get_text("\n", strip=True),
                 "network": network,
+                "tab_count": len(tab_descriptors),
+                "tab_labels": [item.get("text") for item in tab_descriptors],
                 "artifacts": artifacts,
                 "browser_mode": "PLAYWRIGHT",
             }
@@ -118,7 +131,7 @@ class BrowserOpenNode:
             if not config.get("http_fallback", True):
                 raise
             context.log("WARNING", "Browser Open завершился ошибкой; использован HTTP fallback", error=str(exc))
-        fallback = await HTTPRequestNode().execute(context, inputs, {**config, "url": url})
+        fallback = await HTTPRequestNode().execute(context, inputs, {**config, "url": url, "_force_http": True})
         fallback["html"] = fallback.get("body")
         fallback["browser_mode"] = "HTTP_FALLBACK"
         return fallback
@@ -147,6 +160,178 @@ async def perform_browser_action(page: Any, action: dict[str, Any], timeout_ms: 
         await page.evaluate(str(action.get("script", "")))
     else:
         raise ValueError(f"Неизвестное browser action: {kind}")
+
+
+async def collect_paginated_html(page: Any, config: dict[str, Any], timeout_ms: int, start_url: str | None = None) -> str:
+    """Collect every semantic tab and every page exposed by its paginator.
+
+    The controls are discovered from ARIA/data-toggle semantics rather than
+    site-specific classes or URLs.  Each tab is revisited from the original
+    listing URL so a tab that changes the URL cannot hide subsequent tabs.
+    """
+    tabs_enabled = bool(config.get("tabs_enabled", False))
+    initial_url = start_url or page.url
+    descriptors = await discover_tab_descriptors(page) if tabs_enabled else []
+    if descriptors:
+        sections: list[str] = []
+        wait_ms = int(config.get("tabs_wait_ms", config.get("pagination_wait_ms", 500)))
+
+        async def visit(path: list[dict[str, str]]) -> None:
+            try:
+                await page.goto(initial_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                for control in path:
+                    await click_tab_descriptor(page, control, timeout_ms)
+                    await page.wait_for_timeout(wait_ms)
+                visible = await discover_tab_descriptors(page)
+                current_depth = int(path[-1].get("scope_depth") or 0)
+                path_keys = {tab_descriptor_key(item) for item in path}
+                children = [item for item in visible if int(item.get("scope_depth") or 0) > current_depth and tab_descriptor_key(item) not in path_keys]
+                if children and len(path) < int(config.get("tabs_max_depth", 4)):
+                    for child in children:
+                        await visit(path + [child])
+                else:
+                    sections.append(await collect_current_paginated_html(page, config, timeout_ms))
+            except Exception:
+                return
+
+        for descriptor in descriptors:
+            await visit([descriptor])
+        if sections:
+            return merge_rendered_sections(sections)
+    return await collect_current_paginated_html(page, config, timeout_ms)
+
+
+async def discover_tab_descriptors(page: Any) -> list[dict[str, str]]:
+    """Return visible, semantic tab controls with stable attributes."""
+    script = """
+    () => Array.from(document.querySelectorAll(
+      '[role="tab"], [aria-controls], [data-toggle="tab"], [data-bs-toggle="tab"]'
+    )).filter((el) => {
+      const rect = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    }).map((el) => ({
+      id: el.id || '', role: el.getAttribute('role') || '',
+      aria_controls: el.getAttribute('aria-controls') || '',
+      href: el.getAttribute('href') || '',
+      text: (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 160),
+      scope_depth: (() => { let depth = 0, node = el.parentElement; while (node) { if (node.getAttribute && node.getAttribute('role') === 'tabpanel') depth += 1; node = node.parentElement; } return depth; })()
+    }))
+    """
+    values = await page.evaluate(script)
+    result: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str, str]] = set()
+    for item in values or []:
+        if not isinstance(item, dict) or not item.get("text"):
+            continue
+        key = (str(item.get("id") or ""), str(item.get("aria_controls") or ""), str(item.get("href") or ""), str(item.get("text") or ""), str(item.get("scope_depth") or "0"))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append({key_name: str(item.get(key_name) or "") for key_name in ("id", "role", "aria_controls", "href", "text", "scope_depth")})
+    return result
+
+
+def tab_descriptor_key(item: dict[str, str]) -> tuple[str, str, str, str, str]:
+    return (item.get("id", ""), item.get("aria_controls", ""), item.get("href", ""), item.get("text", ""), item.get("scope_depth", "0"))
+
+
+async def click_tab_descriptor(page: Any, descriptor: dict[str, str], timeout_ms: int) -> None:
+    selectors: list[str] = []
+    if descriptor.get("id"):
+        selectors.append(f"#{css_escape(descriptor['id'])}")
+    if descriptor.get("aria_controls"):
+        selectors.append(f"[aria-controls='{css_escape(descriptor['aria_controls'])}']")
+    if descriptor.get("href"):
+        selectors.append(f"[href='{css_escape(descriptor['href'])}']")
+    for selector in selectors:
+        locator = page.locator(selector).first
+        if await locator.count() and await locator.is_visible():
+            await locator.click(timeout=timeout_ms)
+            return
+    locator = page.get_by_text(descriptor.get("text", ""), exact=True).first
+    if await locator.count() and await locator.is_visible():
+        await locator.click(timeout=timeout_ms)
+        return
+    raise ValueError("Semantic tab control is no longer available")
+
+
+def css_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+async def collect_current_paginated_html(page: Any, config: dict[str, Any], timeout_ms: int) -> str:
+    """Collect the current tab through visible pagination controls."""
+    if not config.get("pagination_enabled"):
+        return await page.content()
+    max_pages = min(max(int(config.get("pagination_max_pages", 25)), 1), 500)
+    selector = str(config.get("pagination_next_selector") or "li[aria-label='Next page'] a")
+    rendered_pages: list[str] = []
+    seen_signatures: set[str] = set()
+    for _ in range(max_pages):
+        document = await page.content()
+        rendered_pages.append(document)
+        signature = await page_text_signature(page)
+        if signature in seen_signatures:
+            break
+        seen_signatures.add(signature)
+        candidates = page.locator(selector)
+        next_link = None
+        for index in range(await candidates.count()):
+            candidate = candidates.nth(index)
+            if await candidate.is_visible():
+                next_link = candidate
+                break
+        if next_link is None:
+            # Some client-side pagers expose an empty-href anchor without an
+            # aria label.  Use only visible conventional next-page captions as
+            # a semantic fallback; no site URL or CSS class is required.
+            candidates = page.locator("a, button")
+            for index in range(await candidates.count()):
+                candidate = candidates.nth(index)
+                if (await candidate.is_visible()) and (await candidate.inner_text()).strip() in {"»", ">", "Next", "Следующая"}:
+                    next_link = candidate
+                    break
+        if next_link is None or not await next_link.is_enabled():
+            break
+        try:
+            await next_link.click(timeout=timeout_ms)
+            await page.wait_for_timeout(int(config.get("pagination_wait_ms", 500)))
+            await page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 15000))
+        except Exception:
+            break
+        if await page_text_signature(page) == signature:
+            break
+    if len(rendered_pages) == 1:
+        return rendered_pages[0]
+    return merge_rendered_sections(rendered_pages)
+
+
+def merge_rendered_sections(documents: list[str]) -> str:
+    mains: list[str] = []
+    bodies: list[str] = []
+    for document in documents:
+        soup = BeautifulSoup(document, "lxml")
+        main = soup.select_one("main")
+        body = soup.body
+        if main:
+            mains.append(str(main))
+        elif body:
+            bodies.append(str(body))
+        else:
+            bodies.append(str(soup))
+    if mains:
+        return "<html><body><main>" + "\n".join(mains) + "</main></body></html>"
+    return "<html><body>" + "\n".join(bodies) + "</body></html>"
+
+
+async def page_text_signature(page: Any) -> str:
+    locator = page.locator("main")
+    if await locator.count():
+        text = await locator.first.inner_text()
+    else:
+        text = await page.locator("body").inner_text()
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 class DownloadFileNode:
@@ -252,10 +437,18 @@ class FollowLinksNode:
                         selector = mapping.get("selector") or mapping.get("source_path")
                         element = soup.select_one(str(selector)) if selector else None
                         child[name] = element.get(mapping.get("attribute")) if element and mapping.get("attribute") else element.get_text(" ", strip=True) if element else mapping.get("default")
-                    row = parent if merge_mode == "PARENT_ONLY" else child if merge_mode == "CHILD_ONLY" else {**parent, **child}
+                    table_config = config.get("detail_table")
+                    table_rows = []
+                    if isinstance(table_config, dict) and table_config.get("selector"):
+                        parsed_table = await ParseTableNode().execute(context, {"html": response.text}, table_config)
+                        table_rows = parsed_table.get("records") or []
+                    rows = table_rows or [{}]
                     async with lock:
-                        records.append(row)
-                        progress.append({"url": url, "status": "SUCCESS", "status_code": response.status_code})
+                        for table_row in rows:
+                            detail = {**child, **table_row}
+                            row = parent if merge_mode == "PARENT_ONLY" else detail if merge_mode == "CHILD_ONLY" else {**parent, **detail}
+                            records.append(row)
+                        progress.append({"url": url, "status": "SUCCESS", "status_code": response.status_code, "detail_rows": len(table_rows)})
 
             await asyncio.gather(*(fetch(parent) for parent in parents))
         if failures and policy == "FAIL_FAST":
@@ -300,30 +493,39 @@ class CrawlLinksNode:
     type = "crawl_links"
 
     async def execute(self, context: ExecutionContext, inputs: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+        config = self._effective_config(context, inputs, config)
         listing, listing_url = await self._load_listing(context, inputs, config)
+        listing_diagnostics = context.variables.pop("_crawl_listing_diagnostics", {})
         items = self._listing_items(listing, config)
         configured_base = str(config.get("base_url") or find_value(inputs, "url") or context.variables.get("source", {}).get("base_url", "") or context.variables.get("source", {}).get("url", ""))
         listing_parts = urlsplit(listing_url)
         listing_origin = urlunsplit((listing_parts.scheme, listing_parts.netloc, "/", "", "")) if listing_parts.scheme and listing_parts.netloc else ""
         base_url = configured_base or listing_origin or listing_url
-        pattern = re.compile(str(config.get("url_pattern") or r"/press-center/news/(n[^/?#]+)"), re.I)
+        pattern_text = str(config.get("url_pattern") or "").strip()
+        pattern = re.compile(pattern_text, re.I) if pattern_text else None
         url_path = str(config.get("url_path") or "url")
         seen: set[str] = set()
         candidates: list[dict[str, Any]] = []
+        listing_host = urlsplit(listing_url).netloc.lower()
         for item in items:
             raw_url = find_value(item, url_path) if isinstance(item, dict) else item
             if not raw_url:
                 continue
             raw_url_string = str(raw_url)
             canonical = canonical_url(urljoin(base_url, raw_url_string if raw_url_string.startswith(("/", "http://", "https://")) else f"/{raw_url_string}"))
-            match = pattern.search(canonical)
-            if not match:
+            parts = urlsplit(canonical)
+            if parts.scheme not in {"http", "https"}:
                 continue
-            news_id = match.group(1) if match.groups() else match.group(0)
-            if news_id in seen:
+            if config.get("same_origin_only", True) and listing_host and parts.netloc.lower() != listing_host:
                 continue
-            seen.add(news_id)
-            candidates.append({"item": item if isinstance(item, dict) else {}, "url": canonical, "news_id": news_id})
+            match = pattern.search(canonical) if pattern else None
+            if pattern and not match:
+                continue
+            record_id = (match.group(1) if match and match.groups() else match.group(0) if match else hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20])
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            candidates.append({"item": item if isinstance(item, dict) else {}, "url": canonical, "record_id": record_id})
             if len(candidates) >= min(max(int(config.get("max_items", 100)), 1), 5000):
                 break
 
@@ -343,26 +545,60 @@ class CrawlLinksNode:
                 if context.cancelled:
                     return
                 async with semaphore:
-                    response: httpx.Response | None = None
+                    detail_url = candidate["url"]
+                    detail_html = ""
+                    artifact_content = b""
+                    artifact_content_type = "text/html"
                     error: Exception | None = None
-                    for attempt in range(retries + 1):
-                        try:
-                            response = await client.get(candidate["url"])
-                            response.raise_for_status()
-                            break
-                        except Exception as exc:  # request failures are reported per item, not hidden
-                            error = exc
-                            if attempt < retries:
-                                await asyncio.sleep(min(0.5 * (attempt + 1), 2))
-                    if response is None or not response.is_success:
-                        async with record_lock:
-                            errors.append({"url": candidate["url"], "news_id": candidate["news_id"], "error": str(error or "HTTP request failed")})
-                        return
-                    detail_html, artifact_content, artifact_content_type = await hydrate_dynamic_detail(client, response, config)
+                    if self._detail_uses_browser(context, config):
+                        rendered: dict[str, Any] | None = None
+                        for attempt in range(retries + 1):
+                            try:
+                                # Explicit browser transport must not depend on
+                                # a successful direct HTTP probe. Some sites
+                                # intentionally reject non-browser requests.
+                                rendered = await BrowserOpenNode().execute(context, inputs, {
+                                    "url": candidate["url"], "wait_until": config.get("detail_wait_until", "networkidle"),
+                                    "timeout": config.get("request_timeout", 45), "headers": headers,
+                                    "capture_network": False, "full_page": False, "http_fallback": False,
+                                })
+                                break
+                            except Exception as exc:
+                                error = exc
+                                if attempt < retries:
+                                    await asyncio.sleep(min(0.5 * (attempt + 1), 2))
+                        if rendered is None:
+                            async with record_lock:
+                                errors.append({"url": candidate["url"], "record_id": candidate["record_id"], "error": str(error or "Browser request failed")})
+                            return
+                        detail_url = str(rendered.get("url") or candidate["url"])
+                        detail_html = str(rendered.get("html") or rendered.get("body") or "")
+                        artifact_content = detail_html.encode("utf-8")
+                    else:
+                        response: httpx.Response | None = None
+                        for attempt in range(retries + 1):
+                            try:
+                                response = await client.get(candidate["url"])
+                                response.raise_for_status()
+                                break
+                            except Exception as exc:  # request failures are reported per item, not hidden
+                                error = exc
+                                if attempt < retries:
+                                    await asyncio.sleep(min(0.5 * (attempt + 1), 2))
+                        if response is None or not response.is_success:
+                            async with record_lock:
+                                errors.append({"url": candidate["url"], "record_id": candidate["record_id"], "error": str(error or "HTTP request failed")})
+                            return
+                        detail_url = str(response.url)
+                        detail_html = response.text
+                        artifact_content = response.content
+                        artifact_content_type = response.headers.get("content-type", "text/html")
                     artifact: dict[str, Any] | None = None
                     if config.get("save_artifacts", True):
-                        artifact = await store_artifact(context, artifact_content, artifact_content_type, str(response.url), f"{candidate['news_id']}.json" if "json" in artifact_content_type else f"{candidate['news_id']}.html", "raw_article")
-                    record = extract_article_record(detail_html, str(response.url), candidate, config, artifact)
+                        artifact_id = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(candidate["record_id"]))
+                        artifact = await store_artifact(context, artifact_content, artifact_content_type, detail_url, f"{artifact_id}.json" if "json" in artifact_content_type else f"{artifact_id}.html", "raw_article")
+                    fetched_candidate = {**candidate, "fetched_at": datetime.now(UTC).isoformat()}
+                    record = extract_article_record(detail_html, detail_url, fetched_candidate, config, artifact)
                     async with record_lock:
                         records.append(record)
                     if delay_ms:
@@ -370,21 +606,117 @@ class CrawlLinksNode:
 
             await asyncio.gather(*(crawl(candidate) for candidate in candidates))
 
-        records.sort(key=lambda row: (str(row.get("published_at", "")), str(row.get("news_id", ""))), reverse=True)
+        records.sort(key=lambda row: (str(row.get("published_at", "")), str(row.get("record_id", ""))), reverse=True)
         context.log("INFO", "Crawl Links завершён", found=len(candidates), extracted=len(records), errors=len(errors))
-        return {"records": records, "count": len(records), "discovered": len(candidates), "errors": errors, "artifacts": list(context.artifacts)}
+        return {"records": records, "count": len(records), "discovered": len(candidates), "errors": errors,
+                "listing_diagnostics": listing_diagnostics, "artifacts": list(context.artifacts)}
+
+    @staticmethod
+    def _detail_uses_browser(context: ExecutionContext, config: dict[str, Any]) -> bool:
+        mode = str(config.get("detail_fetch_mode") or "AUTO").upper()
+        if mode == "PLAYWRIGHT":
+            return True
+        if mode == "HTTP":
+            return False
+        source = context.variables.get("source", {})
+        settings = source.get("settings", {}) if isinstance(source, dict) else {}
+        profile = settings.get("profile", {}) if isinstance(settings, dict) else {}
+        return str(source.get("fetch_mode") or settings.get("fetch_mode") or "").upper() == "PLAYWRIGHT" or bool(profile.get("requires_javascript"))
+
+    def _effective_config(self, context: ExecutionContext, inputs: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+        source = context.variables.get("source", {})
+        settings = source.get("settings") if isinstance(source, dict) else {}
+        settings = settings if isinstance(settings, dict) else {}
+        source_crawl = settings.get("crawl_links") or settings.get("crawl") or {}
+        source_crawl = source_crawl if isinstance(source_crawl, dict) else {}
+        profile = settings.get("profile") if isinstance(settings.get("profile"), dict) else {}
+        profile_extractor = profile.get("extractor") if isinstance(profile.get("extractor"), dict) else {}
+        effective = dict(source_crawl)
+        for key, value in config.items():
+            if value not in (None, "", {}, []):
+                effective[key] = value
+        if not effective.get("link_selector"):
+            fields = profile_extractor.get("fields") if isinstance(profile_extractor.get("fields"), list) else []
+            link = next((field for field in fields if isinstance(field, dict) and field.get("attribute") == "href"), None)
+            container = str(profile_extractor.get("container_selector") or "").strip()
+            if link and link.get("selector"):
+                effective["link_selector"] = f"{container} {link['selector']}".strip() if container else link["selector"]
+        effective.setdefault("listing_url", str(source.get("url") or ""))
+        effective.setdefault("same_origin_only", True)
+        return render_object(effective, context, inputs)
 
     async def _load_listing(self, context: ExecutionContext, inputs: dict[str, Any], config: dict[str, Any]) -> tuple[Any, str]:
         listing_url = render_template(str(config.get("listing_url") or ""), context, inputs)
         if not listing_url:
             return find_value(inputs, str(config.get("input_path") or "records")) or inputs, str(find_value(inputs, "url") or "")
         params = render_object(config.get("listing_query") or {}, context, inputs)
-        lookback_days = int(config.get("lookback_days") or 0)
-        if lookback_days:
-            now = context.effective_run_clock or datetime.now(UTC)
-            params.update({"sFrom": (now - timedelta(days=lookback_days)).strftime("%d.%m.%Y"), "sTo": now.strftime("%d.%m.%Y")})
+        date_range = config.get("date_range_query") or {}
+        if isinstance(date_range, dict) and date_range:
+            from_param = str(date_range.get("from_param") or "")
+            to_param = str(date_range.get("to_param") or "")
+            if not from_param or not to_param:
+                raise ValueError("date_range_query requires from_param and to_param")
+            try:
+                zone = ZoneInfo(str(date_range.get("timezone") or "UTC"))
+            except Exception as exc:
+                raise ValueError("date_range_query contains an unknown timezone") from exc
+            now = (context.effective_run_clock or datetime.now(UTC)).astimezone(zone)
+            lookback_days = max(int(date_range.get("lookback_days") or 0), 0)
+            pattern = str(date_range.get("format") or "YYYY-MM-DD")
+            params.update({
+                from_param: formula_format_date(now - timedelta(days=lookback_days), pattern),
+                to_param: formula_format_date(now, pattern),
+            })
         headers = {"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5", "User-Agent": "Mozilla/5.0 (compatible; ParserStudio/1.0)"}
         headers.update(render_object(config.get("headers") or {}, context, inputs))
+        source = context.variables.get("source", {})
+        source_settings = source.get("settings") if isinstance(source, dict) else {}
+        source_settings = source_settings if isinstance(source_settings, dict) else {}
+        profile = source_settings.get("profile") if isinstance(source_settings.get("profile"), dict) else {}
+        source_fetch_mode = str(source.get("fetch_mode") or source_settings.get("fetch_mode") or "").upper() if isinstance(source, dict) else ""
+        listing_fetch_mode = str(config.get("listing_fetch_mode") or "").upper()
+        listing_uses_browser = listing_fetch_mode == "PLAYWRIGHT" or (
+            listing_fetch_mode in {"", "AUTO"}
+            and (source_fetch_mode == "PLAYWRIGHT" or profile.get("requires_javascript"))
+        )
+        if listing_uses_browser:
+            rendered = await BrowserOpenNode().execute(
+                context,
+                inputs,
+                {
+                    "url": listing_url,
+                    "wait_until": config.get("listing_wait_until", "networkidle"),
+                    "timeout": config.get("listing_timeout", 60),
+                    "headers": headers,
+                    "capture_network": True,
+                    "pagination_enabled": config.get("pagination_enabled", True),
+                    "pagination_max_pages": config.get("pagination_max_pages", 25),
+                    "pagination_next_selector": config.get("pagination_next_selector", ""),
+                    "pagination_wait_ms": config.get("pagination_wait_ms", 500),
+                    "tabs_enabled": config.get("tabs_enabled", False),
+                    "tabs_wait_ms": config.get("tabs_wait_ms", 500),
+                    "tabs_max_depth": config.get("tabs_max_depth", 4),
+                    "full_page": False,
+                    "http_fallback": True,
+                },
+            )
+            # Merge every discovered JSON/XHR collection.  Taking only the
+            # largest collection silently drops sibling tabs/categories on
+            # sites that expose one endpoint per tab.
+            network_payloads = [item.get("body") for item in rendered.get("network", []) if isinstance(item, dict) and item.get("body") is not None]
+            if not config.get("items_path"):
+                network_items = self._merge_url_lists(network_payloads)
+                if network_items:
+                    context.variables["_crawl_listing_diagnostics"] = {
+                        "fetch_mode": "PLAYWRIGHT", "tab_count": rendered.get("tab_count", 0),
+                        "tab_labels": rendered.get("tab_labels", []), "collection_source": "network_merged",
+                    }
+                    return network_items, str(rendered.get("url") or listing_url)
+            context.variables["_crawl_listing_diagnostics"] = {
+                "fetch_mode": "PLAYWRIGHT", "tab_count": rendered.get("tab_count", 0),
+                "tab_labels": rendered.get("tab_labels", []), "collection_source": "rendered_html",
+            }
+            return rendered.get("html") or rendered.get("body") or "", str(rendered.get("url") or listing_url)
         async with httpx.AsyncClient(follow_redirects=True, timeout=min(max(float(config.get("listing_timeout", 60)), 1), 120), headers=headers) as client:
             response = await client.get(listing_url, params=params)
             response.raise_for_status()
@@ -397,9 +729,79 @@ class CrawlLinksNode:
     def _listing_items(self, listing: Any, config: dict[str, Any]) -> list[Any]:
         if isinstance(listing, str):
             soup = BeautifulSoup(listing, "lxml")
-            return [{"url": element.get("href"), "title": element.get_text(" ", strip=True)} for element in soup.select(str(config.get("link_selector") or "a[href]")) if element.get("href")]
-        selected = find_value(listing, str(config.get("items_path") or "")) if config.get("items_path") else listing
+            selector = str(config.get("link_selector") or "").strip()
+            elements = soup.select(selector) if selector else soup.select("main a[href]") or soup.select("a[href]")
+            items: list[dict[str, Any]] = []
+            for element in elements:
+                href = str(element.get("href") or "").strip()
+                if not href or href.startswith("#") or href.lower().startswith(("javascript:", "mailto:", "tel:")):
+                    continue
+                utility_path = urlsplit(href).path.rstrip("/").lower() or "/"
+                if not selector and utility_path in {"/", "/search"}:
+                    continue
+                if not selector and any(
+                    parent.name in {"header", "footer", "nav"}
+                    or "breadcrumb" in " ".join(parent.get("class") or []).lower()
+                    or "breadcrumb" in str(parent.get("id") or "").lower()
+                    for parent in element.parents
+                ):
+                    continue
+                items.append({"url": href, "title": element.get_text(" ", strip=True)})
+            return items
+        selected = find_value(listing, str(config.get("items_path") or "")) if config.get("items_path") else self._largest_url_list(listing)
         return selected if isinstance(selected, list) else []
+
+    def _largest_url_list(self, value: Any) -> list[Any]:
+        candidates: list[list[Any]] = []
+        def visit(item: Any) -> None:
+            if isinstance(item, list):
+                if item and sum(1 for child in item if isinstance(child, dict) and child.get("url")):
+                    candidates.append(item)
+                for child in item:
+                    visit(child)
+            elif isinstance(item, dict):
+                for child in item.values():
+                    visit(child)
+        visit(value)
+        return max(candidates, key=lambda items: (sum(1 for child in items if isinstance(child, dict) and child.get("url")), len(items)), default=[])
+
+    def _merge_url_lists(self, value: Any) -> list[Any]:
+        """Flatten and deduplicate all nested URL-bearing collections."""
+        merged: list[Any] = []
+        seen: set[str] = set()
+        for items in self._url_lists(value):
+            for item in items:
+                if isinstance(item, dict):
+                    raw = item.get("url") or item.get("href") or item.get("link")
+                    if not raw:
+                        continue
+                    key = str(raw)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if "url" not in item:
+                        item = {**item, "url": raw}
+                    merged.append(item)
+                elif isinstance(item, str) and item.startswith(("http://", "https://", "/")):
+                    if item not in seen:
+                        seen.add(item)
+                        merged.append({"url": item})
+        return merged
+
+    def _url_lists(self, value: Any) -> list[list[Any]]:
+        found: list[list[Any]] = []
+        def visit(item: Any) -> None:
+            if isinstance(item, list):
+                url_count = sum(1 for child in item if isinstance(child, dict) and (child.get("url") or child.get("href") or child.get("link")))
+                if url_count:
+                    found.append(item)
+                for child in item:
+                    visit(child)
+            elif isinstance(item, dict):
+                for child in item.values():
+                    visit(child)
+        visit(value)
+        return found
 
 
 class ParseHTMLNode:
@@ -517,6 +919,12 @@ class ParseTableNode:
         header_row = int(config.get("header_row", 0))
         headers = dedupe_headers(matrix[header_row]) if matrix else []
         records = [dict(zip(headers, row, strict=False)) for row in matrix[header_row + 1:] if any(row)]
+        if config.get("normalize_fields"):
+            for record in records:
+                for header, value in list(record.items()):
+                    normalized = normalize_table_field_name(header)
+                    if normalized and normalized not in record:
+                        record[normalized] = value
         return {"records": records, "count": len(records), "headers": headers, "table": matrix}
 
 
@@ -651,6 +1059,9 @@ class MappingNode:
                 if spec.get("required") and result in (None, ""):
                     errors.append({"row": index, "field": target, "code": "REQUIRED"})
                 record[target] = result
+            provenance = source.get("__provenance")
+            if isinstance(provenance, dict):
+                record["__provenance"] = provenance
             records.append(record)
         return {"records": records, "count": len(records), "mapping_errors": errors,
                 "business_records": True, "schema_preview": records[:5]}
@@ -695,9 +1106,13 @@ class LLMExtractNode:
         api_key = str(provider_config.get("api_key") or context.secrets.get(f"AI_PROVIDER_{provider}") or context.secrets.get("DEEPSEEK_API_KEY") or "")
         model = str(config.get("model") or provider_config.get("default_model") or "deepseek-chat")
         system_prompt = render_template(str(config.get("system_prompt") or "Верни только валидный JSON."), context, inputs)
+        if "максимум 50" not in system_prompt.lower():
+            system_prompt += "\nВерни максимум 50 записей за один запуск; при избытке выбери только наиболее актуальные и полные."
         schema = config.get("response_schema") or {}
         user_template = str(config.get("user_prompt") or "Извлеки данные из:\n{{content}}")
-        user_prompt = user_template.replace("{{content}}", stringify(content)).replace("{{schema}}", json.dumps(schema, ensure_ascii=False))
+        max_input_chars = max(int(config.get("max_input_chars", 36000)), 1000)
+        prompt_content = content[:max_input_chars] if isinstance(content, str) else content
+        user_prompt = user_template.replace("{{content}}", stringify(prompt_content)).replace("{{schema}}", json.dumps(schema, ensure_ascii=False))
         if provider == "mock":
             parsed = config.get("mock_response") or ({"records": content} if isinstance(content, list) else {"value": content})
             return llm_output(parsed, "mock", {"prompt_tokens": 0, "completion_tokens": 0})
@@ -720,12 +1135,37 @@ class LLMExtractNode:
             raw = response.json()
             text = raw["choices"][0]["message"]["content"]
             parsed = parse_json_response(text)
+            # JSON-mode providers commonly wrap an array in a named envelope
+            # (for example {"products": [...]}) despite an array response
+            # contract. Treat that as the requested collection, not a failure.
+            if isinstance(parsed, dict):
+                for key in ("records", "items", "products", "data", "results"):
+                    if isinstance(parsed.get(key), list) and (schema.get("type") == "array" or len(parsed) == 1):
+                        parsed = parsed[key]
+                        break
+            if isinstance(parsed, list):
+                parsed = dedupe_extracted_records(parsed, config.get("dedupe_key_fields"))
             validate_json_schema(parsed, schema)
             return {**llm_output(parsed, raw.get("model", model), raw.get("usage", {})), "response": text}
         except Exception:
             if config.get("fallback_to_input"):
                 return {"records": content if isinstance(content, list) else [content], "llm_fallback": True}
             raise
+
+def dedupe_extracted_records(records: list[Any], key_fields: list[str] | None = None) -> list[Any]:
+    """Discard repeated cards emitted by templated pages or an LLM."""
+    unique: list[Any] = []
+    seen: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            unique.append(record)
+            continue
+        key = "|".join(str(record.get(field) or "") for field in key_fields) if key_fields else json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(record)
+    return unique
 
 
 class LLMClassifyNode:
@@ -980,52 +1420,31 @@ def simple_json_path(data: Any, path: str) -> list[Any]:
     return values
 
 
-def canonical_url(value: str) -> str:
-    """Drop tracking fragments/query params without changing an article identifier."""
+def canonical_url(value: str, drop_query_params: list[str] | None = None) -> str:
+    """Normalize a URL while preserving query parameters that carry identity."""
     parts = urlsplit(value)
     path = re.sub(r"/{2,}", "/", parts.path).rstrip("/")
-    return urlunsplit((parts.scheme, parts.netloc.lower(), path, "", ""))
+    configured = {item.lower() for item in (drop_query_params or [])}
+    tracking = {"utm", "gclid", "fbclid", "yclid", "mc_cid", "mc_eid"}
+    query = [
+        (key, item)
+        for key, item in parse_qsl(parts.query, keep_blank_values=True)
+        if key.lower() not in configured
+        and key.lower() not in tracking
+        and not key.lower().startswith("utm_")
+    ]
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, urlencode(sorted(query)), ""))
 
 
 async def hydrate_dynamic_detail(
     client: httpx.AsyncClient, response: httpx.Response, config: dict[str, Any]
 ) -> tuple[str, bytes, str]:
-    """Use a site's own JSON detail endpoint when an HTML shell is empty.
+    """Compatibility no-op for old imports.
 
-    BВФБ renders an article shell then calls `/solo/calendar`; preserving this
-    fallback keeps the crawler HTTP-first while still collecting the full text.
+    Dynamic rendering now happens through ``detail_fetch_mode`` in
+    :class:`CrawlLinksNode`, which is portable across websites.
     """
-    page_html = response.text
-    if not config.get("dynamic_detail_api", True):
-        return page_html, response.content, response.headers.get("content-type", "text/html")
-    soup = BeautifulSoup(page_html, "lxml")
-    body_selector = str(config.get("body_selector") or "#pc_body")
-    body = soup.select_one(body_selector)
-    if body and body.get_text(" ", strip=True):
-        return page_html, response.content, response.headers.get("content-type", "text/html")
-    match = re.search(
-        r"init_pc_page_solo\(\s*'([^']+)'\s*,\s*'([^']+)'\s*,\s*'([^']+)'\s*,\s*'([^']+)'\s*\)",
-        page_html,
-    )
-    if not match:
-        return page_html, response.content, response.headers.get("content-type", "text/html")
-    endpoint = urljoin(str(response.url), match.group(3))
-    try:
-        detail = await client.get(endpoint, params={"sType": match.group(1), "sDay": match.group(2), "link": match.group(4)})
-        detail.raise_for_status()
-        payload = detail.json()
-        solo = payload.get("solo") if isinstance(payload, dict) else None
-        if not isinstance(solo, dict) or not solo.get("html"):
-            return page_html, response.content, response.headers.get("content-type", "text/html")
-        tag_html = "".join(f"<span data-parser-studio-tag>{escape(str(tag))}</span>" for tag in solo.get("tags") or [])
-        hydrated = (
-            f"<span id='title'>{escape(str(solo.get('title') or ''))}</span>"
-            f"<div class='dynamic-publicationdate'>{escape(str(solo.get('publicationDate') or ''))}</div>"
-            f"<div id='pc_body'>{solo.get('html')}</div>{tag_html}"
-        )
-        return hydrated, detail.content, detail.headers.get("content-type", "application/json")
-    except Exception:
-        return page_html, response.content, response.headers.get("content-type", "text/html")
+    return response.text, response.content, response.headers.get("content-type", "text/html")
 
 
 def extract_article_record(
@@ -1036,15 +1455,80 @@ def extract_article_record(
     artifact: dict[str, Any] | None,
 ) -> dict[str, Any]:
     soup = BeautifulSoup(page_html, "lxml")
-    title = select_text(soup, str(config.get("title_selector") or "#title")) or str(candidate["item"].get("title") or "")
-    listing_date = str(candidate["item"].get("shortDate") or candidate["item"].get("published_at") or "")
-    date_text = listing_date if re.search(r"\d{4}-\d{2}-\d{2}", listing_date) else select_text(soup, str(config.get("date_selector") or ".dynamic-publicationdate"))
-    body_selector = str(config.get("body_selector") or "#pc_body")
-    body = soup.select_one(body_selector)
+    detail_fields = config.get("detail_fields")
+    if isinstance(detail_fields, list):
+        record: dict[str, Any] = {"record_id": candidate.get("record_id") or hashlib.sha256(canonical_url(page_url).encode()).hexdigest()[:20]}
+        if config.get("include_listing_fields") and isinstance(candidate.get("item"), dict):
+            record.update(candidate["item"])
+        for field in detail_fields:
+            if not isinstance(field, dict) or not field.get("name"):
+                continue
+            name = str(field["name"])
+            selector = str(field.get("selector") or "")
+            elements = soup.select(selector) if selector else []
+            element = elements[0] if elements else None
+            value_mode = str(field.get("value") or "text")
+            if field.get("multiple") and value_mode == "links":
+                record[name] = json.dumps([
+                    {
+                        "title": item.get_text(" ", strip=True) or Path(urlsplit(str(item.get("href") or "")).path).name,
+                        "url": canonical_url(urljoin(page_url, str(item.get("href") or ""))),
+                    }
+                    for item in elements if item.get("href")
+                ], ensure_ascii=False)
+                continue
+            if element is None:
+                record[name] = None
+                continue
+            attribute = str(field.get("attribute") or "")
+            value = element.get(attribute) if attribute else (
+                element.decode_contents() if value_mode == "html" else element.get_text(" ", strip=True)
+            )
+            if name in {"source_published_at", "source_modified_at"}:
+                value = normalize_source_datetime(
+                    str(value or ""),
+                    timezone=str(field.get("timezone") or config.get("timezone") or "UTC"),
+                    date_format=str(field.get("format") or ""),
+                )
+            record[name] = value
+        constants = config.get("detail_constants") or {}
+        if isinstance(constants, dict):
+            record.update(constants)
+        record["fetched_at"] = candidate.get("fetched_at") or datetime.now(UTC).isoformat()
+        record["url"] = canonical_url(page_url, list(config.get("drop_query_params") or []))
+        if artifact:
+            record["__provenance"] = {"raw_artifact": artifact}
+        return record
+    title_selector = str(config.get("title_selector") or "")
+    title = select_text(soup, title_selector) if title_selector else ""
+    title = title or str(candidate["item"].get("title") or "")
+    if not title:
+        title = next((select_text(soup, selector) for selector in ("h1", "[itemprop='headline']", "article h1", "meta[property='og:title']") if select_text(soup, selector)), "")
+    listing_date = str(candidate["item"].get("shortDate") or candidate["item"].get("published_at") or candidate["item"].get("date") or "")
+    date_selector = str(config.get("date_selector") or "")
+    date_text = listing_date if re.search(r"\d{4}-\d{2}-\d{2}", listing_date) else select_text(soup, date_selector) if date_selector else ""
+    if not date_text:
+        date_text = next((element.get("datetime") or element.get("content") or element.get_text(" ", strip=True) for element in soup.select("time, [itemprop='datePublished'], meta[property='article:published_time'], meta[name='date']") if element.get("datetime") or element.get("content") or element.get_text(" ", strip=True)), "")
+    body_selector = str(config.get("body_selector") or "")
+    body = soup.select_one(body_selector) if body_selector else None
+    if not body:
+        body = next((soup.select_one(selector) for selector in ("[itemprop='articleBody']", "article", "main article", ".article-body", ".post-content", ".entry-content", "main") if soup.select_one(selector)), None)
     body_html = body.decode_contents() if body else ""
     body_text = clean_article_text(body.get_text("\n", strip=True) if body else "")
-    tag_selector = str(config.get("tag_selector") or "[data-parser-studio-tag]")
-    tags = unique_strings(element.get_text(" ", strip=True) for element in soup.select(tag_selector)) if tag_selector else []
+    # A detail page may legitimately omit the preferred article wrapper (for
+    # example a short technical notice). Keep the universal contract stable:
+    # every discovered card still receives auditable text and HTML evidence.
+    if not body_text:
+        fallback = soup.select_one("main") or soup.body
+        if fallback:
+            body_html = body_html or fallback.decode_contents()
+            body_text = clean_article_text(fallback.get_text("\n", strip=True))
+    if not body_text:
+        body_text = clean_article_text(title) or clean_article_text(page_url)
+    if not body_html:
+        body_html = f"<p>{escape(body_text)}</p>"
+    tag_selector = str(config.get("tag_selector") or "")
+    tags = unique_strings(element.get_text(" ", strip=True) for element in soup.select(tag_selector)) if tag_selector else unique_strings([element.get("content") or element.get_text(" ", strip=True) for element in soup.select("[data-parser-studio-tag], [rel='tag'], meta[name='keywords']")])
     attachment_selector = str(config.get("attachment_selector") or "a[href$='.pdf'],a[href$='.doc'],a[href$='.docx'],a[href$='.xls'],a[href$='.xlsx'],a[href$='.zip']")
     attachments = []
     if body:
@@ -1053,7 +1537,7 @@ def extract_article_record(
             if href:
                 attachments.append({"title": element.get_text(" ", strip=True) or Path(urlsplit(href).path).name, "url": canonical_url(urljoin(page_url, href))})
     record: dict[str, Any] = {
-        "news_id": candidate["news_id"],
+        "record_id": candidate.get("record_id") or candidate.get("news_id") or hashlib.sha256(canonical_url(page_url).encode("utf-8")).hexdigest()[:20],
         "title": clean_inline_text(title),
         "published_at": normalize_publication_date(date_text),
         "url": canonical_url(page_url),
@@ -1061,11 +1545,54 @@ def extract_article_record(
         "body_html": body_html,
         "tags": "|".join(tags),
         "attachments_json": json.dumps(attachments, ensure_ascii=False),
-        "language": str(config.get("language") or "ru"),
-        "source_name": str(config.get("source_name") or "БВФБ"),
+        "language": str(config.get("language") or (soup.html or {}).get("lang") or "").split("-", 1)[0],
+        "source_name": str(config.get("source_name") or candidate.get("item", {}).get("source_name") or ""),
+        "fetched_at": candidate.get("fetched_at") or datetime.now(UTC).isoformat(),
         "observed_at": datetime.now(UTC).isoformat(),
     }
+    # Older saved workflows may have supplied an additional domain identifier.
+    # Preserve it as data, without making the crawler or the system template
+    # depend on a particular field name.
+    if candidate.get("news_id"):
+        record["news_id"] = candidate["news_id"]
+    if artifact:
+        record["__provenance"] = {"raw_artifact": artifact}
     return record
+
+
+def normalize_source_datetime(value: str, *, timezone: str = "UTC", date_format: str = "") -> str | None:
+    text = clean_inline_text(value)
+    if not text:
+        return None
+    translated_format = date_format
+    for token, replacement in (
+        ("YYYY", "%Y"), ("DD", "%d"), ("MM", "%m"),
+        ("HH", "%H"), ("mm", "%M"), ("ss", "%S"),
+    ):
+        translated_format = translated_format.replace(token, replacement)
+    parsed: datetime | None = None
+    if translated_format:
+        try:
+            parsed = datetime.strptime(text, translated_format)
+        except ValueError:
+            return None
+    else:
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            normalized = normalize_publication_date(text)
+            try:
+                parsed = datetime.fromisoformat(normalized) if normalized != text else None
+            except ValueError:
+                parsed = None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        try:
+            parsed = parsed.replace(tzinfo=ZoneInfo(timezone))
+        except Exception as exc:
+            raise ValueError(f"Unknown source timezone: {timezone}") from exc
+    return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def select_text(soup: BeautifulSoup, selector: str) -> str:
@@ -1136,7 +1663,17 @@ async def response_payload(context: ExecutionContext, response: httpx.Response) 
     if "json" in content_type:
         payload: Any = response.json()
     elif any(token in content_type for token in ("text", "html", "xml", "javascript")) or not content_type:
+        # A response can declare UTF-8 while serving a legacy Cyrillic
+        # encoding. Prefer the decoding with more readable text.
         payload = response.text
+        try:
+            cp1251_payload = raw.decode("cp1251")
+            def readable(text: str) -> int:
+                return sum("А" <= char <= "я" or char in "ЁёЎўІі" for char in text)
+            if readable(cp1251_payload) > readable(payload) * 2:
+                payload = cp1251_payload
+        except UnicodeDecodeError:
+            pass
     else:
         payload = base64.b64encode(raw).decode("ascii")
     arrays = json_array_paths(payload) if "json" in content_type else []
@@ -1212,6 +1749,12 @@ def apply_operation(row: dict[str, Any], operation: dict[str, Any]) -> None:
         row[operation.get("to", field)] = str(row[field]).split(str(operation.get("separator", ",")))
     elif kind == "concat":
         row[field] = str(operation.get("separator", " ")).join(str(row.get(source, "")) for source in operation.get("fields", []))
+
+
+def normalize_table_field_name(header: Any) -> str:
+    """Create a stable structural key without guessing business meaning."""
+    text = re.sub(r"[^\w]+", "_", str(header or "").strip().casefold(), flags=re.UNICODE)
+    return text.strip("_")
 
 
 def safe_eval(expression: str, values: dict[str, Any], run_clock: datetime | None = None) -> Any:

@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.database import SessionLocal, get_db
 from app.dependencies import get_current_user, require_roles
+from app.enums import TERMINAL_RUN_STATUSES
 from app.models import NodeRun, RawDocument, Run, User
 from app.routers.workflows import execute_run
 from app.schemas import RunOut
@@ -81,7 +82,7 @@ async def run_events(
             if serialized != previous:
                 yield f"event: status\ndata: {serialized}\n\n"
                 previous = serialized
-            if payload["status"] in {"SUCCESS", "FAILED", "CANCELLED", "WAITING_FOR_REVIEW", "PARTIAL_SUCCESS", "TIMED_OUT"}:
+            if payload["status"] in TERMINAL_RUN_STATUSES:
                 return
             await asyncio.sleep(1)
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -137,7 +138,7 @@ def cancel(
     run = db.get(Run, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Запуск не найден")
-    if run.status in {"SUCCESS", "FAILED", "CANCELLED", "WAITING_FOR_REVIEW"}:
+    if run.status in TERMINAL_RUN_STATUSES:
         raise HTTPException(status_code=409, detail="Запуск уже завершён")
     run.status = "CANCELLED"
     db.commit()

@@ -10,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -49,6 +50,22 @@ class UserRole(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     role: Mapped[str] = mapped_column(String(32), index=True)
+
+
+class ApiToken(Base, TimestampMixin):
+    """Revocable machine credential; only its SHA-256 digest is stored."""
+
+    __tablename__ = "api_tokens"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    owner_user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    token_prefix: Mapped[str] = mapped_column(String(20), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    scopes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    dataset_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Project(Base, TimestampMixin):
@@ -109,6 +126,24 @@ class Workflow(Base, TimestampMixin):
     version: Mapped[int] = mapped_column(Integer, default=1)
     published_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class WorkflowTemplate(Base, TimestampMixin):
+    """Reusable, project-scoped workflow blueprint.
+
+    Templates deliberately store a graph copy rather than refer to a workflow:
+    changing a draft can never silently change future workflows created from an
+    already approved template.
+    """
+    __tablename__ = "workflow_templates"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str] = mapped_column(Text, default="")
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    graph_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=lambda: {"nodes": [], "edges": [], "settings": {}, "version": 1})
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    is_builtin: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class WorkflowVersion(Base):
@@ -194,6 +229,9 @@ class Record(Base, TimestampMixin):
 
 class RecordVersion(Base):
     __tablename__ = "record_versions"
+    __table_args__ = (
+        Index("uq_record_version_number", "record_id", "version_number", unique=True),
+    )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
     record_id: Mapped[str] = mapped_column(ForeignKey("records.id", ondelete="CASCADE"), index=True)
     run_id: Mapped[str | None] = mapped_column(ForeignKey("runs.id"), nullable=True)
@@ -203,6 +241,44 @@ class RecordVersion(Base):
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     review_status: Mapped[str] = mapped_column(String(32), default="PENDING")
     confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RecordObservation(Base):
+    """A record as seen by one parser run, even when content is unchanged."""
+
+    __tablename__ = "record_observations"
+    __table_args__ = (
+        UniqueConstraint("run_id", "record_id", name="uq_run_record_observation"),
+        Index("ix_record_observations_dataset_observed", "dataset_id", "observed_at"),
+        Index("ix_record_observations_dataset_published", "dataset_id", "source_published_at"),
+        Index("ix_record_observations_dataset_fetched", "dataset_id", "fetched_at"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id", ondelete="CASCADE"), index=True)
+    record_id: Mapped[str] = mapped_column(ForeignKey("records.id", ondelete="CASCADE"), index=True)
+    record_version_id: Mapped[str] = mapped_column(ForeignKey("record_versions.id", ondelete="CASCADE"), index=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
+    source_id: Mapped[str | None] = mapped_column(ForeignKey("sources.id", ondelete="SET NULL"), nullable=True, index=True)
+    raw_document_id: Mapped[str | None] = mapped_column(ForeignKey("raw_documents.id", ondelete="SET NULL"), nullable=True)
+    natural_key: Mapped[str] = mapped_column(String(512))
+    content_changed: Mapped[bool] = mapped_column(Boolean, default=False)
+    source_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source_modified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class DatasetRun(Base):
+    """A committed run result for a dataset, including a valid empty result."""
+
+    __tablename__ = "dataset_runs"
+    __table_args__ = (UniqueConstraint("run_id", "dataset_id", name="uq_run_dataset"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
+    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id", ondelete="CASCADE"), index=True)
+    observed_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

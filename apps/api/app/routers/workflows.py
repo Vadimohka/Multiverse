@@ -7,8 +7,8 @@ from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Response
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from workflow_engine import NODE_CATALOG, WorkflowEngine, validate_dag
 from workflow_engine.nodes import validate_json_schema
@@ -24,30 +24,36 @@ from app.models import (
     DatabaseConnection,
     DataSchema,
     Dataset,
+    DatasetRun,
     LLMCall,
     NodeRun,
     RawDocument,
     Record,
+    RecordObservation,
     RecordVersion,
     ReviewTask,
     Run,
     Secret,
     Source,
+    SourceProfile,
     User,
     Workflow,
     WorkflowVersion,
+    utcnow,
 )
 from app.schemas import (
     NodeTestRequest,
     RunOut,
     RunRequest,
     WorkflowCreate,
+    WorkflowImportRequest,
     WorkflowOut,
     WorkflowTemplateRequest,
     WorkflowUpdate,
 )
 from app.security import decrypt_secret
 from app.services.artifact_storage import ArtifactStorage
+from app.services.run_routing import queue_for_graph
 
 router = APIRouter(prefix="/workflows", tags=["Workflows"])
 settings = get_settings()
@@ -61,13 +67,15 @@ def node_catalog(_: User = Depends(get_current_user)) -> list[dict[str, Any]]:
 @router.get("", response_model=list[WorkflowOut])
 def list_workflows(
     project_id: str | None = None,
+    include_legacy: bool = False,
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ) -> list[Workflow]:
     stmt = select(Workflow).order_by(Workflow.updated_at.desc())
     if project_id:
         stmt = stmt.where(Workflow.project_id == project_id)
-    return list(db.scalars(stmt).all())
+    workflows = list(db.scalars(stmt).all())
+    return workflows
 
 
 @router.post("", response_model=WorkflowOut, status_code=201)
@@ -88,6 +96,32 @@ def create_workflow(
     return workflow
 
 
+@router.post("/import", response_model=WorkflowOut, status_code=201)
+def import_workflow(payload: WorkflowImportRequest, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> Workflow:
+    graph = deepcopy(payload.graph_json)
+    graph.setdefault("settings", {}).pop("source_id", None)
+    errors = validate_dag(graph)
+    if errors:
+        raise HTTPException(status_code=422, detail=errors)
+    workflow = Workflow(project_id=payload.project_id, name=payload.name, description=payload.description, graph_json=graph)
+    db.add(workflow); db.flush()
+    audit(db, user.id, "IMPORT", "workflow", workflow.id, after={"name": workflow.name})
+    db.commit(); db.refresh(workflow)
+    return workflow
+
+
+@router.get("/{workflow_id}/export")
+def export_workflow(workflow_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> Response:
+    workflow = db.get(Workflow, workflow_id)
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    graph = deepcopy(workflow.graph_json)
+    graph.setdefault("settings", {}).pop("source_id", None)
+    payload = {"format": "parser-studio-workflow/v1", "name": workflow.name, "description": workflow.description, "graph_json": graph}
+    filename = "workflow-" + "".join(char if char.isalnum() else "-" for char in workflow.name.lower()).strip("-") + ".json"
+    return Response(content=json.dumps(payload, ensure_ascii=False, indent=2), media_type="application/json", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
 @router.post("/from-source", response_model=WorkflowOut, status_code=201)
 def create_from_source(
     payload: WorkflowTemplateRequest,
@@ -97,6 +131,13 @@ def create_from_source(
     source = db.get(Source, payload.source_id)
     if not source:
         raise HTTPException(status_code=404, detail="Источник не найден")
+    # Older clients/profile API calls may store the profiler result separately.
+    # Hydrate source settings before generating the graph so that endpoint is
+    # never silently replaced by a demo template.
+    if not (isinstance(source.settings, dict) and source.settings.get("profile")):
+        latest_profile = db.scalar(select(SourceProfile).where(SourceProfile.source_id == source.id).order_by(SourceProfile.created_at.desc()))
+        if latest_profile:
+            source.settings = {**(source.settings or {}), "profile": latest_profile.result_json}
     graph = build_source_template(source, payload.template)
     workflow = Workflow(
         project_id=source.project_id,
@@ -185,15 +226,26 @@ def publish(
     errors = validate_dag(workflow.graph_json)
     if errors:
         raise HTTPException(status_code=422, detail=errors)
-    version = (workflow.published_version or 0) + 1
-    db.add(
-        WorkflowVersion(
-            workflow_id=workflow.id,
-            version=version,
-            graph_json=deepcopy(workflow.graph_json),
-            created_by=user.id,
+    # WorkflowVersion is the immutable draft revision created by PATCH.  A
+    # publication must point at that same revision, not at a separate counter:
+    # otherwise the counters eventually collide and a newly published graph can
+    # silently keep running an older snapshot.
+    version = workflow.version
+    published = db.scalar(
+        select(WorkflowVersion).where(
+            WorkflowVersion.workflow_id == workflow.id,
+            WorkflowVersion.version == version,
         )
     )
+    if published is None:
+        db.add(
+            WorkflowVersion(
+                workflow_id=workflow.id,
+                version=version,
+                graph_json=deepcopy(workflow.graph_json),
+                created_by=user.id,
+            )
+        )
     workflow.published_version = version
     audit(db, user.id, "PUBLISH", "workflow", workflow.id, after={"published_version": version})
     db.commit()
@@ -267,6 +319,41 @@ def node_test_graph(payload: NodeTestRequest) -> dict[str, Any]:
     }
 
 
+def _source_extractor_config(source: Source) -> dict[str, Any]:
+    """Return the profiler suggestion plus explicit source overrides.
+
+    Source settings are intentionally JSON: users can edit them in the
+    workflow editor and a new site never requires a bank-specific code change.
+    """
+    settings = source.settings if isinstance(source.settings, dict) else {}
+    profile = settings.get("profile") if isinstance(settings.get("profile"), dict) else {}
+    configured = settings.get("extractor") if isinstance(settings.get("extractor"), dict) else {}
+    profile_extractor = profile.get("extractor") if isinstance(profile.get("extractor"), dict) else {}
+    candidates = profile.get("repeating_candidates") if isinstance(profile.get("repeating_candidates"), list) else []
+    candidate = configured.get("candidate") if isinstance(configured.get("candidate"), dict) else None
+    if not candidate:
+        usable = [item for item in candidates if isinstance(item, dict) and item.get("selector")]
+        candidate = max(usable, key=lambda item: (len(item.get("fields") or []), int(item.get("count") or 0)), default={})
+    container_selector = str(configured.get("container_selector") or profile_extractor.get("container_selector") or candidate.get("selector") or "")
+    fields = configured.get("fields") if isinstance(configured.get("fields"), list) else profile_extractor.get("fields") if isinstance(profile_extractor.get("fields"), list) else candidate.get("fields")
+    fields = [dict(item) for item in (fields or []) if isinstance(item, dict) and item.get("name") and item.get("selector")]
+    if not fields and container_selector:
+        fields = [{"name": "url", "selector": "a[href]", "attribute": "href"}]
+    link_field = next((item for item in fields if item.get("name") in {"url", "link", "href"} and item.get("attribute") == "href"), None)
+    if link_field and link_field.get("name") != "url":
+        link_field = {**link_field, "name": "url"}
+        fields = [link_field if item.get("name") in {"link", "href"} else item for item in fields]
+    detail = configured.get("detail") if isinstance(configured.get("detail"), dict) else settings.get("detail")
+    if not isinstance(detail, dict):
+        detail = {}
+    return {
+        "container_selector": container_selector,
+        "fields": fields,
+        "follow_links": bool(configured.get("follow_links", settings.get("follow_links", profile_extractor.get("follow_links", bool(link_field))))),
+        "detail": detail,
+    }
+
+
 def build_source_template(source: Source, template: str) -> dict[str, Any]:
     fetch_type = "browser_open" if source.fetch_mode == "PLAYWRIGHT" else "download_file" if source.fetch_mode == "DOCUMENT" else "http_request"
     fetch_config: dict[str, Any] = {"url": "{{source.url}}", "timeout": source.settings.get("timeout", 45)}
@@ -285,6 +372,7 @@ def build_source_template(source: Source, template: str) -> dict[str, Any]:
             {"id": "e-json-mapping", "source": "json", "target": "mapping"}, {"id": "e-mapping-output", "source": "mapping", "target": "output"},
         ]
         return {"version": 1, "settings": {"source_id": source.id, "review_policy": {"new": True, "changed": True, "confidence_below": 0.8}}, "nodes": nodes, "edges": edges}
+    extractor = _source_extractor_config(source)
     nodes: list[dict[str, Any]] = [
         {"id": "trigger", "type": "manual_trigger", "position": {"x": 20, "y": 160}, "config": {}},
         {"id": "fetch", "type": fetch_type, "position": {"x": 240, "y": 160}, "config": fetch_config},
@@ -297,19 +385,55 @@ def build_source_template(source: Source, template: str) -> dict[str, Any]:
             {"id": "output", "type": "output", "position": {"x": 820, "y": 160}, "config": {"input_path": "records"}},
         ])
     else:
-        nodes.extend([
-            {"id": "parse", "type": "parse_html", "position": {"x": 480, "y": 160}, "config": {"input_path": "body"}},
-            {"id": "mapping", "type": "mapping", "position": {"x": 700, "y": 160}, "config": {"input_path": "records", "fields": []}},
-            {"id": "extract", "type": "extract_repeating_list", "position": {"x": 720, "y": 160}, "config": {"input_path": "html", "container_selector": ".product-card", "fields": [{"name": "product_name", "selector": ".product-title"}, {"name": "rate", "selector": ".rate"}, {"name": "term", "selector": ".term"}]}},
-            {"id": "transform", "type": "transform", "position": {"x": 960, "y": 160}, "config": {"input_path": "records", "operations": [{"type": "rate", "field": "rate"}, {"type": "term", "field": "term"}]}},
-            {"id": "output", "type": "output", "position": {"x": 1200, "y": 160}, "config": {"input_path": "records"}},
-        ])
-        edges.extend([
-            {"id": "e-fetch-parse", "source": "fetch", "target": "parse"},
-            {"id": "e-parse-extract", "source": "parse", "target": "extract"},
-            {"id": "e-extract-transform", "source": "extract", "target": "transform"},
-            {"id": "e-transform-mapping", "source": "transform", "target": "mapping"}, {"id": "e-mapping-output", "source": "mapping", "target": "output"},
-        ])
+        # Prefer profiler-generated selectors.  With no repeating candidate we
+        # still create a useful, editable link collector instead of demo CSS.
+        if extractor["container_selector"]:
+            parse_node = {"id": "parse", "type": "parse_html", "position": {"x": 480, "y": 160}, "config": {"input_path": "body"}}
+            extract_node = {"id": "extract", "type": "extract_repeating_list", "position": {"x": 700, "y": 160}, "config": {"input_path": "html", "container_selector": extractor["container_selector"], "fields": extractor["fields"]}}
+            nodes.extend([parse_node, extract_node])
+            edges.extend([{ "id": "e-fetch-parse", "source": "fetch", "target": "parse" }, {"id": "e-parse-extract", "source": "parse", "target": "extract"}])
+            previous = "extract"
+        else:
+            select_node = {"id": "select", "type": "select_elements", "position": {"x": 540, "y": 160}, "config": {"input_path": "body", "selector": str(extractor.get("selector") or "a[href]"), "attribute": str(extractor.get("attribute") or "href")}}
+            nodes.append(select_node)
+            edges.append({"id": "e-fetch-select", "source": "fetch", "target": "select"})
+            previous = "select"
+
+        if extractor["follow_links"]:
+            detail = extractor["detail"]
+            follow_config = {"input_collection": "records", "url_field": "url", "merge_mode": "MERGE_PARENT_CHILD", "max_pages": int(detail.get("max_pages", 50)), "detail_fields": detail.get("fields", [])}
+            if detail.get("table"):
+                follow_config["detail_table"] = detail["table"]
+            nodes.append({"id": "follow", "type": "follow_links", "position": {"x": 900, "y": 160}, "config": follow_config})
+            edges.append({"id": "e-extract-follow", "source": previous, "target": "follow"})
+            previous = "follow"
+
+        names = [str(item.get("name")) for item in extractor["fields"] if item.get("name")]
+        for name in extractor["detail"].get("field_names", []):
+            if name not in names:
+                names.append(str(name))
+        operations = []
+        if "rate" in names:
+            operations.append({"type": "rate", "field": "rate"})
+        if "term" in names:
+            operations.append({"type": "term", "field": "term"})
+        if "currency" in names:
+            operations.append({"type": "currency", "field": "currency"})
+        nodes.append({"id": "transform", "type": "transform", "position": {"x": 1080, "y": 160}, "config": {"input_path": "records", "operations": operations}})
+        edges.append({"id": "e-previous-transform", "source": previous, "target": "transform"})
+        mapping_fields = [{"target": name, "source_path": name} for name in names]
+        if "rate" in names:
+            mapping_fields.extend([{"target": "rate_value", "source_path": "rate_value"}])
+        if "term" in names:
+            mapping_fields.extend([
+                {"target": "term_min_days", "source_path": "term_min_days"},
+                {"target": "term_max_days", "source_path": "term_max_days"},
+            ])
+        nodes.append({"id": "mapping", "type": "mapping", "position": {"x": 1260, "y": 160}, "config": {"input_path": "records", "fields": mapping_fields}})
+        edges.append({"id": "e-transform-mapping", "source": "transform", "target": "mapping"})
+        key_fields = ["url"] if "url" in names else ([names[0]] if names else ["value"])
+        nodes.append({"id": "output", "type": "output", "position": {"x": 1440, "y": 160}, "config": {"input_path": "records", "natural_key_fields": key_fields, "on_empty": "warning"}})
+        edges.append({"id": "e-mapping-output", "source": "mapping", "target": "output"})
         return {"version": 1, "settings": {"source_id": source.id, "review_policy": {"new": True, "changed": True, "confidence_below": 0.8}}, "nodes": nodes, "edges": edges}
     edges.extend([
         {"id": "e-fetch-parse", "source": "fetch", "target": "parse"},
@@ -329,7 +453,8 @@ def persist_result(db: Session, workflow: Workflow, run: Run, result: dict[str, 
         return {"enabled": False, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0}
     dataset = db.get(Dataset, dataset_id)
     if not dataset:
-        return {"enabled": False, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0, "warning": "Dataset не найден"}
+        return {"enabled": True, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0,
+                "blocked": True, "warning": "Configured dataset was not found"}
     output = result.get("result", {})
     preflight = output.get("preflight") if isinstance(output, dict) else None
     if not isinstance(preflight, dict) or not output.get("business_records"):
@@ -342,7 +467,8 @@ def persist_result(db: Session, workflow: Workflow, run: Run, result: dict[str, 
     if isinstance(payload, dict):
         payload = [payload]
     if not isinstance(payload, list):
-        return {"enabled": True, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0, "warning": "Output records is not a list"}
+        return {"enabled": True, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0,
+                "blocked": True, "warning": "Output records is not a list"}
     key_fields = output_config.get("natural_key_fields") or graph_settings.get("natural_key_fields") or dataset.natural_key_fields or []
     if isinstance(key_fields, str):
         key_fields = [item.strip() for item in key_fields.split(",") if item.strip()]
@@ -354,55 +480,203 @@ def persist_result(db: Session, workflow: Workflow, run: Run, result: dict[str, 
     if missing_keys:
         return {"enabled": True, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0,
                 "blocked": True, "validation_errors": missing_keys}
+    natural_key_rows: dict[str, list[int]] = {}
+    for index, item in enumerate(payload):
+        if not isinstance(item, dict):
+            continue
+        natural_key = "|".join(str(item.get(key, "")) for key in key_fields)
+        natural_key_rows.setdefault(natural_key, []).append(index)
+    duplicate_keys = [
+        {"code": "DUPLICATE_NATURAL_KEY", "natural_key": natural_key, "rows": rows}
+        for natural_key, rows in natural_key_rows.items()
+        if len(rows) > 1
+    ]
+    if duplicate_keys:
+        return {
+            "enabled": True,
+            "created": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "review_tasks": 0,
+            "blocked": True,
+            "warning": "Duplicate natural keys in one run",
+            "validation_errors": duplicate_keys,
+        }
     if dataset.schema_id:
         schema = db.get(DataSchema, dataset.schema_id)
         schema_errors: list[dict[str, Any]] = []
         if schema:
             for index, item in enumerate(payload):
                 try:
-                    validate_json_schema(item, schema.schema_json)
+                    validate_json_schema(business_record(item), schema.schema_json)
                 except ValueError as exc:
                     schema_errors.append({"row": index, "code": "SCHEMA", "message": str(exc)})
         if schema_errors:
             return {"enabled": True, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0,
                     "blocked": True, "validation_errors": schema_errors}
-    review_policy = output_config.get("review_policy") or graph_settings.get("review_policy") or dataset.review_policy or {"new": False, "changed": False, "confidence_below": 0.0}
-    counters = {"enabled": True, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0}
+    # Merge the three policy levels so a dataset-wide quality setting is not
+    # accidentally discarded by a reusable workflow's output node.
+    review_policy = {
+        "new": False,
+        "changed": False,
+        "confidence_below": 0.0,
+        "sample_unchanged": 0,
+        **(dataset.review_policy or {}),
+        **(graph_settings.get("review_policy") or {}),
+        **(output_config.get("review_policy") or {}),
+    }
+    counters = {"enabled": True, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0, "sampled_for_review": 0}
+    unchanged_candidates: list[tuple[Record, dict[str, Any]]] = []
     for item in payload:
         if not isinstance(item, dict):
             continue
+        business_item = business_record(item)
         natural_key = "|".join(str(item.get(key, "")) for key in key_fields) if key_fields else hashlib.sha256(json.dumps(item, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
-        data_hash = stable_record_hash(item)
-        confidence = float(item.get("confidence", 1.0) or 0)
-        record = db.scalar(select(Record).where(Record.dataset_id == dataset_id, Record.natural_key == natural_key))
+        data_hash = stable_record_hash(business_item)
+        confidence = float(business_item.get("confidence", 1.0) or 0)
+        record = db.scalar(
+            select(Record)
+            .where(Record.dataset_id == dataset_id, Record.natural_key == natural_key)
+            .with_for_update()
+        )
         if record is None:
-            requires_review = bool(review_policy.get("new", True) or item.get("requires_review") or confidence < float(review_policy.get("confidence_below", 0.8)))
-            record = Record(dataset_id=dataset_id, natural_key=natural_key, current_version=1, data_json=item, data_hash=data_hash, confidence=confidence, review_status="PENDING" if requires_review else "APPROVED")
+            requires_review = bool(review_policy.get("new", True) or business_item.get("requires_review") or confidence < float(review_policy.get("confidence_below", 0.8)))
+            record = Record(dataset_id=dataset_id, natural_key=natural_key, current_version=1, data_json=business_item, data_hash=data_hash, confidence=confidence, review_status="PENDING" if requires_review else "APPROVED")
             db.add(record)
             db.flush()
-            db.add(RecordVersion(record_id=record.id, run_id=run.id, version_number=1, data_json=item, data_hash=data_hash, confidence=confidence, review_status=record.review_status))
+            version = RecordVersion(record_id=record.id, run_id=run.id, version_number=1, data_json=business_item, data_hash=data_hash, confidence=confidence, review_status=record.review_status)
+            db.add(version)
+            db.flush()
+            add_record_observation(db, dataset, record, version, run, item, content_changed=True)
             if requires_review:
-                db.add(ReviewTask(project_id=workflow.project_id, record_id=record.id, run_id=run.id, reason="NEW_RECORD", old_data={}, new_data=item, evidence=evidence_from_item(item)))
+                db.add(ReviewTask(project_id=workflow.project_id, record_id=record.id, run_id=run.id, reason="NEW_RECORD", old_data={}, new_data=business_item, evidence=evidence_from_item(item)))
                 counters["review_tasks"] += 1
             counters["created"] += 1
             continue
         if record.data_hash == data_hash:
+            version = db.scalar(
+                select(RecordVersion)
+                .where(RecordVersion.record_id == record.id, RecordVersion.data_hash == data_hash)
+                .order_by(RecordVersion.version_number.desc())
+            )
+            if version is None:
+                raise ValueError(f"Current version is missing for record {record.id}")
+            add_record_observation(db, dataset, record, version, run, item, content_changed=False)
             counters["unchanged"] += 1
+            unchanged_candidates.append((record, business_item))
             continue
-        requires_review = bool(review_policy.get("changed", True) or item.get("requires_review") or confidence < float(review_policy.get("confidence_below", 0.8)))
-        next_version = record.current_version + 1
-        db.add(RecordVersion(record_id=record.id, run_id=run.id, version_number=next_version, data_json=item, data_hash=data_hash, confidence=confidence, review_status="PENDING" if requires_review else "APPROVED"))
+        requires_review = bool(review_policy.get("changed", True) or business_item.get("requires_review") or confidence < float(review_policy.get("confidence_below", 0.8)))
+        next_version = (
+            db.scalar(select(func.max(RecordVersion.version_number)).where(RecordVersion.record_id == record.id)) or 0
+        ) + 1
+        version = RecordVersion(record_id=record.id, run_id=run.id, version_number=next_version, data_json=business_item, data_hash=data_hash, confidence=confidence, review_status="PENDING" if requires_review else "APPROVED")
+        db.add(version)
+        db.flush()
+        add_record_observation(db, dataset, record, version, run, item, content_changed=True)
         if requires_review:
-            db.add(ReviewTask(project_id=workflow.project_id, record_id=record.id, run_id=run.id, reason="CHANGED_RECORD", old_data=record.data_json, new_data=item, evidence=evidence_from_item(item)))
+            db.add(ReviewTask(project_id=workflow.project_id, record_id=record.id, run_id=run.id, reason="CHANGED_RECORD", old_data=record.data_json, new_data=business_item, evidence=evidence_from_item(item)))
             counters["review_tasks"] += 1
         else:
-            record.data_json = item
+            record.data_json = business_item
             record.data_hash = data_hash
             record.current_version = next_version
             record.confidence = confidence
             record.review_status = "APPROVED"
         counters["updated"] += 1
+    # A recurring sample catches a broken selector or extraction regression even
+    # when the content hash has not changed. Ordering varies by run so repeated
+    # scheduled checks eventually cover a whole source.
+    try:
+        sample_size = max(0, int(review_policy.get("sample_unchanged", 0) or 0))
+    except (TypeError, ValueError):
+        sample_size = 0
+    if sample_size and unchanged_candidates:
+        sample = sorted(
+            unchanged_candidates,
+            key=lambda candidate: hashlib.sha256(f"{run.id}|{candidate[0].natural_key}".encode()).hexdigest(),
+        )[:sample_size]
+        for record, item in sample:
+            db.add(ReviewTask(
+                project_id=workflow.project_id,
+                record_id=record.id,
+                run_id=run.id,
+                reason="SAMPLED_RECORD",
+                old_data=item,
+                new_data=item,
+                evidence=evidence_from_item(item),
+            ))
+        counters["review_tasks"] += len(sample)
+        counters["sampled_for_review"] = len(sample)
+    dataset_run = db.scalar(select(DatasetRun).where(DatasetRun.run_id == run.id, DatasetRun.dataset_id == dataset.id))
+    if dataset_run is None:
+        db.add(DatasetRun(
+            run_id=run.id,
+            dataset_id=dataset.id,
+            observed_count=counters["created"] + counters["updated"] + counters["unchanged"],
+        ))
     return counters
+
+
+def add_record_observation(
+    db: Session,
+    dataset: Dataset,
+    record: Record,
+    version: RecordVersion,
+    run: Run,
+    item: dict[str, Any],
+    *,
+    content_changed: bool,
+) -> None:
+    raw_document = raw_document_for_item(db, run.id, item)
+    fetched_at = metadata_datetime(item.get("fetched_at")) or (raw_document.created_at if raw_document else None)
+    db.add(RecordObservation(
+        dataset_id=dataset.id,
+        record_id=record.id,
+        record_version_id=version.id,
+        run_id=run.id,
+        source_id=run.source_id,
+        raw_document_id=raw_document.id if raw_document else None,
+        natural_key=record.natural_key,
+        content_changed=content_changed,
+        source_published_at=metadata_datetime(item.get("source_published_at") or item.get("published_at")),
+        source_modified_at=metadata_datetime(item.get("source_modified_at")),
+        fetched_at=fetched_at,
+        observed_at=utcnow(),
+    ))
+
+
+def metadata_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        text = value.strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def raw_document_for_item(db: Session, run_id: str, item: dict[str, Any]) -> RawDocument | None:
+    provenance = item.get("__provenance") if isinstance(item.get("__provenance"), dict) else {}
+    explicit_id = provenance.get("raw_document_id") or item.get("raw_document_id")
+    if explicit_id:
+        document = db.get(RawDocument, str(explicit_id))
+        if document and document.run_id == run_id:
+            return document
+    artifact = provenance.get("raw_artifact") if isinstance(provenance.get("raw_artifact"), dict) else (
+        item.get("raw_artifact") if isinstance(item.get("raw_artifact"), dict) else {}
+    )
+    sha256 = artifact.get("sha256")
+    if not sha256:
+        return None
+    stmt = select(RawDocument).where(RawDocument.run_id == run_id)
+    stmt = stmt.where(RawDocument.sha256 == str(sha256))
+    return db.scalar(stmt.order_by(RawDocument.created_at.desc()))
 
 
 def evidence_from_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -448,6 +722,8 @@ def node_recommendations(node_type: str, output: dict[str, Any], error: dict[str
 
 def determine_run_status(graph: dict[str, Any], result: dict[str, Any], persistence: dict[str, Any]) -> str:
     """Report empty extraction honestly instead of calling it SUCCESS."""
+    if persistence.get("blocked"):
+        return "FAILED"
     if persistence.get("review_tasks"):
         return "WAITING_FOR_REVIEW"
     outputs = result.get("node_outputs", {})
@@ -472,9 +748,18 @@ def determine_run_status(graph: dict[str, Any], result: dict[str, Any], persiste
 
 def stable_record_hash(item: dict[str, Any]) -> str:
     """Hash business data only; run evidence and observation time must not create a revision."""
-    volatile = {"observed_at", "evidence", "raw_artifact", "status_code", "artifacts"}
+    volatile = {"fetched_at", "observed_at", "evidence", "raw_artifact", "status_code", "artifacts"}
     comparable = {key: value for key, value in item.items() if key not in volatile}
     return hashlib.sha256(json.dumps(comparable, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def business_record(item: dict[str, Any]) -> dict[str, Any]:
+    """Remove engine-owned side channels before schema validation and storage."""
+    return {
+        key: value
+        for key, value in item.items()
+        if not key.startswith("__") and key not in {"raw_artifact", "raw_document_id"}
+    }
 
 
 def active_graph(db: Session, workflow: Workflow, workflow_version: int) -> dict[str, Any]:
@@ -486,8 +771,10 @@ def build_execution_variables(db: Session, source: Source | None) -> tuple[dict[
     variables: dict[str, Any] = {
         "source": {
             "id": source.id if source else None,
+            "name": source.name if source else "",
             "url": source.entry_url if source else "",
             "base_url": source.base_url if source else "",
+            "fetch_mode": source.fetch_mode if source else "",
             "settings": source.settings if source else {},
         },
         "deepseek_base_url": settings.deepseek_base_url,
@@ -583,16 +870,25 @@ async def execute_run(run_id: str) -> None:
         for artifact in context.artifacts:
             if artifact.get("storage_key"):
                 db.add(RawDocument(run_id=run.id, source_id=run.source_id, url=artifact.get("url", ""), content_type=artifact.get("content_type", ""), sha256=artifact.get("sha256", ""), storage_key=artifact["storage_key"], metadata_json={key: value for key, value in artifact.items() if key != "storage_key"}))
+        db.flush()
         persistence = persist_result(db, workflow, run, result)
         run.output_json = {**result, "persistence": persistence}
         run.status = determine_run_status(graph, result, persistence)
+        if persistence.get("blocked"):
+            run.error_json = {
+                "code": "PERSISTENCE_BLOCKED",
+                "message": persistence.get("warning") or "Dataset persistence validation failed",
+                "details": persistence.get("validation_errors") or [],
+            }
         run.finished_at = datetime.now(UTC)
         db.commit()
     except Exception as exc:
-        if run:
-            run.status = "FAILED"
-            run.error_json = {"code": "WORKFLOW_ERROR", "message": str(exc)}
-            run.finished_at = datetime.now(UTC)
+        db.rollback()
+        failed_run = db.get(Run, run_id)
+        if failed_run:
+            failed_run.status = "FAILED"
+            failed_run.error_json = {"code": "WORKFLOW_ERROR", "message": str(exc)}
+            failed_run.finished_at = datetime.now(UTC)
             db.commit()
     finally:
         db.close()
@@ -617,6 +913,9 @@ async def run_workflow(
     if payload.use_published and not workflow.published_version:
         raise HTTPException(status_code=422, detail="Опубликованная версия отсутствует: сначала нажмите «Опубликовать»")
     run_version = workflow.published_version if payload.use_published else workflow.version
+    graph = active_graph(db, workflow, run_version)
+    if "{{source." in json.dumps(graph, ensure_ascii=False) and not source_id:
+        raise HTTPException(status_code=422, detail="Выберите источник запуска: этот workflow использует URL источника")
     try:
         zone = ZoneInfo(payload.timezone)
     except Exception as exc:
@@ -640,6 +939,56 @@ async def run_workflow(
     return run
 
 
+@router.post("/{workflow_id}/run-all", response_model=list[RunOut], status_code=201)
+async def run_workflow_for_all_sources(
+    workflow_id: str,
+    payload: RunRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER", "OPERATOR")),
+) -> list[Run]:
+    """Queue one independent run for every public, enabled source of the workflow project.
+
+    A batch is deliberately represented as normal runs: it preserves per-site
+    raw artifacts, failures and retry controls while writing all results into
+    the workflow's single output dataset.
+    """
+    workflow = db.get(Workflow, workflow_id)
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    if payload.use_published and not workflow.published_version:
+        raise HTTPException(status_code=422, detail="Published workflow is required")
+    try:
+        zone = ZoneInfo(payload.timezone)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="Invalid timezone") from exc
+    clock = datetime.now(zone)
+    if payload.run_clock_mode == "manual":
+        if payload.run_at is None:
+            raise HTTPException(status_code=422, detail="Manual run requires a date and time")
+        clock = payload.run_at.replace(tzinfo=zone) if payload.run_at.tzinfo is None else payload.run_at.astimezone(zone)
+    sources = list(db.scalars(select(Source).where(Source.project_id == workflow.project_id, Source.enabled.is_(True))).all())
+    sources = [source for source in sources if (source.settings or {}).get("access_status", "PUBLIC") == "PUBLIC"]
+    if not sources:
+        raise HTTPException(status_code=422, detail="No public enabled sources in this project")
+    run_version = workflow.published_version if payload.use_published else workflow.version
+    runs = [
+        Run(
+            workflow_id=workflow.id,
+            workflow_version=run_version,
+            source_id=source.id,
+            input_json={**payload.inputs, "batch": True, "_run_clock": {"mode": payload.run_clock_mode, "timezone": payload.timezone, "effective": clock.isoformat()}},
+            created_by=user.id,
+        )
+        for source in sources
+    ]
+    db.add_all(runs)
+    db.commit()
+    for run in runs:
+        db.refresh(run)
+        enqueue_run(run.id)
+    return runs
+
+
 def enqueue_run(run_id: str) -> None:
     from celery import Celery
     celery = Celery("parser_studio_client", broker=settings.redis_url)
@@ -648,8 +997,8 @@ def enqueue_run(run_id: str) -> None:
         run = db.get(Run, run_id)
         workflow = db.get(Workflow, run.workflow_id) if run else None
         graph = active_graph(db, workflow, run.workflow_version) if run and workflow else {}
-        node_types = {node.get("type") or node.get("data", {}).get("type") for node in graph.get("nodes", [])}
-        queue = "browser" if "browser_open" in node_types else "documents" if node_types & {"parse_document", "download_file"} else "llm" if node_types & {"llm_extract", "llm_classify"} else "exports" if "export_file" in node_types else "default"
+        source = db.get(Source, run.source_id) if run and run.source_id else None
+        queue = queue_for_graph(graph, source)
     finally:
         db.close()
     celery.send_task("parser_studio.execute_run", args=[run_id], queue=queue)

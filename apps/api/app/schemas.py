@@ -19,6 +19,23 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class ApiTokenCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    scopes: list[str] = ["datasets:read"]
+    dataset_ids: list[str] = Field(min_length=1)
+    expires_at: datetime | None = None
+
+
+class ApiTokenCreated(BaseModel):
+    id: str
+    name: str
+    token: str
+    token_prefix: str
+    scopes: list[str]
+    dataset_ids: list[str]
+    expires_at: datetime | None
+
+
 class UserCreate(BaseModel):
     email: str
     password: str = Field(min_length=8)
@@ -75,6 +92,15 @@ class SourceCreate(BaseModel):
     settings: dict[str, Any] = {}
 
 
+class SourceUpdate(BaseModel):
+    name: str | None = None
+    entry_url: str | None = None
+    enabled: bool | None = None
+    description: str | None = None
+    fetch_mode: str | None = None
+    tags: list[str] | None = None
+
+
 class SourceOut(ORMModel):
     id: str
     project_id: str
@@ -86,6 +112,7 @@ class SourceOut(ORMModel):
     version: int
     settings: dict[str, Any]
     created_at: datetime
+    updated_at: datetime
 
 
 class ProfileRequest(BaseModel):
@@ -148,6 +175,58 @@ class DatasetOut(ORMModel):
     updated_at: datetime
 
 
+class RecordTimestamps(BaseModel):
+    source_published_at: datetime | None = None
+    source_modified_at: datetime | None = None
+    fetched_at: datetime | None = None
+    observed_at: datetime | None = None
+
+
+class RecordProvenance(BaseModel):
+    run_id: str | None = None
+    source_id: str | None = None
+    raw_document_id: str | None = None
+
+
+class DataRecordItem(BaseModel):
+    id: str
+    record_id: str
+    record_version_id: str | None = None
+    natural_key: str
+    status: str
+    data: dict[str, Any]
+    timestamps: RecordTimestamps
+    provenance: RecordProvenance
+    confidence: float
+    review_status: str
+    updated_at: datetime
+
+
+class CursorPagination(BaseModel):
+    limit: int
+    next_cursor: str | None = None
+
+
+class DataResponseMeta(BaseModel):
+    dataset_id: str
+    dataset_slug: str
+    view: str
+    run_id: str | None = None
+    time_basis: str
+    from_: datetime | None = Field(default=None, alias="from")
+    to: datetime | None = None
+    at: datetime | None = None
+
+
+class DataRecordsResponse(BaseModel):
+    items: list[DataRecordItem]
+    pagination: CursorPagination
+    meta: DataResponseMeta
+    limit: int
+    offset: int
+    total: int
+
+
 class WorkflowCreate(BaseModel):
     project_id: str
     name: str
@@ -162,6 +241,13 @@ class WorkflowUpdate(BaseModel):
     is_active: bool | None = None
 
 
+class WorkflowImportRequest(BaseModel):
+    project_id: str
+    name: str
+    description: str = ""
+    graph_json: dict[str, Any]
+
+
 class WorkflowOut(ORMModel):
     id: str
     project_id: str
@@ -173,6 +259,46 @@ class WorkflowOut(ORMModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+
+
+class WorkflowTemplateCreate(BaseModel):
+    project_id: str
+    name: str
+    description: str = ""
+    tags: list[str] = []
+    graph_json: dict[str, Any]
+
+
+class WorkflowTemplateUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    tags: list[str] | None = None
+
+
+class WorkflowTemplateInstantiateRequest(BaseModel):
+    project_id: str
+    name: str | None = None
+    source_id: str | None = None
+    dataset_id: str | None = None
+
+
+class WorkflowTemplateFromWorkflowRequest(BaseModel):
+    project_id: str
+    name: str
+    description: str = ""
+    tags: list[str] = []
+
+
+class WorkflowTemplateOut(ORMModel):
+    id: str
+    project_id: str | None = None
+    name: str
+    description: str
+    tags: list[str] = []
+    graph_json: dict[str, Any]
+    is_system: bool = False
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 class RunRequest(BaseModel):

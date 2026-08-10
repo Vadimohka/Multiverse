@@ -69,6 +69,7 @@ flowchart LR
 - Safe mapping, constants, formulas without Python `eval`, and financial value normalizers.
 - DeepSeek and other OpenAI-compatible extraction and classification with JSON-schema validation and call history.
 - Versioned datasets, review tasks, raw artifacts in MinIO/S3 or the local fallback, schedules, Celery workers, audit logs, health checks, and metrics.
+- Stable dataset Data API for current state, latest/specific runs, history, exact-second source/fetch/observation filters, cursor pagination, and scoped read-only tokens.
 - Output to internal datasets, PostgreSQL/MySQL/SQLite, REST webhooks, CSV, XLSX, and JSON.
 
 ## Quick start
@@ -104,6 +105,13 @@ For low-resource servers (1 vCPU, 1 GiB RAM), see [the minimal Compose deploymen
 ## First workflow
 
 On first startup, Multiverse seeds a deterministic bank-deposit demo. It fetches local financial HTML, extracts deposit cards, normalizes values, validates and versions three records, creates review tasks, approves the records, and exports the dataset to XLSX. Use it to verify the installation before connecting external websites.
+
+It also installs the executable `БВФБ: новости` site preset. The preset reads the
+calendar over HTTP, renders JavaScript detail pages with Playwright, extracts the
+publication time in `Europe/Minsk`, and stores news in the `bcse-news` dataset.
+Site URLs and selectors live in this preset, not in the generic crawler. See the
+[Data API contract](docs/audit/DATA_API_CONTRACT.md) for read-only token and
+`from`/`to` query examples.
 
 ## Node catalog
 
