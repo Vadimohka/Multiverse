@@ -34,6 +34,8 @@ NODE_CATALOG: list[dict[str, Any]] = [
     {"type": "browser_open", "label": "Browser Open", "category": "Fetch", "description": "Открывает JavaScript-страницу Playwright, выполняет действия и сохраняет screenshot/network.", "fields": [
         field("url", "URL", "template", placeholder="{{source.url}}"), field("wait_until", "Ожидание", "select", options=["domcontentloaded", "load", "networkidle"], default="networkidle"),
         field("timeout", "Timeout, сек.", "number", default=45), field("actions", "Действия браузера", "json", default=[]),
+        field("browser_cookies", "Cookies браузера", "json", default=[]),
+        field("storage_state", "Storage state", "json", default={}),
         field("capture_network", "Перехватывать JSON/XHR", "boolean", default=True), field("full_page", "Полный screenshot", "boolean", default=True),
     ]},
     {"type": "download_file", "label": "Download File", "category": "Fetch", "description": "Скачивает документ и передаёт base64 для document parser.", "fields": [field("url", "URL", "template", placeholder="{{source.url}}"), field("headers", "Headers", "json", default={}), field("timeout", "Timeout, сек.", "number", default=60), *retry_policy_fields()]},

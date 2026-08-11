@@ -807,7 +807,14 @@ def build_execution_variables(db: Session, source: Source | None) -> tuple[dict[
     if source and source.settings.get("browser_profile_id"):
         profile = db.get(BrowserProfile, source.settings["browser_profile_id"])
         if profile:
-            variables["browser_profile"] = {"viewport": profile.viewport, "locale": profile.locale, "timezone": profile.timezone, "user_agent": profile.user_agent, "proxy": profile.proxy}
+            storage_state: dict[str, Any] | None = None
+            if profile.encrypted_storage_state:
+                try:
+                    decoded = json.loads(decrypt_secret(profile.encrypted_storage_state))
+                    storage_state = decoded if isinstance(decoded, dict) else None
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    storage_state = None
+            variables["browser_profile"] = {"viewport": profile.viewport, "locale": profile.locale, "timezone": profile.timezone, "user_agent": profile.user_agent, "proxy": profile.proxy, "storage_state": storage_state}
     return variables, secrets
 
 

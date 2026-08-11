@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlsplit
 
@@ -31,7 +32,8 @@ async def profile_url(url: str, timeout: float = 20) -> dict[str, Any]:
     })
     lower_url = url.lower()
     if "json" in content_type:
-        result.update({"recommended_fetch_mode": "XHR_JSON", "json_detected": True, "static_text_length": len(response.text), "xhr_candidates": [candidate_from_response(response, "GET")]})
+        payload = response.json()
+        result.update({"recommended_fetch_mode": "XHR_JSON", "json_detected": True, "static_text_length": len(response.text), "xhr_candidates": [candidate_from_response(response, "GET")], "json_schema_hints": infer_json_schema_hints(payload)})
         return result
     document_types = {"pdf": "PDF", "word": "DOCX", "spreadsheet": "XLSX", "csv": "CSV"}
     for token, document_type in document_types.items():
@@ -58,6 +60,7 @@ async def profile_url(url: str, timeout: float = 20) -> dict[str, Any]:
         "repeating_candidates": repeated_candidates,
         "extractor": build_extractor_suggestion(repeated_candidates),
         "captcha_detected": captcha_detected,
+        **analyze_html_capabilities(soup, str(response.url)),
     })
     if captcha_detected:
         result["warnings"].append("Обнаружены признаки CAPTCHA; может потребоваться браузерный профиль и ручная авторизация")
@@ -287,3 +290,142 @@ def candidate_from_response(response: httpx.Response, method: str) -> dict[str, 
         "query_params": {key: values[-1] if len(values) == 1 else values for key, values in parse_qs(urlsplit(str(response.url)).query, keep_blank_values=True).items()},
         "request_body": "", "headers": {},
     }
+
+
+def analyze_html_capabilities(soup: BeautifulSoup, page_url: str) -> dict[str, Any]:
+    pagination_candidates: list[dict[str, Any]] = []
+    for element in soup.select("a[rel='next'][href], link[rel='next'][href]"):
+        pagination_candidates.append({
+            "mode": "NEXT_LINK",
+            "selector": f"{element.name}[rel='next']",
+            "url": urljoin(page_url, str(element.get("href") or "")),
+            "confidence": 1.0,
+            "reason": "HTML rel=next semantic",
+        })
+    current_query = parse_qs(urlsplit(page_url).query, keep_blank_values=True)
+    for element in soup.select("a[href]"):
+        target = urljoin(page_url, str(element.get("href") or ""))
+        target_query = parse_qs(urlsplit(target).query, keep_blank_values=True)
+        changed = [
+            key
+            for key, value in target_query.items()
+            if value != current_query.get(key) and value and value[-1].lstrip("-").isdigit()
+        ]
+        for key in changed:
+            pagination_candidates.append({
+                "mode": "QUERY_PARAMETER",
+                "parameter": key,
+                "url": target,
+                "confidence": 0.8,
+                "reason": "numeric query parameter changes between pages",
+            })
+
+    metadata_candidates: list[dict[str, Any]] = []
+    semantic_metadata = (
+        ("source_published_at", "time[datetime]", "datetime"),
+        ("source_published_at", "meta[property='article:published_time']", "content"),
+        ("source_modified_at", "meta[property='article:modified_time']", "content"),
+        ("source_modified_at", "[itemprop='dateModified']", "datetime"),
+    )
+    for target, selector, attribute in semantic_metadata:
+        if soup.select_one(selector):
+            metadata_candidates.append({
+                "target": target,
+                "source": "selector",
+                "selector": selector,
+                "attribute": attribute,
+                "confidence": 0.9,
+            })
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:
+            value = json.loads(script.string or script.get_text() or "")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        serialized = json.dumps(value, ensure_ascii=False)
+        for target, field_name in (
+            ("source_published_at", "datePublished"),
+            ("source_modified_at", "dateModified"),
+        ):
+            if f'"{field_name}"' in serialized:
+                metadata_candidates.append({
+                    "target": target,
+                    "source": "json_ld",
+                    "json_path": f"$..{field_name}",
+                    "confidence": 0.95,
+                })
+
+    table_candidates: list[dict[str, Any]] = []
+    for index, table in enumerate(soup.select("table"), start=1):
+        first_row = table.select_one("tr")
+        headers = [
+            cell.get_text(" ", strip=True)
+            for cell in first_row.select(":scope > th, :scope > td")
+        ] if first_row else []
+        selector = f"#{css_escape(str(table.get('id')))}" if table.get("id") else f"table:nth-of-type({index})"
+        table_candidates.append({
+            "selector": selector,
+            "headers": headers,
+            "row_count": len(table.select("tr")),
+            "confidence": 0.95 if headers else 0.6,
+        })
+
+    selector_candidates: list[dict[str, Any]] = []
+    for candidate in detect_repeating_candidates(soup):
+        css = str(candidate["selector"])
+        try:
+            element = soup.select_one(css)
+        except Exception:
+            element = None
+        if element is None:
+            continue
+        classes = [str(item) for item in (element.get("class") or [])]
+        class_predicates = "".join(
+            f"[contains(concat(' ', normalize-space(@class), ' '), ' {item} ')]"
+            for item in classes
+        )
+        selector_candidates.append({
+            "css": css,
+            "xpath": f"//{element.name}{class_predicates}",
+            "confidence": min(1.0, 0.5 + float(candidate.get("field_population") or 0) / 2),
+            "count": candidate.get("count", 0),
+        })
+    return {
+        "pagination_candidates": unique_dicts(pagination_candidates, "url"),
+        "metadata_candidates": metadata_candidates,
+        "table_candidates": table_candidates,
+        "selector_candidates": selector_candidates,
+    }
+
+
+def infer_json_schema_hints(value: Any) -> dict[str, Any]:
+    arrays: list[dict[str, Any]] = []
+
+    def kind(item: Any) -> str:
+        if item is None:
+            return "null"
+        if isinstance(item, bool):
+            return "boolean"
+        if isinstance(item, (int, float)):
+            return "number"
+        if isinstance(item, dict):
+            return "object"
+        if isinstance(item, list):
+            return "array"
+        return "string"
+
+    def visit(item: Any, path: str) -> None:
+        if isinstance(item, list):
+            sample = next((child for child in item if isinstance(child, dict)), None)
+            arrays.append({
+                "json_path": f"{path}[*]",
+                "length": len(item),
+                "fields": {key: kind(child) for key, child in sample.items()} if sample else {},
+            })
+            if item:
+                visit(item[0], f"{path}[*]")
+        elif isinstance(item, dict):
+            for key, child in item.items():
+                visit(child, f"{path}.{key}")
+
+    visit(value, "$")
+    return {"array_candidates": arrays[:50]}

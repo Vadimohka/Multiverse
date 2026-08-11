@@ -87,12 +87,22 @@ class BrowserOpenNode:
             from playwright.async_api import async_playwright
 
             async with async_playwright() as playwright:
-                browser = await playwright.chromium.launch(headless=True)
-                page = await browser.new_page(
-                    viewport=context.variables.get("browser_profile", {}).get("viewport", {"width": 1440, "height": 900}),
-                    locale=context.variables.get("browser_profile", {}).get("locale", "ru-RU"),
-                    timezone_id=context.variables.get("browser_profile", {}).get("timezone", "Europe/Minsk"),
+                profile = context.variables.get("browser_profile", {})
+                proxy = profile.get("proxy") if isinstance(profile, dict) else None
+                browser = await playwright.chromium.launch(headless=True, proxy=proxy or None)
+                browser_context = await browser.new_context(
+                    **browser_context_options(profile if isinstance(profile, dict) else {}, config)
                 )
+                configured_cookies = config.get("browser_cookies") or profile.get("cookies") or []
+                if isinstance(configured_cookies, dict):
+                    origin = urlunsplit((*urlsplit(url)[:2], "", "", ""))
+                    configured_cookies = [
+                        {"name": name, "value": str(value), "url": origin}
+                        for name, value in configured_cookies.items()
+                    ]
+                if configured_cookies:
+                    await browser_context.add_cookies(configured_cookies)
+                page = await browser_context.new_page()
                 if config.get("capture_network", True):
                     async def on_response(response: Any) -> None:
                         content_type = response.headers.get("content-type", "")
@@ -111,6 +121,7 @@ class BrowserOpenNode:
                 screenshot = await page.screenshot(full_page=bool(config.get("full_page", True)), type="png")
                 title = await page.title()
                 final_url = page.url
+                await browser_context.close()
                 await browser.close()
             raw = rendered_html.encode("utf-8")
             html_artifact = await store_artifact(context, raw, "text/html", final_url, "rendered.html", "rendered_html")
@@ -151,8 +162,15 @@ class BrowserOpenNode:
 
 
 async def perform_browser_action(page: Any, action: dict[str, Any], timeout_ms: int) -> None:
-    kind = action.get("type")
+    kind = str(action.get("type") or "")
     selector = action.get("selector")
+    known = {"click", "fill", "select", "hover", "press", "wait", "wait_for", "scroll", "javascript"}
+    if kind not in known:
+        raise ValueError(f"Unknown browser action: {kind or '<empty>'}")
+    if kind in {"click", "fill", "select", "hover", "wait_for"} and not selector:
+        raise ValueError(f"Browser action {kind} requires selector")
+    if kind == "javascript" and not str(action.get("script") or "").strip():
+        raise ValueError("Browser action javascript requires script")
     if kind == "click":
         await page.locator(selector).first.click(timeout=timeout_ms)
     elif kind == "fill":
@@ -171,8 +189,21 @@ async def perform_browser_action(page: Any, action: dict[str, Any], timeout_ms: 
         await page.evaluate("window.scrollBy(0, arguments[0])", int(action.get("pixels", 1000)))
     elif kind == "javascript":
         await page.evaluate(str(action.get("script", "")))
-    else:
-        raise ValueError(f"Неизвестное browser action: {kind}")
+
+
+def browser_context_options(profile: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "viewport": config.get("viewport") or profile.get("viewport") or {"width": 1440, "height": 900},
+        "locale": str(config.get("locale") or profile.get("locale") or "ru-RU"),
+        "timezone_id": str(config.get("timezone") or profile.get("timezone") or "Europe/Minsk"),
+    }
+    user_agent = config.get("user_agent") or profile.get("user_agent")
+    storage_state = config.get("storage_state") or profile.get("storage_state")
+    if user_agent:
+        options["user_agent"] = str(user_agent)
+    if storage_state:
+        options["storage_state"] = storage_state
+    return options
 
 
 async def collect_paginated_html(page: Any, config: dict[str, Any], timeout_ms: int, start_url: str | None = None) -> str:
@@ -1733,12 +1764,25 @@ def extract_article_record(
     detail_fields = config.get("detail_fields")
     if isinstance(detail_fields, list):
         record: dict[str, Any] = {"record_id": candidate.get("record_id") or hashlib.sha256(canonical_url(page_url).encode()).hexdigest()[:20]}
+        page_metadata = extract_page_metadata(soup)
         if config.get("include_listing_fields") and isinstance(candidate.get("item"), dict):
             record.update(candidate["item"])
         for field in detail_fields:
             if not isinstance(field, dict) or not field.get("name"):
                 continue
             name = str(field["name"])
+            source_kind = str(field.get("source") or "selector").lower()
+            if source_kind in {"metadata", "json_ld"}:
+                metadata_key = str(field.get("metadata_key") or name)
+                value = page_metadata.get(metadata_key)
+                if name in {"source_published_at", "source_modified_at"}:
+                    value = normalize_source_datetime(
+                        str(value or ""),
+                        timezone=str(field.get("timezone") or config.get("timezone") or "UTC"),
+                        date_format=str(field.get("format") or ""),
+                    )
+                record[name] = value
+                continue
             selector = str(field.get("selector") or "")
             elements = soup.select(selector) if selector else []
             element = elements[0] if elements else None
@@ -1869,6 +1913,32 @@ def extract_jsonld_dates(soup: BeautifulSoup) -> dict[str, str]:
             visit(json.loads(script.string or script.get_text() or ""))
         except (json.JSONDecodeError, TypeError):
             continue
+    return result
+
+
+def extract_page_metadata(soup: BeautifulSoup) -> dict[str, str]:
+    result = extract_jsonld_dates(soup)
+    semantic = {
+        "source_published_at": (
+            "time[datetime]",
+            "[itemprop='datePublished']",
+            "meta[property='article:published_time']",
+        ),
+        "source_modified_at": (
+            "[itemprop='dateModified']",
+            "meta[property='article:modified_time']",
+        ),
+    }
+    for target, selectors in semantic.items():
+        if result.get(target):
+            continue
+        for selector in selectors:
+            element = soup.select_one(selector)
+            if element:
+                value = element.get("datetime") or element.get("content") or element.get_text(" ", strip=True)
+                if value:
+                    result[target] = str(value)
+                    break
     return result
 
 
