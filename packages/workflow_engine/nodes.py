@@ -5,6 +5,7 @@ import asyncio
 import base64
 import csv
 import hashlib
+import hmac
 import io
 import json
 import re
@@ -400,23 +401,20 @@ class FollowLinksNode:
             collection = [{str(config.get("url_field", "url")): urljoin(base_url, element.get("href", ""))}
                           for element in soup.select(str(config.get("selector", "a[href]"))) if element.get("href")]
         url_field = str(config.get("url_field", "url"))
-        pattern = re.compile(str(config.get("url_pattern"))) if config.get("url_pattern") else None
         limit = max(0, int(config.get("max_pages", len(collection) or 20)))
-        parents: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for item in collection:
-            parent = dict(item) if isinstance(item, dict) else {url_field: item}
-            raw_url = find_value(parent, url_field)
-            if not raw_url:
-                continue
-            url = urljoin(base_url, str(raw_url))
-            if (pattern and not pattern.search(url)) or url in seen:
-                continue
-            seen.add(url)
-            parent[url_field] = url
+        frontier = build_url_frontier(
+            collection,
+            base_url=base_url,
+            origin_url=base_url,
+            url_path=url_field,
+            config=config,
+            limit=limit or len(collection),
+        )
+        parents = []
+        for candidate in frontier:
+            parent = dict(candidate["item"])
+            parent[url_field] = candidate["url"]
             parents.append(parent)
-            if limit and len(parents) >= limit:
-                break
 
         concurrency = min(max(int(config.get("concurrency", 3)), 1), 20)
         fetch_policy = FetchPolicy.from_config(config)
@@ -515,7 +513,25 @@ class CrawlLinksNode:
 
     async def execute(self, context: ExecutionContext, inputs: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         config = self._effective_config(context, inputs, config)
-        listing, listing_url = await self._load_listing(context, inputs, config)
+        headers = {"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5", "User-Agent": "Mozilla/5.0 (compatible; ParserStudio/1.0)"}
+        headers.update(render_object(config.get("headers") or {}, context, inputs))
+        cookies = render_object(config.get("cookies") or {}, context, inputs)
+        client = httpx.AsyncClient(follow_redirects=True, headers=headers, cookies=cookies)
+        resume_token = str(inputs.get("resume_token") or config.get("resume_token") or "").strip()
+        try:
+            if resume_token:
+                resume_urls = decode_crawl_resume_token(resume_token, context, config)
+                listing = [{"url": url} for url in resume_urls]
+                listing_url = resume_urls[0] if resume_urls else str(config.get("listing_url") or "")
+                context.variables["_crawl_listing_diagnostics"] = {
+                    "fetch_mode": "RESUME",
+                    "resumed_urls": len(resume_urls),
+                }
+            else:
+                listing, listing_url = await self._load_listing(context, inputs, config, client=client)
+        except Exception:
+            await close_http_client(client)
+            raise
         listing_diagnostics = context.variables.pop("_crawl_listing_diagnostics", {})
         items = self._listing_items(listing, config)
         configured_base = str(config.get("base_url") or find_value(inputs, "url") or context.variables.get("source", {}).get("base_url", "") or context.variables.get("source", {}).get("url", ""))
@@ -525,47 +541,46 @@ class CrawlLinksNode:
         pattern_text = str(config.get("url_pattern") or "").strip()
         pattern = re.compile(pattern_text, re.I) if pattern_text else None
         url_path = str(config.get("url_path") or "url")
-        seen: set[str] = set()
-        candidates: list[dict[str, Any]] = []
-        listing_host = urlsplit(listing_url).netloc.lower()
-        for item in items:
-            raw_url = find_value(item, url_path) if isinstance(item, dict) else item
-            if not raw_url:
-                continue
-            raw_url_string = str(raw_url)
-            canonical = canonical_url(urljoin(base_url, raw_url_string if raw_url_string.startswith(("/", "http://", "https://")) else f"/{raw_url_string}"))
-            parts = urlsplit(canonical)
-            if parts.scheme not in {"http", "https"}:
-                continue
-            if config.get("same_origin_only", True) and listing_host and parts.netloc.lower() != listing_host:
-                continue
-            match = pattern.search(canonical) if pattern else None
-            if pattern and not match:
-                continue
-            record_id = (match.group(1) if match and match.groups() else match.group(0) if match else hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20])
-            if canonical in seen:
-                continue
-            seen.add(canonical)
-            candidates.append({"item": item if isinstance(item, dict) else {}, "url": canonical, "record_id": record_id})
-            if len(candidates) >= min(max(int(config.get("max_items", 100)), 1), 5000):
-                break
+        maximum = min(
+            max(int(config.get("max_items", 5000)), 1),
+            max(int(config.get("max_pages", config.get("max_items", 5000))), 1),
+            5000,
+        )
+        candidates = build_url_frontier(
+            items,
+            base_url=base_url,
+            origin_url=listing_url,
+            url_path=url_path,
+            config=config,
+            limit=maximum,
+        )
+        for candidate in candidates:
+            match = pattern.search(candidate["url"]) if pattern else None
+            candidate["record_id"] = (
+                match.group(1)
+                if match and match.groups()
+                else match.group(0)
+                if match
+                else hashlib.sha256(candidate["url"].encode("utf-8")).hexdigest()[:20]
+            )
+            candidate["depth"] = 1
 
         concurrency = min(max(int(config.get("concurrency", 3)), 1), 20)
         delay_ms = max(int(config.get("delay_ms", 400)), 0)
         fetch_policy = FetchPolicy.from_config(config)
-        headers = {"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5", "User-Agent": "Mozilla/5.0 (compatible; ParserStudio/1.0)"}
-        headers.update(render_object(config.get("headers") or {}, context, inputs))
         semaphore = asyncio.Semaphore(concurrency)
         records: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
         detail_diagnostics: list[dict[str, Any]] = []
         record_lock = asyncio.Lock()
+        visited_urls = {candidate["url"] for candidate in candidates}
+        all_candidates = list(candidates)
+        max_depth = min(max(int(config.get("max_depth", 1)), 1), 20)
+        recursive_selector = str(config.get("recursive_link_selector") or "").strip()
 
-        cookies = render_object(config.get("cookies") or {}, context, inputs)
-        async with httpx.AsyncClient(follow_redirects=True, headers=headers, cookies=cookies) as client:
-            async def crawl(candidate: dict[str, Any]) -> None:
+        async def crawl(candidate: dict[str, Any]) -> list[dict[str, Any]]:
                 if context.cancelled:
-                    return
+                    return []
                 async with semaphore:
                     detail_url = candidate["url"]
                     detail_html = ""
@@ -593,7 +608,7 @@ class CrawlLinksNode:
                         if rendered is None:
                             async with record_lock:
                                 errors.append({"url": candidate["url"], "record_id": candidate["record_id"], "error": str(error or "Browser request failed")})
-                            return
+                            return []
                         detail_url = str(rendered.get("url") or candidate["url"])
                         detail_html = str(rendered.get("html") or rendered.get("body") or "")
                         artifact_content = detail_html.encode("utf-8")
@@ -616,7 +631,7 @@ class CrawlLinksNode:
                                     "error": str(error or "HTTP request failed"),
                                     "fetch_attempts": fetch_attempts(response) if response is not None else getattr(error, "fetch_attempts", []),
                                 })
-                            return
+                            return []
                         detail_url = str(response.url)
                         detail_html = response.text
                         artifact_content = response.content
@@ -638,12 +653,60 @@ class CrawlLinksNode:
                         records.append(record)
                     if delay_ms:
                         await asyncio.sleep(delay_ms / 1000)
+                    if not recursive_selector or int(candidate["depth"]) >= max_depth:
+                        return []
+                    detail_items = [
+                        {"url": element.get("href")}
+                        for element in BeautifulSoup(detail_html, "lxml").select(recursive_selector)
+                        if element.get("href")
+                    ]
+                    discovered = build_url_frontier(
+                        detail_items,
+                        base_url=detail_url,
+                        origin_url=listing_url,
+                        url_path="url",
+                        config=config,
+                        limit=maximum,
+                    )
+                    children: list[dict[str, Any]] = []
+                    async with record_lock:
+                        for child in discovered:
+                            if child["url"] in visited_urls or len(all_candidates) + len(children) >= maximum:
+                                continue
+                            visited_urls.add(child["url"])
+                            child["record_id"] = hashlib.sha256(child["url"].encode()).hexdigest()[:20]
+                            child["depth"] = int(candidate["depth"]) + 1
+                            children.append(child)
+                    return children
 
-            await asyncio.gather(*(crawl(candidate) for candidate in candidates))
+        try:
+            pending = candidates
+            while pending:
+                discovered_groups = await asyncio.gather(*(crawl(candidate) for candidate in pending))
+                remaining = max(0, maximum - len(all_candidates))
+                pending = [child for group in discovered_groups for child in group][:remaining]
+                all_candidates.extend(pending)
+        finally:
+            await close_http_client(client)
 
         records.sort(key=lambda row: (str(row.get("published_at", "")), str(row.get("record_id", ""))), reverse=True)
-        context.log("INFO", "Crawl Links завершён", found=len(candidates), extracted=len(records), errors=len(errors))
-        return {"records": records, "count": len(records), "discovered": len(candidates), "errors": errors,
+        failed_urls = {str(item["url"]) for item in errors}
+        completed_urls = [candidate["url"] for candidate in all_candidates if candidate["url"] not in failed_urls]
+        next_resume_token = (
+            encode_crawl_resume_token(sorted(failed_urls), context, config)
+            if failed_urls
+            else None
+        )
+        error_policy = str(config.get("error_policy") or "CONTINUE").upper()
+        if errors and error_policy in {"FAIL", "FAIL_FAST"}:
+            raise ValueError(f"Crawl failed for {errors[0]['url']}: {errors[0]['error']}")
+        if error_policy == "REQUIRE_MINIMUM":
+            minimum = max(int(config.get("minimum_successful_records", 1)), 0)
+            if len(records) < minimum:
+                raise ValueError(f"Crawl minimum successful records not met: {len(records)} < {minimum}")
+        context.log("INFO", "Crawl Links завершён", found=len(all_candidates), extracted=len(records), errors=len(errors))
+        return {"records": records, "count": len(records), "discovered": len(all_candidates), "errors": errors,
+                "failures": errors, "completed_urls": completed_urls, "resume_token": next_resume_token,
                 "listing_diagnostics": listing_diagnostics, "detail_diagnostics": detail_diagnostics,
                 "artifacts": list(context.artifacts)}
 
@@ -681,7 +744,13 @@ class CrawlLinksNode:
         effective.setdefault("same_origin_only", True)
         return render_object(effective, context, inputs)
 
-    async def _load_listing(self, context: ExecutionContext, inputs: dict[str, Any], config: dict[str, Any]) -> tuple[Any, str]:
+    async def _load_listing(
+        self,
+        context: ExecutionContext,
+        inputs: dict[str, Any],
+        config: dict[str, Any],
+        client: httpx.AsyncClient | None = None,
+    ) -> tuple[Any, str]:
         listing_url = render_template(str(config.get("listing_url") or ""), context, inputs)
         if not listing_url:
             return find_value(inputs, str(config.get("input_path") or "records")) or inputs, str(find_value(inputs, "url") or "")
@@ -754,16 +823,16 @@ class CrawlLinksNode:
             }
             return rendered.get("html") or rendered.get("body") or "", str(rendered.get("url") or listing_url)
         listing_policy = FetchPolicy.from_config({**config, "request_timeout": config.get("listing_timeout", 60)})
-        cookies = render_object(config.get("cookies") or {}, context, inputs)
-        async with httpx.AsyncClient(follow_redirects=True, headers=headers, cookies=cookies) as client:
-            response = await request_with_policy(
-                client,
-                "GET",
-                listing_url,
-                listing_policy,
-                params=params,
-            )
+        owns_client = client is None
+        if client is None:
+            cookies = render_object(config.get("cookies") or {}, context, inputs)
+            client = httpx.AsyncClient(follow_redirects=True, headers=headers, cookies=cookies)
+        try:
+            response = await request_with_policy(client, "GET", listing_url, listing_policy, params=params)
             response.raise_for_status()
+        finally:
+            if owns_client:
+                await close_http_client(client)
         context.variables["_crawl_listing_diagnostics"] = {
             "fetch_mode": "HTTP",
             "fetch_attempts": fetch_attempts(response),
@@ -1482,6 +1551,133 @@ def canonical_url(value: str, drop_query_params: list[str] | None = None) -> str
         and not key.lower().startswith("utm_")
     ]
     return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, urlencode(sorted(query)), ""))
+
+
+def build_url_frontier(
+    items: list[Any],
+    *,
+    base_url: str,
+    origin_url: str,
+    url_path: str,
+    config: dict[str, Any],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Build one bounded canonical frontier for every link-following node.
+
+    An empty ``allowed_domains`` list means that no cross-origin domains are
+    added: the normal same-origin rule remains in force. Set
+    ``same_origin_only=false`` explicitly to allow unrestricted domains.
+    """
+    pattern_text = str(config.get("url_pattern") or "").strip()
+    pattern = re.compile(pattern_text, re.I) if pattern_text else None
+    origin_host = (urlsplit(origin_url).hostname or "").lower()
+    allowed_domains = {
+        str(domain).strip().lower().split(":", 1)[0]
+        for domain in (config.get("allowed_domains") or [])
+        if str(domain).strip()
+    }
+    seen: set[str] = set()
+    frontier: list[dict[str, Any]] = []
+    for value in items:
+        item = dict(value) if isinstance(value, dict) else {url_path: value}
+        raw_url = find_value(item, url_path)
+        if not raw_url:
+            continue
+        canonical = canonical_url(
+            urljoin(base_url, str(raw_url)),
+            list(config.get("drop_query_params") or []),
+        )
+        parts = urlsplit(canonical)
+        if parts.scheme not in {"http", "https"}:
+            continue
+        candidate_host = (parts.hostname or "").lower()
+        if allowed_domains and candidate_host not in allowed_domains:
+            continue
+        if (
+            not allowed_domains
+            and config.get("same_origin_only", True)
+            and origin_host
+            and candidate_host != origin_host
+        ):
+            continue
+        if pattern and not pattern.search(canonical):
+            continue
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        frontier.append({"item": item, "url": canonical})
+        if len(frontier) >= max(limit, 1):
+            break
+    return frontier
+
+
+async def close_http_client(client: Any) -> None:
+    close = getattr(client, "aclose", None)
+    if close is not None:
+        await close()
+
+
+def crawl_resume_scope(context: ExecutionContext, config: dict[str, Any]) -> str:
+    stable_config = {
+        key: value
+        for key, value in config.items()
+        if key not in {"resume_token"} and not key.startswith("_force_")
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(stable_config, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+    return f"{context.workflow_version_id}:{config.get('_node_id', 'crawl_links')}:{fingerprint}"
+
+
+def crawl_resume_secret(context: ExecutionContext) -> bytes:
+    secret = context.secrets.get("_CRAWL_RESUME_SECRET")
+    if not secret:
+        # Direct library use remains resumable; API execution injects the
+        # deployment secret so production tokens cannot be forged.
+        secret = f"multiverse-resume:{context.workflow_version_id}"
+    return secret.encode()
+
+
+def encode_crawl_resume_token(
+    urls: list[str],
+    context: ExecutionContext,
+    config: dict[str, Any],
+) -> str:
+    payload = json.dumps(
+        {"version": 1, "scope": crawl_resume_scope(context, config), "urls": urls},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    signature = hmac.new(crawl_resume_secret(context), payload, hashlib.sha256).digest()
+    body = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    proof = base64.urlsafe_b64encode(signature).decode().rstrip("=")
+    return f"{body}.{proof}"
+
+
+def decode_crawl_resume_token(
+    token: str,
+    context: ExecutionContext,
+    config: dict[str, Any],
+) -> list[str]:
+    try:
+        body, proof = token.split(".", 1)
+        payload = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+        signature = base64.urlsafe_b64decode(proof + "=" * (-len(proof) % 4))
+        expected = hmac.new(crawl_resume_secret(context), payload, hashlib.sha256).digest()
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError
+        value = json.loads(payload)
+        urls = value.get("urls")
+        if (
+            value.get("version") != 1
+            or value.get("scope") != crawl_resume_scope(context, config)
+            or not isinstance(urls, list)
+            or any(not isinstance(url, str) for url in urls)
+        ):
+            raise ValueError
+        return [canonical_url(url) for url in urls]
+    except Exception as exc:
+        raise ValueError("Invalid crawl resume token") from exc
 
 
 async def hydrate_dynamic_detail(

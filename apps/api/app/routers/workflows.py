@@ -781,7 +781,7 @@ def build_execution_variables(db: Session, source: Source | None) -> tuple[dict[
         "ai_providers": {},
         "database_connections": {},
     }
-    secrets: dict[str, str] = {}
+    secrets: dict[str, str] = {"_CRAWL_RESUME_SECRET": settings.app_secret_key}
     for secret in db.scalars(select(Secret)).all():
         secrets[secret.name] = decrypt_secret(secret.encrypted_value)
     if settings.deepseek_api_key:
