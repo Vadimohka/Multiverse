@@ -106,15 +106,20 @@ For low-resource servers (1 vCPU, 1 GiB RAM), see [the minimal Compose deploymen
 
 On first startup, Multiverse seeds a deterministic bank-deposit demo. It fetches local financial HTML, extracts deposit cards, normalizes values, validates and versions three records, creates review tasks, approves the records, and exports the dataset to XLSX. Use it to verify the installation before connecting external websites.
 
-It also installs the executable `Новости БВФБ` site preset. The preset reads the
-calendar over HTTP, renders JavaScript detail pages with Playwright, extracts the
-exact publication second from the listing in `Europe/Minsk`, and stores news in the `bcse-news` dataset.
+It also installs the executable `Новости БВФБ` site preset. The preset opens
+`https://www.bcse.by/press-center/releases`, follows every client-side pagination
+page, and collects every publication card. Full text, HTML, tags, category and
+attachments are read from the same public detail endpoint used by the site;
+publication timestamps are normalized from `Europe/Minsk` and records are stored
+in the `bcse-news` dataset.
 Site URLs and selectors live in this preset, not in the generic crawler. See the
 [Data API contract](docs/audit/DATA_API_CONTRACT.md) for read-only token and
 `from`/`to` query examples.
 
-After deployment, open **Шаблоны workflow → Новости БВФБ**, create the
-workflow, publish it, and run it once. In **API-токены**, create a
+After deployment, open **Шаблоны workflow → Новости БВФБ**. The project
+**Новости БВФБ**, source **БВФБ — публикации пресс-центра**, and dataset
+`bcse-news` are preselected: create the workflow, verify it, publish it, and run
+it once. In **API-токены**, create a
 `datasets:read` token scoped to `bcse-news`. An external agent asking for
 “yesterday” must calculate the Minsk interval itself and request, for example:
 

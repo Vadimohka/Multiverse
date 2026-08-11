@@ -557,15 +557,16 @@ def test_bcse_news_preset_is_bootstrapped_as_an_executable_chain(client, auth):
     workflows = client.get(f"/api/v1/workflows?project_id={project['id']}", headers=auth).json()
 
     dataset = next(item for item in datasets if item["slug"] == "bcse-news")
-    source = next(item for item in sources if item["entry_url"] == "https://www.bcse.by/press_center/calendar")
+    source = next(item for item in sources if item["entry_url"] == "https://www.bcse.by/press-center/releases")
     workflow = next(item for item in workflows if item["name"] == "БВФБ: новости")
     crawl = next(node for node in workflow["graph_json"]["nodes"] if node["id"] == "crawl")["config"]
 
     assert workflow["graph_json"]["settings"]["source_id"] == source["id"]
     assert workflow["graph_json"]["settings"]["dataset_id"] == dataset["id"]
-    assert source["fetch_mode"] == "HTTP"
+    assert source["fetch_mode"] == "PLAYWRIGHT"
     assert crawl["detail_fields"]
-    assert crawl["date_range_query"]["from_param"] == "sFrom"
+    assert crawl["pagination_enabled"] is True
+    assert crawl["detail_request"]["html_path"] == "solo.html"
 
 
 def test_bcse_site_preset_is_available_in_template_picker_and_keeps_configuration(client, auth):
@@ -577,6 +578,11 @@ def test_bcse_site_preset_is_available_in_template_picker_and_keeps_configuratio
     dataset = client.get(f"/api/v1/datasets?project_id={project['id']}", headers=auth).json()[0]
     templates = client.get("/api/v1/workflow-templates", headers=auth).json()
     preset = next(item for item in templates if item["id"] == "system-bcse-news")
+    assert preset["preset_defaults"] == {
+        "project_slug": "bcse-news",
+        "source_entry_url": "https://www.bcse.by/press-center/releases",
+        "dataset_slug": "bcse-news",
+    }
 
     created = client.post(
         f"/api/v1/workflow-templates/{preset['id']}/instantiate",
@@ -598,10 +604,11 @@ def test_bcse_site_preset_is_available_in_template_picker_and_keeps_configuratio
     )
     assert graph["settings"]["source_id"] == source["id"]
     assert graph["settings"]["dataset_id"] == dataset["id"]
-    assert crawl["listing_url"] == "https://www.bcse.by/press_center/calendar"
+    assert crawl["listing_url"] == "https://www.bcse.by/press-center/releases"
     assert crawl["base_url"] == "https://www.bcse.by/"
-    assert publication["source"] == "listing"
-    assert publication["source_path"] == "shortDate"
+    assert crawl["pagination_max_pages"] >= 25
+    assert publication["source"] == "response"
+    assert publication["source_path"] == "day"
 
 
 def test_scoped_api_token_can_only_read_its_dataset(client, auth):

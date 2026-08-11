@@ -106,7 +106,7 @@ def ensure_bcse_news_preset(db: Session, admin: User) -> None:
         project = Project(
             name="Новости БВФБ",
             slug="bcse-news",
-            description="Готовый site preset: календарь БВФБ → news detail → versioned dataset",
+            description="Готовый site preset: все страницы пресс-центра БВФБ → полный текст карточек → versioned dataset",
             created_by=admin.id,
         )
         db.add(project)
@@ -122,6 +122,10 @@ def ensure_bcse_news_preset(db: Session, admin: User) -> None:
         )
         db.add(schema)
         db.flush()
+    else:
+        schema.description = "Структурированная публикация пресс-центра БВФБ"
+        schema.schema_json = BCSE_NEWS_SCHEMA
+        schema.published = True
     dataset = db.scalar(select(Dataset).where(Dataset.slug == "bcse-news"))
     if dataset is None:
         dataset = Dataset(
@@ -136,21 +140,31 @@ def ensure_bcse_news_preset(db: Session, admin: User) -> None:
         db.flush()
     source = db.scalar(select(Source).where(
         Source.project_id == project.id,
-        Source.entry_url == "https://www.bcse.by/press_center/calendar",
+        Source.entry_url.in_([
+            "https://www.bcse.by/press-center/releases",
+            "https://www.bcse.by/press_center/calendar",
+        ]),
     ))
     if source is None:
         source = Source(
             project_id=project.id,
-            name="БВФБ — календарь новостей",
+            name="БВФБ — публикации пресс-центра",
             source_type="WEB_SITE",
-            entry_url="https://www.bcse.by/press_center/calendar",
+            entry_url="https://www.bcse.by/press-center/releases",
             base_url="https://www.bcse.by",
-            fetch_mode="HTTP",
-            description="Site preset; selectors and query parameters live in workflow configuration",
+            fetch_mode="PLAYWRIGHT",
+            description="Все карточки и страницы пагинации; полный текст загружается из публичного detail endpoint БВФБ",
             settings={"access_status": "PUBLIC"},
         )
         db.add(source)
         db.flush()
+    else:
+        source.name = "БВФБ — публикации пресс-центра"
+        source.entry_url = "https://www.bcse.by/press-center/releases"
+        source.base_url = "https://www.bcse.by"
+        source.fetch_mode = "PLAYWRIGHT"
+        source.description = "Все карточки и страницы пагинации; полный текст загружается из публичного detail endpoint БВФБ"
+        source.settings = {**(source.settings or {}), "access_status": "PUBLIC"}
     workflow = db.scalar(select(Workflow).where(Workflow.project_id == project.id, Workflow.name == "БВФБ: новости"))
     if workflow is None:
         db.add(Workflow(
@@ -159,4 +173,11 @@ def ensure_bcse_news_preset(db: Session, admin: User) -> None:
             description="Конфигурационный preset list → detail с source publication timestamp",
             graph_json=bcse_news_graph(source.id, dataset.id, incremental=True),
         ))
+    else:
+        crawl = next(
+            (node for node in (workflow.graph_json or {}).get("nodes", []) if node.get("id") == "crawl"),
+            None,
+        )
+        if crawl and crawl.get("config", {}).get("listing_url") == "https://www.bcse.by/press_center/calendar":
+            workflow.graph_json = bcse_news_graph(source.id, dataset.id, incremental=True)
     db.commit()

@@ -587,8 +587,11 @@ class CrawlLinksNode:
         )
         for candidate in candidates:
             match = pattern.search(candidate["url"]) if pattern else None
+            if match:
+                candidate.update({key: value for key, value in match.groupdict().items() if value is not None})
             candidate["record_id"] = (
-                match.group(1)
+                candidate.get("record_id")
+                or match.group(1)
                 if match and match.groups()
                 else match.group(0)
                 if match
@@ -619,7 +622,53 @@ class CrawlLinksNode:
                     artifact_content_type = "text/html"
                     error: Exception | None = None
                     response: httpx.Response | None = None
-                    if self._detail_uses_browser(context, config):
+                    detail_request = config.get("detail_request") if isinstance(config.get("detail_request"), dict) else None
+                    if detail_request:
+                        detail_scope = {**inputs, **candidate, "item": candidate.get("item") or {}}
+                        request_url = render_template(str(detail_request.get("url") or candidate["url"]), context, detail_scope)
+                        request_params = render_object(detail_request.get("query_params") or {}, context, detail_scope)
+                        try:
+                            response = await request_with_policy(
+                                client,
+                                str(detail_request.get("method") or "GET").upper(),
+                                request_url,
+                                fetch_policy,
+                                params=request_params,
+                            )
+                            response.raise_for_status()
+                        except Exception as exc:
+                            error = exc
+                        if response is None or not response.is_success:
+                            async with record_lock:
+                                errors.append({
+                                    "url": candidate["url"],
+                                    "record_id": candidate["record_id"],
+                                    "error": str(error or "Detail API request failed"),
+                                    "fetch_attempts": fetch_attempts(response) if response is not None else getattr(error, "fetch_attempts", []),
+                                })
+                            return []
+                        try:
+                            detail_payload = response.json()
+                        except Exception as exc:
+                            async with record_lock:
+                                errors.append({"url": candidate["url"], "record_id": candidate["record_id"], "error": f"Detail API returned invalid JSON: {exc}"})
+                            return []
+                        not_found_path = str(detail_request.get("not_found_path") or "")
+                        if not_found_path and bool(find_value(detail_payload, not_found_path)):
+                            async with record_lock:
+                                errors.append({
+                                    "url": candidate["url"],
+                                    "record_id": candidate["record_id"],
+                                    "error": "Detail API reported that the record was not found",
+                                })
+                            return []
+                        candidate["detail_response"] = detail_payload
+                        candidate["_detail_request_url"] = str(response.url)
+                        detail_url = candidate["url"]
+                        detail_html = str(find_value(detail_payload, str(detail_request.get("html_path") or "")) or "")
+                        artifact_content = response.content
+                        artifact_content_type = response.headers.get("content-type", "application/json")
+                    elif self._detail_uses_browser(context, config):
                         rendered: dict[str, Any] | None = None
                         for attempt in range(fetch_policy.retries + 1):
                             try:
@@ -677,6 +726,7 @@ class CrawlLinksNode:
                         async with record_lock:
                             detail_diagnostics.append({
                                 "url": detail_url,
+                                "request_url": candidate.get("_detail_request_url") or detail_url,
                                 "status_code": response.status_code,
                                 "fetch_attempts": fetch_attempts(response),
                             })
@@ -773,7 +823,13 @@ class CrawlLinksNode:
                 effective["link_selector"] = f"{container} {link['selector']}".strip() if container else link["selector"]
         effective.setdefault("listing_url", str(source.get("url") or ""))
         effective.setdefault("same_origin_only", True)
-        return render_object(effective, context, inputs)
+        # Detail requests are rendered per candidate after URL regex groups
+        # (for example publication timestamp and record id) become available.
+        detail_request = effective.get("detail_request")
+        rendered = render_object(effective, context, inputs)
+        if isinstance(detail_request, dict):
+            rendered["detail_request"] = detail_request
+        return rendered
 
     async def _load_listing(
         self,
@@ -1794,6 +1850,29 @@ def extract_article_record(
                     )
                 record[name] = value
                 continue
+            if source_kind in {"response", "detail_response", "json"}:
+                response_payload = candidate.get("detail_response") if isinstance(candidate.get("detail_response"), dict) else {}
+                value = find_value(response_payload, str(field.get("source_path") or name))
+                value_mode = str(field.get("value") or "raw").lower()
+                if value_mode == "html_text":
+                    value = BeautifulSoup(str(value or ""), "lxml").get_text(" ", strip=True)
+                elif value_mode == "join" and isinstance(value, list):
+                    value = str(field.get("separator") or "|").join(clean_inline_text(str(item)) for item in value if item is not None)
+                elif value_mode == "json":
+                    value = json.dumps(value, ensure_ascii=False)
+                regex = str(field.get("regex") or "")
+                if regex and value is not None:
+                    match = re.search(regex, str(value))
+                    group = int(field.get("regex_group", 1))
+                    value = match.group(group) if match else None
+                if name in {"source_published_at", "source_modified_at"}:
+                    value = normalize_source_datetime(
+                        str(value or ""),
+                        timezone=str(field.get("timezone") or config.get("timezone") or "UTC"),
+                        date_format=str(field.get("format") or ""),
+                    )
+                record[name] = value
+                continue
             selector = str(field.get("selector") or "")
             elements = soup.select(selector) if selector else []
             element = elements[0] if elements else None
@@ -1985,7 +2064,10 @@ def normalize_source_datetime(value: str, *, timezone: str = "UTC", date_format:
             parsed = parsed.replace(tzinfo=ZoneInfo(timezone))
         except Exception as exc:
             raise ValueError(f"Unknown source timezone: {timezone}") from exc
-    return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    try:
+        return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    except (OverflowError, ValueError):
+        return None
 
 
 def select_text(soup: BeautifulSoup, selector: str) -> str:
