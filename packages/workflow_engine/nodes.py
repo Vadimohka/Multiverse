@@ -1772,6 +1772,17 @@ def extract_article_record(
                 continue
             name = str(field["name"])
             source_kind = str(field.get("source") or "selector").lower()
+            if source_kind in {"listing", "item"}:
+                listing_item = candidate.get("item") if isinstance(candidate.get("item"), dict) else {}
+                value = find_value(listing_item, str(field.get("source_path") or name))
+                if name in {"source_published_at", "source_modified_at"}:
+                    value = normalize_source_datetime(
+                        str(value or ""),
+                        timezone=str(field.get("timezone") or config.get("timezone") or "UTC"),
+                        date_format=str(field.get("format") or ""),
+                    )
+                record[name] = value
+                continue
             if source_kind in {"metadata", "json_ld"}:
                 metadata_key = str(field.get("metadata_key") or name)
                 value = page_metadata.get(metadata_key)

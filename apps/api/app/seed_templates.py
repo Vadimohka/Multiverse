@@ -58,6 +58,7 @@ def bcse_news_graph(source_id: str, dataset_id: str, *, incremental: bool = Fals
     ]
     crawl_config = {
         "listing_url": "https://www.bcse.by/press_center/calendar",
+        "base_url": "https://www.bcse.by/",
         "listing_fetch_mode": "HTTP",
         "detail_fetch_mode": "PLAYWRIGHT",
         "listing_query": {"sFrom": "01.01.2000", "sTo": "31.12.2035"} if not incremental else {},
@@ -70,7 +71,7 @@ def bcse_news_graph(source_id: str, dataset_id: str, *, incremental: bool = Fals
         "headers": {"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5"},
         "detail_fields": [
             {"name": "title", "selector": "#title"},
-            {"name": "source_published_at", "selector": ".dynamic-publicationdate", "timezone": "Europe/Minsk"},
+            {"name": "source_published_at", "source": "listing", "source_path": "shortDate", "timezone": "Europe/Minsk"},
             {"name": "body_text", "selector": "#pc_body"},
             {"name": "body_html", "selector": "#pc_body", "value": "html"},
             {"name": "attachments_json", "selector": "#pc_body a[href$='.pdf'],#pc_body a[href$='.doc'],#pc_body a[href$='.docx'],#pc_body a[href$='.xls'],#pc_body a[href$='.xlsx'],#pc_body a[href$='.zip']", "multiple": True, "value": "links"},

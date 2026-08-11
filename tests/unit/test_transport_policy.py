@@ -55,6 +55,25 @@ async def test_retry_after_and_backoff_are_applied_by_one_policy():
     ]
 
 
+@pytest.mark.asyncio
+async def test_get_omits_optional_none_body_for_real_httpx_client():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.content == b""
+        return httpx.Response(200, request=request, json={"ok": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        response = await request_with_policy(
+            client,
+            "GET",
+            "https://example.test/items",
+            FetchPolicy(retries=0),
+            json=None,
+        )
+
+    assert response.json() == {"ok": True}
+
+
 def test_fetch_policy_rejects_unbounded_values():
     with pytest.raises(ValueError, match="request_timeout"):
         FetchPolicy.from_config({"request_timeout": 0})

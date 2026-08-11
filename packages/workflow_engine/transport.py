@@ -85,18 +85,19 @@ async def request_with_policy(
 ) -> httpx.Response:
     attempts: list[FetchAttempt] = []
     backoff_attempt = 0
+    request_options = {key: value for key, value in kwargs.items() if value is not None}
     for attempt_number in range(1, policy.retries + 2):
         try:
             method_handler = getattr(client, method.lower(), None)
             if method_handler is None:
-                response = await client.request(method, url, timeout=policy.timeout, **kwargs)
+                response = await client.request(method, url, timeout=policy.timeout, **request_options)
             else:
                 parameters = inspect.signature(method_handler).parameters.values()
                 supports_timeout = any(
                     parameter.name == "timeout" or parameter.kind == inspect.Parameter.VAR_KEYWORD
                     for parameter in parameters
                 )
-                request_kwargs = {**kwargs}
+                request_kwargs = {**request_options}
                 if supports_timeout:
                     request_kwargs["timeout"] = policy.timeout
                 response = await method_handler(url, **request_kwargs)
