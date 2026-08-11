@@ -24,6 +24,7 @@ class ApiTokenCreate(BaseModel):
     scopes: list[str] = ["datasets:read"]
     dataset_ids: list[str] = Field(min_length=1)
     expires_at: datetime | None = None
+    rate_limit_per_minute: int = Field(default=120, ge=1, le=10_000)
 
 
 class ApiTokenCreated(BaseModel):
@@ -34,6 +35,7 @@ class ApiTokenCreated(BaseModel):
     scopes: list[str]
     dataset_ids: list[str]
     expires_at: datetime | None
+    rate_limit_per_minute: int
 
 
 class UserCreate(BaseModel):

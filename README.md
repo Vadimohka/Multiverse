@@ -64,12 +64,12 @@ flowchart LR
 ## Highlights
 
 - Visual React Flow workflow builder with typed nodes, validation, publishing, test runs, and per-node inspection.
-- HTTP requests, Playwright browser sessions, file downloads, pagination, link following, and concurrent page crawling.
+- HTTP requests, Playwright browser sessions, file downloads, pagination, link following, and concurrent page crawling with shared retry policy, cookie sessions, and signed resume tokens.
 - CSS, XPath, repeating lists, HTML tables, JSONPath, and PDF/DOCX/XLSX/CSV/JSON parsing.
 - Safe mapping, constants, formulas without Python `eval`, and financial value normalizers.
 - DeepSeek and other OpenAI-compatible extraction and classification with JSON-schema validation and call history.
 - Versioned datasets, review tasks, raw artifacts in MinIO/S3 or the local fallback, schedules, Celery workers, audit logs, health checks, and metrics.
-- Stable dataset Data API for current state, latest/specific runs, history, exact-second source/fetch/observation filters, cursor pagination, and scoped read-only tokens.
+- Stable SQL-backed dataset Data API for current state, latest/specific runs, history, exact-second source/fetch/observation filters, cursor pagination, predictable errors, and rate-limited scoped read-only tokens.
 - Output to internal datasets, PostgreSQL/MySQL/SQLite, REST webhooks, CSV, XLSX, and JSON.
 
 ## Quick start
@@ -106,12 +106,22 @@ For low-resource servers (1 vCPU, 1 GiB RAM), see [the minimal Compose deploymen
 
 On first startup, Multiverse seeds a deterministic bank-deposit demo. It fetches local financial HTML, extracts deposit cards, normalizes values, validates and versions three records, creates review tasks, approves the records, and exports the dataset to XLSX. Use it to verify the installation before connecting external websites.
 
-It also installs the executable `БВФБ: новости` site preset. The preset reads the
+It also installs the executable `Новости БВФБ` site preset. The preset reads the
 calendar over HTTP, renders JavaScript detail pages with Playwright, extracts the
-publication time in `Europe/Minsk`, and stores news in the `bcse-news` dataset.
+exact publication second from the listing in `Europe/Minsk`, and stores news in the `bcse-news` dataset.
 Site URLs and selectors live in this preset, not in the generic crawler. See the
 [Data API contract](docs/audit/DATA_API_CONTRACT.md) for read-only token and
 `from`/`to` query examples.
+
+After deployment, open **Шаблоны workflow → Новости БВФБ**, create the
+workflow, publish it, and run it once. In **API-токены**, create a
+`datasets:read` token scoped to `bcse-news`. An external agent asking for
+“yesterday” must calculate the Minsk interval itself and request, for example:
+
+```http
+GET /api/v1/datasets/bcse-news/records?view=current&time_basis=source_published_at&from=2026-08-10T00:00:00%2B03:00&to=2026-08-11T00:00:00%2B03:00&sort=asc
+Authorization: Bearer mv_<token>
+```
 
 ## Node catalog
 
@@ -220,8 +230,11 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```bash
 make test
 make lint
+cd apps/frontend && npm test -- --run && cd ../..
 make frontend-lint
 make frontend-build
+npm --prefix apps/frontend audit --audit-level=high
+python scripts/load_test_data_api.py
 docker compose config --quiet
 ```
 

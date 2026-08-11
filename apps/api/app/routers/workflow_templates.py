@@ -21,6 +21,7 @@ from app.schemas import (
     WorkflowTemplateOut,
     WorkflowTemplateUpdate,
 )
+from app.seed_templates import bcse_news_graph
 
 router = APIRouter(prefix="/workflow-templates", tags=["Workflow templates"])
 
@@ -29,10 +30,19 @@ def _graph(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> dict[str
     return {"version": 1, "settings": {"review_policy": {"new": True, "changed": True, "confidence_below": 0.8}}, "nodes": nodes, "edges": edges}
 
 
-# These are source- and dataset-independent starter blueprints.  They stay in
-# code so every project receives the same reviewed starting point, while user
-# templates below are immutable snapshots stored in the database.
+# System entries are either source-independent starter blueprints or explicitly
+# labelled site presets. They stay in code so reviewed presets can evolve while
+# user templates below remain immutable snapshots stored in the database.
 SYSTEM_TEMPLATES: list[dict[str, Any]] = [
+    {
+        "id": "system-bcse-news",
+        "name": "Новости БВФБ",
+        "description": "Готовый site preset: JSON-календарь БВФБ → Playwright detail → точное source_published_at → versioned dataset.",
+        "tags": ["site-preset", "БВФБ", "news", "list-detail"],
+        "is_system": True,
+        "site_preset": True,
+        "graph_json": bcse_news_graph("", "", incremental=True),
+    },
     {
         "id": "system-list-detail-crawl",
         "name": "Список ссылок → detail-карточки",
@@ -290,8 +300,10 @@ def instantiate_template(template_id: str, payload: WorkflowTemplateInstantiateR
         if _template_issues(item.graph_json):
             raise HTTPException(status_code=422, detail="Этот legacy-шаблон содержит привязку к сайту и больше недоступен. Используйте системный универсальный шаблон.")
         name, description, graph = item.name, item.description, item.graph_json
-    copied_graph = _clean_graph(graph)
+    copied_graph = deepcopy(graph) if system and system.get("site_preset") else _clean_graph(graph)
     settings = copied_graph.setdefault("settings", {})
+    settings.pop("source_id", None)
+    settings.pop("dataset_id", None)
     if payload.source_id:
         source = db.get(Source, payload.source_id)
         if not source or source.project_id != payload.project_id:

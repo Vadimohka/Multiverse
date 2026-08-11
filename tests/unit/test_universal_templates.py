@@ -6,7 +6,13 @@ from workflow_engine.nodes import CrawlLinksNode, extract_article_record
 
 def test_system_templates_have_no_literal_source_bindings():
     for template in SYSTEM_TEMPLATES:
-        assert _template_issues(template["graph_json"]) == []
+        issues = _template_issues(template["graph_json"])
+        if template.get("site_preset"):
+            assert "site-preset" in template["tags"]
+            assert issues
+            assert all(issue.startswith("literal URL at ") for issue in issues)
+        else:
+            assert issues == []
 
 
 def test_clean_graph_removes_site_specific_crawl_settings():

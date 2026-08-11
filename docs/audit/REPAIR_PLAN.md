@@ -2,15 +2,23 @@
 
 > Execution rule: add a failing generic or contract test before each behavior change. Site preset tests may use site selectors; core tests may not.
 
-## Implemented in the restoration change
+## Completion status — 2026-08-11
 
-The P0 vertical slice and the P1 core-universality work in this plan are now
-implemented: per-run observations/dataset runs, timestamped Data API views,
-cursor pagination, scoped dataset tokens, the executable БВФБ preset, generic
-detail field/date-range configuration, neutral profiler scoring, generic URL
-identity/deduplication, honest blocked/empty run statuses, and matching no-code
-controls. Remaining scale optimizations and broader fixture coverage stay
-prioritized below rather than being represented as completed functionality.
+P0, P1 and P2 are implemented and verified. The former P3 capability list is
+also complete: SQL keyset pagination was load-tested with 10,000 records;
+scoped tokens have rate limits and UI management; all HTTP fetch nodes share
+retry/`Retry-After` policy; crawler sessions preserve cookies and emit signed
+resume tokens; profiler suggestions include pagination, CSS/XPath, metadata,
+tables and JSON arrays. The generic offline fixture matrix covers all twelve
+required source structures.
+
+Evidence: `tests/integration/test_data_api_sql.py`,
+`tests/integration/test_api_operations.py`, `tests/unit/test_transport_policy.py`,
+`tests/unit/test_crawl_resilience.py`,
+`tests/unit/test_universal_fixture_matrix.py`, frontend component tests and
+`scripts/load_test_data_api.py`. A many-to-many raw-evidence relation remains a
+conditional future schema extension, not a present requirement: each current
+observation has an unambiguous record-specific raw document.
 
 ## Delivery order
 
@@ -323,11 +331,12 @@ Low.
 
 ## P3 — Further capability work
 
-- Cursor/API rate limiting and token UI polish.
-- Shared browser sessions/cookies and `Retry-After` support.
-- Profiler pagination/XPath/JSON schema proposal quality.
-- Crawl checkpoint/recovery and performance/load tests.
-- Many-to-many raw evidence relation if one observation regularly needs multiple artifacts.
+- **DONE:** cursor/API rate limiting and token UI.
+- **DONE:** shared browser sessions/cookies and `Retry-After` support.
+- **DONE:** profiler pagination/XPath/JSON schema suggestions.
+- **DONE:** signed crawl recovery and 10,000-record load verification.
+- **NON-GOAL FOR THIS RELEASE:** many-to-many evidence; add only when one
+  observation must cite several raw artifacts rather than the current exact one.
 
 ## Verification matrix
 
@@ -336,9 +345,12 @@ Run after each P0 slice and again at completion:
 ```bash
 make test
 make lint
+cd apps/frontend && npm test -- --run && cd ../..
 make frontend-lint
 make frontend-build
+npm --prefix apps/frontend audit --audit-level=high
 python scripts/smoke_test.py
+python scripts/load_test_data_api.py
 docker compose config --quiet
 alembic upgrade head
 alembic downgrade -1

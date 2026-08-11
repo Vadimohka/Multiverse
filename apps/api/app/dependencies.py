@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import ApiToken, User
 from app.security import decode_token
+from app.services.rate_limit import enforce_api_token_rate_limit
 
 bearer = HTTPBearer(auto_error=False)
 
@@ -26,7 +27,9 @@ def get_current_user(
     db: Session = Depends(get_db),
 ) -> User:
     if not credentials:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Требуется авторизация")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Требуется авторизация"
+        )
     try:
         payload = decode_token(credentials.credentials)
     except Exception as exc:
@@ -47,7 +50,9 @@ def get_data_principal(
     if not raw.startswith("mv_"):
         return DataPrincipal(user=get_current_user(credentials, db))
     digest = hashlib.sha256(raw.encode()).hexdigest()
-    token = db.scalar(select(ApiToken).where(ApiToken.token_hash == digest, ApiToken.revoked_at.is_(None)))
+    token = db.scalar(
+        select(ApiToken).where(ApiToken.token_hash == digest, ApiToken.revoked_at.is_(None))
+    )
     now = datetime.now(UTC)
     expires_at = token.expires_at if token else None
     if expires_at and expires_at.tzinfo is None:
@@ -57,6 +62,7 @@ def get_data_principal(
     user = db.scalar(select(User).where(User.id == token.owner_user_id, User.is_active.is_(True)))
     if not user:
         raise HTTPException(status_code=401, detail="Владелец API token отключён")
+    enforce_api_token_rate_limit(db, token, now)
     token.last_used_at = now
     db.commit()
     return DataPrincipal(user=user, api_token=token)
@@ -64,7 +70,9 @@ def get_data_principal(
 
 def authorize_dataset_read(principal: DataPrincipal, dataset_id: str) -> None:
     token = principal.api_token
-    if token and ("datasets:read" not in (token.scopes or []) or dataset_id not in (token.dataset_ids or [])):
+    if token and (
+        "datasets:read" not in (token.scopes or []) or dataset_id not in (token.dataset_ids or [])
+    ):
         raise HTTPException(status_code=403, detail="API token не имеет доступа к dataset")
 
 
@@ -77,4 +85,5 @@ def require_roles(*allowed: str) -> Callable[[User], User]:
         if not role_names(user).intersection(allowed):
             raise HTTPException(status_code=403, detail="Недостаточно прав")
         return user
+
     return dependency

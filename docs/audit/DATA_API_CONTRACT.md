@@ -194,7 +194,8 @@ Content-Type: application/json
 {
   "name": "BCSE news agent",
   "scopes": ["datasets:read"],
-  "dataset_ids": ["<bcse-dataset-uuid>"]
+  "dataset_ids": ["<bcse-dataset-uuid>"],
+  "rate_limit_per_minute": 120
 }
 ```
 
@@ -222,10 +223,11 @@ GET /api/v1/datasets/bcse-news/records?view=latest_run
 
 ```json
 {
+  "detail": "Cursor does not match request filters",
   "error": {
-    "code": "INVALID_TIME_RANGE",
-    "message": "Parameter 'to' must be later than 'from'",
-    "details": {"from": "...", "to": "..."},
+    "code": "INVALID_CURSOR",
+    "message": "Cursor does not match request filters",
+    "details": {},
     "request_id": "..."
   }
 }
@@ -233,16 +235,17 @@ GET /api/v1/datasets/bcse-news/records?view=latest_run
 
 | HTTP | Code | Meaning |
 | --- | --- | --- |
-| 400 | `INVALID_CURSOR`, `INVALID_VIEW_COMBINATION` | Parameters are syntactically valid but incompatible |
-| 401 | `UNAUTHENTICATED` | Missing/invalid credential |
-| 403 | `DATASET_SCOPE_DENIED` | Credential lacks dataset read scope |
-| 404 | `DATASET_NOT_FOUND`, `RUN_NOT_FOUND` | Referenced resource unavailable |
-| 422 | `INVALID_TIMESTAMP`, `INVALID_TIME_RANGE` | Filter validation failed |
+| 400 | `INVALID_CURSOR`, `BAD_REQUEST` | Cursor is invalid/mismatched or parameters are incompatible |
+| 401 | `AUTHENTICATION_REQUIRED` | Missing, expired, revoked or invalid credential |
+| 403 | `FORBIDDEN` | Credential lacks dataset scope or review role |
+| 404 | `NOT_FOUND` | Dataset/run/resource unavailable |
+| 409 | `CONFLICT` | Unique resource conflict |
+| 422 | `VALIDATION_ERROR` | Timestamp or request validation failed |
 | 429 | `RATE_LIMITED` | API consumer limit exceeded |
 
 ## Authentication migration
 
-Existing JWT bearer tokens continue to work. Scoped service tokens use the same Authorization header and are read-only. Token secrets are hashed at rest, revocable and optionally restricted to dataset ids. No token may invoke workflow, review or administrative endpoints unless a separate future scope explicitly permits it.
+Existing JWT bearer tokens continue to work. Scoped service tokens use the same Authorization header and are read-only. Token secrets are shown once, hashed at rest, revocable, restricted to dataset ids and rate-limited per UTC minute. A `429` response includes `Retry-After`. No token may invoke workflow, review or administrative endpoints unless a separate future scope explicitly permits it.
 
 ## OpenAPI requirements
 

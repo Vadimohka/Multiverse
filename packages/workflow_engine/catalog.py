@@ -9,6 +9,19 @@ def field(name: str, label: str, kind: str = "text", **kwargs: Any) -> dict[str,
     return {"name": name, "label": label, "kind": kind, **kwargs}
 
 
+def retry_policy_fields(*, include_retries: bool = True) -> list[dict[str, Any]]:
+    fields = []
+    if include_retries:
+        fields.append(field("request_retries", "Повторы запроса", "number", default=2))
+    fields.extend([
+        field("retry_backoff_seconds", "Начальная задержка повтора, сек.", "number", default=0.5),
+        field("retry_statuses", "HTTP-коды для повтора", "json", default=[408, 425, 429, 500, 502, 503, 504]),
+        field("respect_retry_after", "Учитывать Retry-After", "boolean", default=True),
+        field("cookies", "Cookies", "json", default={}),
+    ])
+    return fields
+
+
 NODE_CATALOG: list[dict[str, Any]] = [
     {"type": "manual_trigger", "label": "Ручной запуск", "category": "Trigger", "description": "Передаёт входные данные запуска.", "fields": []},
     {"type": "http_request", "label": "HTTP Request", "category": "Fetch", "description": "Загружает HTML, JSON или файл и сохраняет raw artifact.", "fields": [
@@ -16,14 +29,17 @@ NODE_CATALOG: list[dict[str, Any]] = [
         field("method", "Метод", "select", options=["GET", "POST", "PUT", "PATCH", "DELETE"], default="GET"),
         field("headers", "Headers", "json", default={}), field("query_params", "Query params", "json", default={}),
         field("json_body", "JSON body", "json", default={}), field("timeout", "Timeout, сек.", "number", default=30),
+        *retry_policy_fields(),
     ]},
     {"type": "browser_open", "label": "Browser Open", "category": "Fetch", "description": "Открывает JavaScript-страницу Playwright, выполняет действия и сохраняет screenshot/network.", "fields": [
         field("url", "URL", "template", placeholder="{{source.url}}"), field("wait_until", "Ожидание", "select", options=["domcontentloaded", "load", "networkidle"], default="networkidle"),
         field("timeout", "Timeout, сек.", "number", default=45), field("actions", "Действия браузера", "json", default=[]),
+        field("browser_cookies", "Cookies браузера", "json", default=[]),
+        field("storage_state", "Storage state", "json", default={}),
         field("capture_network", "Перехватывать JSON/XHR", "boolean", default=True), field("full_page", "Полный screenshot", "boolean", default=True),
     ]},
-    {"type": "download_file", "label": "Download File", "category": "Fetch", "description": "Скачивает документ и передаёт base64 для document parser.", "fields": [field("url", "URL", "template", placeholder="{{source.url}}"), field("timeout", "Timeout, сек.", "number", default=60)]},
-    {"type": "follow_links", "label": "Follow Links", "category": "Fetch", "description": "Открывает detail URL для каждого элемента входной коллекции и явно объединяет parent/child.", "fields": [field("input_collection", "Входная коллекция", default="records"), field("url_field", "URL field", default="url"), field("concurrency", "Параллельных запросов", "number", default=3), field("timeout", "Timeout, сек.", "number", default=30), field("retries", "Повторы", "number", default=1), field("detail_fields", "Поля detail-страницы", "mapping_fields", default=[]), field("detail_table", "Таблица detail-страницы", "json", default={}), field("merge_mode", "Режим объединения", "select", options=["PARENT_ONLY", "CHILD_ONLY", "MERGE_PARENT_CHILD"], default="MERGE_PARENT_CHILD"), field("error_policy", "Ошибки URL", "select", options=["CONTINUE", "FAIL_FAST"], default="CONTINUE"), field("max_pages", "Максимум ссылок", "number", default=20), field("input_path", "Legacy HTML path", default="html"), field("selector", "Legacy selector", "selector", default="a[href]"), field("url_pattern", "Regex URL", default="")]},
+    {"type": "download_file", "label": "Download File", "category": "Fetch", "description": "Скачивает документ и передаёт base64 для document parser.", "fields": [field("url", "URL", "template", placeholder="{{source.url}}"), field("headers", "Headers", "json", default={}), field("timeout", "Timeout, сек.", "number", default=60), *retry_policy_fields()]},
+    {"type": "follow_links", "label": "Follow Links", "category": "Fetch", "description": "Открывает detail URL для каждого элемента входной коллекции и явно объединяет parent/child.", "fields": [field("input_collection", "Входная коллекция", default="records"), field("url_field", "URL field", default="url"), field("concurrency", "Параллельных запросов", "number", default=3), field("timeout", "Timeout, сек.", "number", default=30), field("retries", "Повторы (legacy)", "number", default=1), *retry_policy_fields(), field("headers", "Headers", "json", default={}), field("allowed_domains", "Разрешённые домены", "json", default=[]), field("same_origin_only", "Только исходный домен", "boolean", default=True), field("drop_query_params", "Удалять query-параметры", "json", default=[]), field("detail_fields", "Поля detail-страницы", "mapping_fields", default=[]), field("detail_table", "Таблица detail-страницы", "json", default={}), field("merge_mode", "Режим объединения", "select", options=["PARENT_ONLY", "CHILD_ONLY", "MERGE_PARENT_CHILD"], default="MERGE_PARENT_CHILD"), field("error_policy", "Ошибки URL", "select", options=["CONTINUE", "FAIL_FAST"], default="CONTINUE"), field("max_pages", "Максимум ссылок", "number", default=20), field("input_path", "Legacy HTML path", default="html"), field("selector", "Legacy selector", default="a[href]"), field("url_pattern", "Regex URL", default="")]},
     {"type": "pagination", "label": "Pagination", "category": "Fetch", "description": "Загружает страницы по шаблону page/offset.", "fields": [field("url_template", "URL-шаблон", "template", placeholder="https://site/?page={{page}}"), field("mode", "Режим", "select", options=["page", "offset"], default="page"), field("start", "Начало", "number", default=1), field("step", "Шаг", "number", default=1), field("max_pages", "Максимум страниц", "number", default=10), field("stop_selector", "Остановиться, если selector отсутствует", default="") ]},
     {"type": "crawl_links", "label": "Crawl Links / Карточки", "category": "Fetch", "description": "Fan-out/fan-in: получает ссылки из HTML/JSON, открывает detail-страницы параллельно и извлекает заголовок, дату, текст, теги и вложения.", "fields": [
         field("listing_url", "URL списка / API", "template", placeholder="{{source.url}}"),
@@ -36,12 +52,20 @@ NODE_CATALOG: list[dict[str, Any]] = [
         field("link_selector", "Selector ссылок (HTML-список)", "selector", default="a[href]"),
         field("url_pattern", "Regex ссылки и ID", default=""),
         field("same_origin_only", "Только ссылки того же сайта", "boolean", default=True),
+        field("allowed_domains", "Разрешённые домены", "json", default=[]),
         field("max_items", "Максимум материалов", "number", default=5000),
+        field("max_pages", "Максимум detail-страниц", "number", default=5000),
+        field("max_depth", "Максимальная глубина", "number", default=1),
+        field("recursive_link_selector", "Selector ссылок следующей глубины", "selector", default=""),
         field("concurrency", "Параллельных запросов", "number", default=10),
         field("delay_ms", "Задержка после запроса, мс", "number", default=250),
         field("request_retries", "Повторы запроса", "number", default=2),
+        *retry_policy_fields(include_retries=False),
         field("request_timeout", "Timeout страницы, сек.", "number", default=45),
         field("detail_fetch_mode", "Загрузка detail-страниц", "select", options=["AUTO", "HTTP", "PLAYWRIGHT"], default="AUTO"),
+        field("error_policy", "Политика ошибок", "select", options=["CONTINUE", "FAIL", "REQUIRE_MINIMUM"], default="CONTINUE"),
+        field("minimum_successful_records", "Минимум успешных записей", "number", default=1),
+        field("resume_token", "Resume token", "textarea", default=""),
         field("detail_fields", "Поля detail-страницы", "detail_fields", default=[]),
         field("detail_constants", "Константы detail-записи", "json", default={}),
         field("include_listing_fields", "Добавлять поля list item", "boolean", default=False),

@@ -31,7 +31,9 @@ def utcnow() -> datetime:
 
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
 
 
 class User(Base, TimestampMixin):
@@ -57,15 +59,30 @@ class ApiToken(Base, TimestampMixin):
 
     __tablename__ = "api_tokens"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    owner_user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    owner_user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
     name: Mapped[str] = mapped_column(String(200))
     token_prefix: Mapped[str] = mapped_column(String(20), index=True)
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     scopes: Mapped[list[str]] = mapped_column(JSON, default=list)
     dataset_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    rate_limit_per_minute: Mapped[int] = mapped_column(Integer, default=120)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ApiUsageBucket(Base):
+    __tablename__ = "api_usage_buckets"
+    __table_args__ = (UniqueConstraint("token_id", "bucket_start", name="uq_api_usage_bucket"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    token_id: Mapped[str] = mapped_column(
+        ForeignKey("api_tokens.id", ondelete="CASCADE"),
+        index=True,
+    )
+    bucket_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    request_count: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Project(Base, TimestampMixin):
@@ -83,7 +100,9 @@ class Project(Base, TimestampMixin):
 class Source(Base, TimestampMixin):
     __tablename__ = "sources"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
     name: Mapped[str] = mapped_column(String(200))
     source_type: Mapped[str] = mapped_column(String(40))
     entry_url: Mapped[str] = mapped_column(Text, default="")
@@ -99,7 +118,9 @@ class Source(Base, TimestampMixin):
 class SourceProfile(Base):
     __tablename__ = "source_profiles"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    source_id: Mapped[str | None] = mapped_column(ForeignKey("sources.id", ondelete="CASCADE"), nullable=True)
+    source_id: Mapped[str | None] = mapped_column(
+        ForeignKey("sources.id", ondelete="CASCADE"), nullable=True
+    )
     url: Mapped[str] = mapped_column(Text)
     result_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -108,7 +129,9 @@ class SourceProfile(Base):
 class DataSchema(Base, TimestampMixin):
     __tablename__ = "data_schemas"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
     name: Mapped[str] = mapped_column(String(200))
     description: Mapped[str] = mapped_column(Text, default="")
     schema_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -119,10 +142,14 @@ class DataSchema(Base, TimestampMixin):
 class Workflow(Base, TimestampMixin):
     __tablename__ = "workflows"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
     name: Mapped[str] = mapped_column(String(200))
     description: Mapped[str] = mapped_column(Text, default="")
-    graph_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=lambda: {"nodes": [], "edges": [], "settings": {}, "version": 1})
+    graph_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=lambda: {"nodes": [], "edges": [], "settings": {}, "version": 1}
+    )
     version: Mapped[int] = mapped_column(Integer, default=1)
     published_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -135,14 +162,21 @@ class WorkflowTemplate(Base, TimestampMixin):
     changing a draft can never silently change future workflows created from an
     already approved template.
     """
+
     __tablename__ = "workflow_templates"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
     name: Mapped[str] = mapped_column(String(200))
     description: Mapped[str] = mapped_column(Text, default="")
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
-    graph_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=lambda: {"nodes": [], "edges": [], "settings": {}, "version": 1})
-    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    graph_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=lambda: {"nodes": [], "edges": [], "settings": {}, "version": 1}
+    )
+    created_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     is_builtin: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -150,7 +184,9 @@ class WorkflowVersion(Base):
     __tablename__ = "workflow_versions"
     __table_args__ = (UniqueConstraint("workflow_id", "version", name="uq_workflow_version"),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    workflow_id: Mapped[str] = mapped_column(ForeignKey("workflows.id", ondelete="CASCADE"), index=True)
+    workflow_id: Mapped[str] = mapped_column(
+        ForeignKey("workflows.id", ondelete="CASCADE"), index=True
+    )
     version: Mapped[int] = mapped_column(Integer)
     graph_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
@@ -160,7 +196,9 @@ class WorkflowVersion(Base):
 class Prompt(Base, TimestampMixin):
     __tablename__ = "prompts"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
     name: Mapped[str] = mapped_column(String(200))
     provider: Mapped[str] = mapped_column(String(64), default="deepseek")
     model: Mapped[str] = mapped_column(String(128), default="deepseek-chat")
@@ -205,19 +243,25 @@ class NodeRun(Base):
 class Dataset(Base, TimestampMixin):
     __tablename__ = "datasets"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
     schema_id: Mapped[str | None] = mapped_column(ForeignKey("data_schemas.id"), nullable=True)
     name: Mapped[str] = mapped_column(String(200))
     slug: Mapped[str] = mapped_column(String(200), unique=True)
     natural_key_fields: Mapped[list[str]] = mapped_column(JSON, default=list)
-    review_policy: Mapped[dict[str, Any]] = mapped_column(JSON, default=lambda: {"new": False, "changed": False, "confidence_below": 0.0})
+    review_policy: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=lambda: {"new": False, "changed": False, "confidence_below": 0.0}
+    )
 
 
 class Record(Base, TimestampMixin):
     __tablename__ = "records"
     __table_args__ = (UniqueConstraint("dataset_id", "natural_key", name="uq_dataset_natural_key"),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id", ondelete="CASCADE"), index=True)
+    dataset_id: Mapped[str] = mapped_column(
+        ForeignKey("datasets.id", ondelete="CASCADE"), index=True
+    )
     natural_key: Mapped[str] = mapped_column(String(512))
     current_version: Mapped[int] = mapped_column(Integer, default=1)
     status: Mapped[str] = mapped_column(String(32), default="ACTIVE")
@@ -255,16 +299,28 @@ class RecordObservation(Base):
         Index("ix_record_observations_dataset_fetched", "dataset_id", "fetched_at"),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id", ondelete="CASCADE"), index=True)
+    dataset_id: Mapped[str] = mapped_column(
+        ForeignKey("datasets.id", ondelete="CASCADE"), index=True
+    )
     record_id: Mapped[str] = mapped_column(ForeignKey("records.id", ondelete="CASCADE"), index=True)
-    record_version_id: Mapped[str] = mapped_column(ForeignKey("record_versions.id", ondelete="CASCADE"), index=True)
+    record_version_id: Mapped[str] = mapped_column(
+        ForeignKey("record_versions.id", ondelete="CASCADE"), index=True
+    )
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
-    source_id: Mapped[str | None] = mapped_column(ForeignKey("sources.id", ondelete="SET NULL"), nullable=True, index=True)
-    raw_document_id: Mapped[str | None] = mapped_column(ForeignKey("raw_documents.id", ondelete="SET NULL"), nullable=True)
+    source_id: Mapped[str | None] = mapped_column(
+        ForeignKey("sources.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    raw_document_id: Mapped[str | None] = mapped_column(
+        ForeignKey("raw_documents.id", ondelete="SET NULL"), nullable=True
+    )
     natural_key: Mapped[str] = mapped_column(String(512))
     content_changed: Mapped[bool] = mapped_column(Boolean, default=False)
-    source_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    source_modified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source_published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    source_modified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -277,7 +333,9 @@ class DatasetRun(Base):
     __table_args__ = (UniqueConstraint("run_id", "dataset_id", name="uq_run_dataset"),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
-    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id", ondelete="CASCADE"), index=True)
+    dataset_id: Mapped[str] = mapped_column(
+        ForeignKey("datasets.id", ondelete="CASCADE"), index=True
+    )
     observed_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -285,7 +343,9 @@ class DatasetRun(Base):
 class ReviewTask(Base, TimestampMixin):
     __tablename__ = "review_tasks"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
     record_id: Mapped[str | None] = mapped_column(ForeignKey("records.id"), nullable=True)
     run_id: Mapped[str | None] = mapped_column(ForeignKey("runs.id"), nullable=True)
     reason: Mapped[str] = mapped_column(String(200))
@@ -300,7 +360,9 @@ class ReviewTask(Base, TimestampMixin):
 class Schedule(Base, TimestampMixin):
     __tablename__ = "schedules"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    workflow_id: Mapped[str] = mapped_column(ForeignKey("workflows.id", ondelete="CASCADE"), index=True)
+    workflow_id: Mapped[str] = mapped_column(
+        ForeignKey("workflows.id", ondelete="CASCADE"), index=True
+    )
     name: Mapped[str] = mapped_column(String(200))
     cron: Mapped[str] = mapped_column(String(100))
     timezone: Mapped[str] = mapped_column(String(64), default="Europe/Minsk")
@@ -346,7 +408,9 @@ class RawDocument(Base):
 class LLMCall(Base):
     __tablename__ = "llm_calls"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    run_id: Mapped[str | None] = mapped_column(ForeignKey("runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     node_id: Mapped[str] = mapped_column(String(100), default="")
     provider: Mapped[str] = mapped_column(String(100), default="")
     model: Mapped[str] = mapped_column(String(200), default="")
@@ -382,14 +446,18 @@ class BrowserProfile(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
     name: Mapped[str] = mapped_column(String(200), unique=True)
     browser: Mapped[str] = mapped_column(String(40), default="chromium")
-    viewport: Mapped[dict[str, Any]] = mapped_column(JSON, default=lambda: {"width": 1440, "height": 900})
+    viewport: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=lambda: {"width": 1440, "height": 900}
+    )
     locale: Mapped[str] = mapped_column(String(32), default="ru-RU")
     timezone: Mapped[str] = mapped_column(String(64), default="Europe/Minsk")
     user_agent: Mapped[str] = mapped_column(Text, default="")
     proxy: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     encrypted_storage_state: Mapped[str] = mapped_column(Text, default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class AIProviderConfig(Base, TimestampMixin):

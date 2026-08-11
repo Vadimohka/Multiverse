@@ -140,7 +140,8 @@ class WorkflowEngine:
                         merged_inputs[source_id] = branch_value
                 else:
                     merged_inputs.update(source_output)
-            config = definition.get("config") or definition.get("data", {}).get("config", {})
+            config = dict(definition.get("config") or definition.get("data", {}).get("config", {}))
+            config.setdefault("_node_id", node_id)
             started = time.perf_counter()
             output: dict[str, Any] = {}
             error: dict[str, Any] = {}

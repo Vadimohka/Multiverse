@@ -116,10 +116,12 @@ def test_bcse_preset_keeps_site_date_range_and_selectors_in_configuration():
     assert "lookback_days" not in crawl
     assert crawl["listing_fetch_mode"] == "HTTP"
     assert crawl["detail_fetch_mode"] == "PLAYWRIGHT"
+    assert crawl["base_url"] == "https://www.bcse.by/"
     publication = next(field for field in crawl["detail_fields"] if field["name"] == "source_published_at")
     assert publication == {
         "name": "source_published_at",
-        "selector": ".dynamic-publicationdate",
+        "source": "listing",
+        "source_path": "shortDate",
         "timezone": "Europe/Minsk",
     }
 
@@ -128,11 +130,11 @@ def test_bcse_preset_keeps_site_date_range_and_selectors_in_configuration():
         <div class='dynamic-publicationdate'>10 августа 2026</div>
         <div id='pc_body'>Итоги торговой сессии<a href='/files/result.pdf'>Протокол</a></div></html>""",
         "https://www.bcse.by/press-center/news/n100820261?utm_source=test",
-        {"record_id": "n100820261", "item": {}},
+        {"record_id": "n100820261", "item": {"shortDate": "2026-08-10T14:27:03"}},
         crawl,
         None,
     )
-    assert record["source_published_at"] == "2026-08-09T21:00:00Z"
+    assert record["source_published_at"] == "2026-08-10T11:27:03Z"
     assert record["url"] == "https://www.bcse.by/press-center/news/n100820261"
     assert record["attachments_json"] == '[{"title": "Протокол", "url": "https://www.bcse.by/files/result.pdf"}]'
 

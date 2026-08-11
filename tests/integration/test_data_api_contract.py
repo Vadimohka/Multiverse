@@ -568,6 +568,42 @@ def test_bcse_news_preset_is_bootstrapped_as_an_executable_chain(client, auth):
     assert crawl["date_range_query"]["from_param"] == "sFrom"
 
 
+def test_bcse_site_preset_is_available_in_template_picker_and_keeps_configuration(client, auth):
+    project = next(
+        item for item in client.get("/api/v1/projects", headers=auth).json()
+        if item["slug"] == "bcse-news"
+    )
+    source = client.get(f"/api/v1/sources?project_id={project['id']}", headers=auth).json()[0]
+    dataset = client.get(f"/api/v1/datasets?project_id={project['id']}", headers=auth).json()[0]
+    templates = client.get("/api/v1/workflow-templates", headers=auth).json()
+    preset = next(item for item in templates if item["id"] == "system-bcse-news")
+
+    created = client.post(
+        f"/api/v1/workflow-templates/{preset['id']}/instantiate",
+        headers=auth,
+        json={
+            "project_id": project["id"],
+            "source_id": source["id"],
+            "dataset_id": dataset["id"],
+            "name": "БВФБ: точное время публикации",
+        },
+    )
+
+    assert created.status_code == 201, created.text
+    graph = created.json()["graph_json"]
+    crawl = next(node for node in graph["nodes"] if node["id"] == "crawl")["config"]
+    publication = next(
+        field for field in crawl["detail_fields"]
+        if field["name"] == "source_published_at"
+    )
+    assert graph["settings"]["source_id"] == source["id"]
+    assert graph["settings"]["dataset_id"] == dataset["id"]
+    assert crawl["listing_url"] == "https://www.bcse.by/press_center/calendar"
+    assert crawl["base_url"] == "https://www.bcse.by/"
+    assert publication["source"] == "listing"
+    assert publication["source_path"] == "shortDate"
+
+
 def test_scoped_api_token_can_only_read_its_dataset(client, auth):
     dataset, _, _, _ = create_observed_dataset(
         client,
