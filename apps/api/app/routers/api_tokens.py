@@ -28,7 +28,9 @@ def create_api_token(
     existing = set(db.scalars(select(Dataset.id).where(Dataset.id.in_(dataset_ids))).all())
     if existing != set(dataset_ids):
         raise HTTPException(status_code=404, detail="Dataset не найден")
-    if payload.expires_at and (payload.expires_at.tzinfo is None or payload.expires_at.utcoffset() is None):
+    if payload.expires_at and (
+        payload.expires_at.tzinfo is None or payload.expires_at.utcoffset() is None
+    ):
         raise HTTPException(status_code=422, detail="expires_at must include a timezone")
     raw = "mv_" + secrets.token_urlsafe(32)
     token = ApiToken(
@@ -38,6 +40,7 @@ def create_api_token(
         token_hash=hashlib.sha256(raw.encode()).hexdigest(),
         scopes=scopes,
         dataset_ids=dataset_ids,
+        rate_limit_per_minute=payload.rate_limit_per_minute,
         expires_at=payload.expires_at.astimezone(UTC) if payload.expires_at else None,
     )
     db.add(token)
@@ -51,6 +54,7 @@ def create_api_token(
         "scopes": token.scopes,
         "dataset_ids": token.dataset_ids,
         "expires_at": token.expires_at,
+        "rate_limit_per_minute": token.rate_limit_per_minute,
     }
 
 
@@ -59,7 +63,11 @@ def list_api_tokens(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
 ) -> list[dict]:
-    tokens = db.scalars(select(ApiToken).where(ApiToken.owner_user_id == user.id).order_by(ApiToken.created_at.desc())).all()
+    tokens = db.scalars(
+        select(ApiToken)
+        .where(ApiToken.owner_user_id == user.id)
+        .order_by(ApiToken.created_at.desc())
+    ).all()
     return [
         {
             "id": token.id,
@@ -68,6 +76,7 @@ def list_api_tokens(
             "scopes": token.scopes,
             "dataset_ids": token.dataset_ids,
             "expires_at": token.expires_at,
+            "rate_limit_per_minute": token.rate_limit_per_minute,
             "last_used_at": token.last_used_at,
             "revoked_at": token.revoked_at,
             "created_at": token.created_at,
@@ -82,7 +91,9 @@ def revoke_api_token(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
 ) -> None:
-    token = db.scalar(select(ApiToken).where(ApiToken.id == token_id, ApiToken.owner_user_id == user.id))
+    token = db.scalar(
+        select(ApiToken).where(ApiToken.id == token_id, ApiToken.owner_user_id == user.id)
+    )
     if not token:
         raise HTTPException(status_code=404, detail="API token не найден")
     token.revoked_at = datetime.now(UTC)
