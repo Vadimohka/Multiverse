@@ -32,6 +32,7 @@ from app.models import (
     User,
 )
 from app.schemas import DataRecordsResponse, DatasetCreate, DatasetOut, DatasetUpdate
+from app.services.data_records import RecordPage, load_current_page, load_observation_page
 from app.services.exporter import export_xlsx
 
 router = APIRouter(tags=["Данные и экспорт"])
@@ -44,40 +45,72 @@ def exportable_record(data: dict) -> dict:
 
 
 def dataset_out(dataset: Dataset) -> dict:
-    return {"id": dataset.id, "project_id": dataset.project_id, "schema_id": dataset.schema_id, "name": dataset.name, "slug": dataset.slug,
-            "natural_key_fields": dataset.natural_key_fields or [], "review_policy": dataset.review_policy or {}, "created_at": dataset.created_at, "updated_at": dataset.updated_at}
+    return {
+        "id": dataset.id,
+        "project_id": dataset.project_id,
+        "schema_id": dataset.schema_id,
+        "name": dataset.name,
+        "slug": dataset.slug,
+        "natural_key_fields": dataset.natural_key_fields or [],
+        "review_policy": dataset.review_policy or {},
+        "created_at": dataset.created_at,
+        "updated_at": dataset.updated_at,
+    }
 
 
 @router.get("/datasets", response_model=list[DatasetOut])
-def list_datasets(project_id: str | None = None, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> list[dict]:
+def list_datasets(
+    project_id: str | None = None,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> list[dict]:
     stmt = select(Dataset).order_by(Dataset.updated_at.desc())
-    if project_id: stmt = stmt.where(Dataset.project_id == project_id)
+    if project_id:
+        stmt = stmt.where(Dataset.project_id == project_id)
     datasets = db.scalars(stmt).all()
     return [dataset_out(d) for d in datasets]
 
 
 @router.post("/datasets", response_model=DatasetOut, status_code=201)
-def create_dataset(payload: DatasetCreate, db: Session = Depends(get_db), _: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> Dataset:
+def create_dataset(
+    payload: DatasetCreate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
+) -> Dataset:
     if db.scalar(select(Dataset).where(Dataset.slug == payload.slug)):
         raise HTTPException(status_code=409, detail="Slug dataset уже используется")
     if payload.schema_id and not db.get(DataSchema, payload.schema_id):
         raise HTTPException(status_code=404, detail="Схема не найдена")
     dataset = Dataset(**payload.model_dump())
-    db.add(dataset); db.commit(); db.refresh(dataset)
+    db.add(dataset)
+    db.commit()
+    db.refresh(dataset)
     return dataset
 
 
 @router.patch("/datasets/{dataset_id}", response_model=DatasetOut)
-def update_dataset(dataset_id: str, payload: DatasetUpdate, db: Session = Depends(get_db), _: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> Dataset:
+def update_dataset(
+    dataset_id: str,
+    payload: DatasetUpdate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
+) -> Dataset:
     dataset = db.get(Dataset, dataset_id)
-    if not dataset: raise HTTPException(status_code=404, detail="Dataset не найден")
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset не найден")
     changes = payload.model_dump(exclude_unset=True)
-    if "slug" in changes and changes["slug"] != dataset.slug and db.scalar(select(Dataset).where(Dataset.slug == changes["slug"])):
+    if (
+        "slug" in changes
+        and changes["slug"] != dataset.slug
+        and db.scalar(select(Dataset).where(Dataset.slug == changes["slug"]))
+    ):
         raise HTTPException(status_code=409, detail="Slug dataset уже используется")
     if changes.get("schema_id") and not db.get(DataSchema, changes["schema_id"]):
         raise HTTPException(status_code=404, detail="Схема не найдена")
-    for key, value in changes.items(): setattr(dataset, key, value)
-    db.commit(); db.refresh(dataset)
+    for key, value in changes.items():
+        setattr(dataset, key, value)
+    db.commit()
+    db.refresh(dataset)
     return dataset
 
 
@@ -86,7 +119,9 @@ def clear_dataset_records(db: Session, dataset_id: str) -> int:
     records = list(db.scalars(select(Record).where(Record.dataset_id == dataset_id)).all())
     record_ids = [record.id for record in records]
     if record_ids:
-        for task in db.scalars(select(ReviewTask).where(ReviewTask.record_id.in_(record_ids))).all():
+        for task in db.scalars(
+            select(ReviewTask).where(ReviewTask.record_id.in_(record_ids))
+        ).all():
             db.delete(task)
     for record in records:
         db.delete(record)
@@ -94,7 +129,11 @@ def clear_dataset_records(db: Session, dataset_id: str) -> int:
 
 
 @router.delete("/datasets/{dataset_id}/records")
-def clear_dataset(dataset_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> dict:
+def clear_dataset(
+    dataset_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
+) -> dict:
     if not db.get(Dataset, dataset_id):
         raise HTTPException(status_code=404, detail="Dataset не найден")
     removed = clear_dataset_records(db, dataset_id)
@@ -104,26 +143,57 @@ def clear_dataset(dataset_id: str, db: Session = Depends(get_db), user: User = D
 
 
 @router.delete("/datasets/{dataset_id}", status_code=204)
-def delete_dataset(dataset_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> None:
+def delete_dataset(
+    dataset_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
+) -> None:
     dataset = db.get(Dataset, dataset_id)
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset не найден")
     removed = clear_dataset_records(db, dataset_id)
-    audit(db, user.id, "DELETE", "dataset", dataset_id, before={"name": dataset.name, "removed_records": removed})
+    audit(
+        db,
+        user.id,
+        "DELETE",
+        "dataset",
+        dataset_id,
+        before={"name": dataset.name, "removed_records": removed},
+    )
     db.delete(dataset)
     db.commit()
 
 
 @router.get("/datasets/{dataset_id}/summary")
-def dataset_summary(dataset_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict:
+def dataset_summary(
+    dataset_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)
+) -> dict:
     if not db.get(Dataset, dataset_id):
         raise HTTPException(status_code=404, detail="Dataset не найден")
     base = (Record.dataset_id == dataset_id, Record.status == "ACTIVE")
     return {
-        "approved": db.scalar(select(func.count()).select_from(Record).where(*base, Record.review_status == "APPROVED")) or 0,
-        "pending": db.scalar(select(func.count()).select_from(Record).where(*base, Record.review_status == "PENDING")) or 0,
-        "rejected": db.scalar(select(func.count()).select_from(Record).where(Record.dataset_id == dataset_id, Record.status == "REJECTED")) or 0,
-        "pending_initial": db.scalar(select(func.count()).select_from(Record).where(*base, Record.review_status == "PENDING", Record.current_version == 1)) or 0,
+        "approved": db.scalar(
+            select(func.count())
+            .select_from(Record)
+            .where(*base, Record.review_status == "APPROVED")
+        )
+        or 0,
+        "pending": db.scalar(
+            select(func.count()).select_from(Record).where(*base, Record.review_status == "PENDING")
+        )
+        or 0,
+        "rejected": db.scalar(
+            select(func.count())
+            .select_from(Record)
+            .where(Record.dataset_id == dataset_id, Record.status == "REJECTED")
+        )
+        or 0,
+        "pending_initial": db.scalar(
+            select(func.count())
+            .select_from(Record)
+            .where(*base, Record.review_status == "PENDING", Record.current_version == 1)
+        )
+        or 0,
     }
 
 
@@ -132,7 +202,9 @@ def list_records(
     dataset_id: str,
     view: Literal["current", "latest_run", "run", "history"] = "current",
     run_id: str | None = None,
-    time_basis: Literal["source_published_at", "source_modified_at", "fetched_at", "observed_at"] = "observed_at",
+    time_basis: Literal[
+        "source_published_at", "source_modified_at", "fetched_at", "observed_at"
+    ] = "observed_at",
     from_: datetime | None = Query(default=None, alias="from"),
     to: datetime | None = None,
     at: datetime | None = None,
@@ -149,11 +221,14 @@ def list_records(
         raise HTTPException(status_code=404, detail="Dataset не найден")
     authorize_dataset_read(principal, dataset.id)
     if include_pending and (
-        principal.api_token or not role_names(principal.user).intersection({"ADMINISTRATOR", "OPERATOR"})
+        principal.api_token
+        or not role_names(principal.user).intersection({"ADMINISTRATOR", "OPERATOR"})
     ):
         raise HTTPException(status_code=403, detail="Pending records require a review role")
     if view not in {"current", "latest_run", "run", "history"}:
-        raise HTTPException(status_code=422, detail="view must be current, latest_run, run or history")
+        raise HTTPException(
+            status_code=422, detail="view must be current, latest_run, run or history"
+        )
     if time_basis not in {"source_published_at", "source_modified_at", "fetched_at", "observed_at"}:
         raise HTTPException(status_code=422, detail="Unsupported time_basis")
     requested_at = at
@@ -168,24 +243,7 @@ def list_records(
         raise HTTPException(status_code=422, detail="run_id is only valid for view=run")
 
     selected_run_id = run_id
-    rows: list[tuple[Record, RecordVersion | None, RecordObservation | None]] = []
-    if view == "current":
-        filters = (Record.dataset_id == dataset.id, Record.status == "ACTIVE")
-        if not include_pending:
-            filters += (Record.review_status == "APPROVED",)
-        for record in db.scalars(select(Record).where(*filters)).all():
-            version = db.scalar(select(RecordVersion).where(
-                RecordVersion.record_id == record.id,
-                RecordVersion.version_number == record.current_version,
-            ))
-            observation = None
-            if version:
-                observation = db.scalar(select(RecordObservation).where(
-                    RecordObservation.record_id == record.id,
-                    RecordObservation.record_version_id == version.id,
-                ).order_by(RecordObservation.observed_at.desc(), RecordObservation.id.desc()))
-            rows.append((record, version, observation))
-    else:
+    if view != "current":
         if view == "latest_run":
             selected_run_id = db.scalar(
                 select(DatasetRun.run_id)
@@ -198,26 +256,13 @@ def list_records(
                 .limit(1)
             )
         elif view == "run":
-            dataset_run = db.scalar(select(DatasetRun).where(DatasetRun.dataset_id == dataset.id, DatasetRun.run_id == selected_run_id))
+            dataset_run = db.scalar(
+                select(DatasetRun).where(
+                    DatasetRun.dataset_id == dataset.id, DatasetRun.run_id == selected_run_id
+                )
+            )
             if not db.get(Run, selected_run_id) or not dataset_run:
                 raise HTTPException(status_code=404, detail="Run не найден для dataset")
-        observation_stmt = select(RecordObservation).where(RecordObservation.dataset_id == dataset.id)
-        if selected_run_id:
-            observation_stmt = observation_stmt.where(RecordObservation.run_id == selected_run_id)
-        elif view == "latest_run":
-            observation_stmt = observation_stmt.where(False)
-        for observation in db.scalars(observation_stmt).all():
-            record = db.get(Record, observation.record_id)
-            version = db.get(RecordVersion, observation.record_version_id)
-            if not record or not version:
-                continue
-            if not include_pending and version.review_status != "APPROVED":
-                continue
-            rows.append((record, version, observation))
-
-    filtered = [row for row in rows if observation_matches_time(row[2], time_basis, from_, to)]
-    sort_observation_rows(filtered, time_basis, sort)
-    total = len(filtered)
     cursor_context = {
         "dataset_id": dataset.id,
         "view": view,
@@ -228,21 +273,53 @@ def list_records(
         "sort": sort,
         "include_pending": include_pending,
     }
+    cursor_key = None
     if cursor:
         cursor_payload = decode_cursor(cursor)
         if cursor_payload.get("context") != cursor_context:
             raise HTTPException(status_code=400, detail="Cursor does not match request filters")
-        cursor_key = (cursor_payload["null_rank"], cursor_payload["parsed_timestamp"], cursor_payload["id"])
-        filtered = [
-            row for row in filtered
-            if observation_key_is_after(observation_sort_key(row[2], time_basis, row[0]), cursor_key, sort)
-        ]
+        cursor_key = (
+            cursor_payload["null_rank"],
+            cursor_payload["parsed_timestamp"],
+            cursor_payload["id"],
+        )
     page_limit = min(max(limit, 1), 1000)
     start = max(offset, 0) if not cursor else 0
-    page = filtered[start:start + page_limit]
-    has_more = len(filtered) > start + len(page)
-    next_cursor = encode_cursor(page[-1], time_basis, cursor_context) if page and has_more else None
-    items = [record_api_item(*row) for row in page]
+    if view == "current":
+        record_page = load_current_page(
+            db,
+            dataset.id,
+            include_pending=include_pending,
+            time_basis=time_basis,
+            from_=from_,
+            to=to,
+            cursor_key=cursor_key,
+            direction=sort,
+            limit=page_limit,
+            offset=start,
+        )
+    elif view == "latest_run" and not selected_run_id:
+        record_page = RecordPage(rows=[], total=0, has_more=False)
+    else:
+        record_page = load_observation_page(
+            db,
+            dataset.id,
+            run_id=selected_run_id,
+            include_pending=include_pending,
+            time_basis=time_basis,
+            from_=from_,
+            to=to,
+            cursor_key=cursor_key,
+            direction=sort,
+            limit=page_limit,
+            offset=start,
+        )
+    next_cursor = (
+        encode_cursor(record_page.rows[-1], time_basis, cursor_context)
+        if record_page.rows and record_page.has_more
+        else None
+    )
+    items = [record_api_item(*row) for row in record_page.rows]
     return {
         "items": items,
         "pagination": {"limit": page_limit, "next_cursor": next_cursor},
@@ -259,12 +336,14 @@ def list_records(
         # Compatibility fields for the existing frontend and API consumers.
         "limit": page_limit,
         "offset": max(offset, 0),
-        "total": total,
+        "total": record_page.total,
     }
 
 
 def resolve_dataset(db: Session, dataset_ref: str) -> Dataset | None:
-    return db.get(Dataset, dataset_ref) or db.scalar(select(Dataset).where(Dataset.slug == dataset_ref))
+    return db.get(Dataset, dataset_ref) or db.scalar(
+        select(Dataset).where(Dataset.slug == dataset_ref)
+    )
 
 
 def validate_time_range(
@@ -354,7 +433,9 @@ def record_api_item(
         "status": record.status,
         "data": data,
         "timestamps": {
-            "source_published_at": iso_utc(observation.source_published_at if observation else None),
+            "source_published_at": iso_utc(
+                observation.source_published_at if observation else None
+            ),
             "source_modified_at": iso_utc(observation.source_modified_at if observation else None),
             "fetched_at": iso_utc(observation.fetched_at if observation else None),
             "observed_at": iso_utc(observation.observed_at if observation else None),
@@ -400,7 +481,10 @@ def decode_cursor(cursor: str) -> dict:
     try:
         padding = "=" * (-len(cursor) % 4)
         value = json.loads(base64.urlsafe_b64decode(cursor + padding))
-        if not isinstance(value, dict) or not {"null_rank", "timestamp", "id", "context"} <= value.keys():
+        if (
+            not isinstance(value, dict)
+            or not {"null_rank", "timestamp", "id", "context"} <= value.keys()
+        ):
             raise ValueError
         if value["null_rank"] not in {0, 1} or not isinstance(value["id"], str) or not value["id"]:
             raise ValueError
@@ -424,7 +508,11 @@ def decode_cursor(cursor: str) -> dict:
 
 
 @router.post("/datasets/{dataset_id}/accept-baseline")
-def accept_baseline(dataset_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "OPERATOR"))) -> dict:
+def accept_baseline(
+    dataset_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("ADMINISTRATOR", "OPERATOR")),
+) -> dict:
     """Publish only first-observation records after an operator reviewed a sample.
 
     Later changed versions keep their own Review Queue tasks and are never
@@ -432,44 +520,86 @@ def accept_baseline(dataset_id: str, db: Session = Depends(get_db), user: User =
     """
     if not db.get(Dataset, dataset_id):
         raise HTTPException(status_code=404, detail="Dataset не найден")
-    records = list(db.scalars(select(Record).where(
-        Record.dataset_id == dataset_id,
-        Record.status == "ACTIVE",
-        Record.review_status == "PENDING",
-        Record.current_version == 1,
-    )).all())
+    records = list(
+        db.scalars(
+            select(Record).where(
+                Record.dataset_id == dataset_id,
+                Record.status == "ACTIVE",
+                Record.review_status == "PENDING",
+                Record.current_version == 1,
+            )
+        ).all()
+    )
     record_ids = [record.id for record in records]
     for record in records:
         record.review_status = "APPROVED"
     if record_ids:
-        versions = db.scalars(select(RecordVersion).where(RecordVersion.record_id.in_(record_ids), RecordVersion.version_number == 1)).all()
+        versions = db.scalars(
+            select(RecordVersion).where(
+                RecordVersion.record_id.in_(record_ids), RecordVersion.version_number == 1
+            )
+        ).all()
         for version in versions:
             version.review_status = "APPROVED"
-        tasks = db.scalars(select(ReviewTask).where(
-            ReviewTask.record_id.in_(record_ids),
-            ReviewTask.reason == "NEW_RECORD",
-            ReviewTask.status == "PENDING",
-        )).all()
+        tasks = db.scalars(
+            select(ReviewTask).where(
+                ReviewTask.record_id.in_(record_ids),
+                ReviewTask.reason == "NEW_RECORD",
+                ReviewTask.status == "PENDING",
+            )
+        ).all()
         for task in tasks:
             task.status = "APPROVED"
             task.decision_by = user.id
             task.decision_comment = "Базовый срез принят оператором после выборочной проверки"
-    audit(db, user.id, "ACCEPT_BASELINE", "dataset", dataset_id, after={"approved_records": len(records)})
+    audit(
+        db,
+        user.id,
+        "ACCEPT_BASELINE",
+        "dataset",
+        dataset_id,
+        after={"approved_records": len(records)},
+    )
     db.commit()
     return {"approved_records": len(records)}
 
 
 @router.get("/records/{record_id}/history")
-def record_history(record_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> list[dict]:
-    if not db.get(Record, record_id): raise HTTPException(status_code=404, detail="Запись не найдена")
-    versions = db.scalars(select(RecordVersion).where(RecordVersion.record_id == record_id).order_by(RecordVersion.version_number.desc())).all()
-    return [{"id": item.id, "run_id": item.run_id, "version": item.version_number, "data": item.data_json, "hash": item.data_hash, "review_status": item.review_status, "confidence": item.confidence, "observed_at": item.observed_at} for item in versions]
+def record_history(
+    record_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)
+) -> list[dict]:
+    if not db.get(Record, record_id):
+        raise HTTPException(status_code=404, detail="Запись не найдена")
+    versions = db.scalars(
+        select(RecordVersion)
+        .where(RecordVersion.record_id == record_id)
+        .order_by(RecordVersion.version_number.desc())
+    ).all()
+    return [
+        {
+            "id": item.id,
+            "run_id": item.run_id,
+            "version": item.version_number,
+            "data": item.data_json,
+            "hash": item.data_hash,
+            "review_status": item.review_status,
+            "confidence": item.confidence,
+            "observed_at": item.observed_at,
+        }
+        for item in versions
+    ]
 
 
 @router.post("/exports")
-def export_dataset(dataset_id: str, format: str = "xlsx", db: Session = Depends(get_db), _: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER", "OPERATOR", "VIEWER"))) -> Response:
+def export_dataset(
+    dataset_id: str,
+    format: str = "xlsx",
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER", "OPERATOR", "VIEWER")),
+) -> Response:
     dataset = db.get(Dataset, dataset_id)
-    if not dataset: raise HTTPException(status_code=404, detail="Dataset не найден")
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset не найден")
     rows = [
         exportable_record(r.data_json)
         for r in db.scalars(
@@ -480,9 +610,26 @@ def export_dataset(dataset_id: str, format: str = "xlsx", db: Session = Depends(
             )
         ).all()
     ]
-    if format == "json": return Response(json.dumps(rows, ensure_ascii=False, default=str), media_type="application/json", headers={"Content-Disposition": f'attachment; filename="{dataset.slug}.json"'})
+    if format == "json":
+        return Response(
+            json.dumps(rows, ensure_ascii=False, default=str),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{dataset.slug}.json"'},
+        )
     if format == "csv":
-        buffer = io.StringIO(); columns = sorted({k for row in rows for k in row}); writer = csv.DictWriter(buffer, fieldnames=columns); writer.writeheader(); writer.writerows(rows)
-        return Response(buffer.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{dataset.slug}.csv"'})
+        buffer = io.StringIO()
+        columns = sorted({k for row in rows for k in row})
+        writer = csv.DictWriter(buffer, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+        return Response(
+            buffer.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{dataset.slug}.csv"'},
+        )
     content = export_xlsx(rows, {"dataset": dataset.name, "records": len(rows)})
-    return Response(content, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{dataset.slug}.xlsx"'})
+    return Response(
+        content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{dataset.slug}.xlsx"'},
+    )
