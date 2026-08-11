@@ -10,3 +10,12 @@ cursor pagination and timezone-aware filters by `source_published_at`,
 The normative contract, scoped-token creation, response examples and exact
 second/range semantics are documented in
 [audit/DATA_API_CONTRACT.md](audit/DATA_API_CONTRACT.md).
+
+Operational guarantees:
+
+- filtering, ordering and cursor pagination run in SQL, not in application memory;
+- machine errors contain `error.code`, `error.message`, `error.request_id` and
+  the legacy top-level `detail` during migration;
+- scoped tokens can read only configured datasets and return `429 Retry-After`
+  when their per-minute limit is exceeded;
+- `from` is inclusive, `to` is exclusive and `at` represents one exact second.
