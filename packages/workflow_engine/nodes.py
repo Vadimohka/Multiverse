@@ -23,6 +23,7 @@ from lxml import html as lxml_html
 from openpyxl import Workbook, load_workbook
 
 from .normalizers import normalize_currency, normalize_number, normalize_term, parse_rate_expression
+from .transport import FetchPolicy, fetch_attempts, request_with_policy
 from .types import ExecutionContext
 
 
@@ -51,14 +52,25 @@ class HTTPRequestNode:
                 context, inputs, {**config, "url": url, "http_fallback": True, "_force_http": True}
             )
         method = str(config.get("method", "GET")).upper()
-        timeout = float(config.get("timeout", 30))
+        policy = FetchPolicy.from_config(config)
         headers = render_object(config.get("headers") or {}, context, inputs)
+        cookies = render_object(config.get("cookies") or {}, context, inputs)
         query_params = render_object(config.get("query_params") or {}, context, inputs)
         json_body = render_object(config.get("json_body") or {}, context, inputs)
-        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-            response = await client.request(method, url, headers=headers, params=query_params, json=json_body or None)
+        async with httpx.AsyncClient(follow_redirects=True, cookies=cookies) as client:
+            response = await request_with_policy(
+                client,
+                method,
+                url,
+                policy,
+                headers=headers,
+                params=query_params,
+                json=json_body or None,
+            )
             response.raise_for_status()
-        return await response_payload(context, response)
+        payload = await response_payload(context, response)
+        payload["fetch_attempts"] = fetch_attempts(response)
+        return payload
 
 
 class BrowserOpenNode:
@@ -352,8 +364,16 @@ class DownloadFileNode:
             )
             artifact = await store_artifact(context, content, content_type, url, filename, "raw_document")
             return {"url": url, "filename": filename, "content_type": content_type, "content_base64": base64.b64encode(content).decode("ascii"), "size": len(content), "sha256": artifact["sha256"], "artifact": artifact}
-        async with httpx.AsyncClient(follow_redirects=True, timeout=float(config.get("timeout", 60))) as client:
-            response = await client.get(url, headers=render_object(config.get("headers") or {}, context, inputs))
+        policy = FetchPolicy.from_config(config)
+        cookies = render_object(config.get("cookies") or {}, context, inputs)
+        async with httpx.AsyncClient(follow_redirects=True, cookies=cookies) as client:
+            response = await request_with_policy(
+                client,
+                "GET",
+                url,
+                policy,
+                headers=render_object(config.get("headers") or {}, context, inputs),
+            )
             response.raise_for_status()
         content_type = response.headers.get("content-type", "application/octet-stream")
         filename = filename_from_response(response)
@@ -362,6 +382,7 @@ class DownloadFileNode:
             "url": str(response.url), "filename": filename, "content_type": content_type,
             "content_base64": base64.b64encode(response.content).decode("ascii"), "size": len(response.content),
             "sha256": artifact["sha256"], "artifact": artifact,
+            "fetch_attempts": fetch_attempts(response),
         }
 
 
@@ -398,8 +419,7 @@ class FollowLinksNode:
                 break
 
         concurrency = min(max(int(config.get("concurrency", 3)), 1), 20)
-        retries = min(max(int(config.get("retries", 1)), 0), 5)
-        timeout = min(max(float(config.get("timeout", 30)), 1), 120)
+        fetch_policy = FetchPolicy.from_config(config)
         merge_mode = str(config.get("merge_mode", "MERGE_PARENT_CHILD"))
         policy = str(config.get("error_policy", "CONTINUE"))
         progress: list[dict[str, Any]] = []
@@ -408,25 +428,26 @@ class FollowLinksNode:
         lock = asyncio.Lock()
         semaphore = asyncio.Semaphore(concurrency)
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+        headers = render_object(config.get("headers") or {}, context, inputs)
+        cookies = render_object(config.get("cookies") or {}, context, inputs)
+        async with httpx.AsyncClient(follow_redirects=True, headers=headers, cookies=cookies) as client:
             async def fetch(parent: dict[str, Any]) -> None:
                 url = str(parent[url_field])
                 response: httpx.Response | None = None
                 message = ""
+                exception_attempts: list[dict[str, Any]] = []
                 async with semaphore:
-                    for attempt in range(retries + 1):
-                        try:
-                            response = await client.get(url)
-                            response.raise_for_status()
-                            break
-                        except Exception as exc:
-                            message = str(exc)
-                            if attempt == retries:
-                                break
-                    if response is None:
+                    try:
+                        response = await request_with_policy(client, "GET", url, fetch_policy)
+                        response.raise_for_status()
+                    except Exception as exc:
+                        message = str(exc)
+                        exception_attempts = getattr(exc, "fetch_attempts", [])
+                    if response is None or not response.is_success:
                         async with lock:
-                            failures.append({"url": url, "error": message})
-                            progress.append({"url": url, "status": "FAILED", "error": message})
+                            attempts = fetch_attempts(response) if response is not None else exception_attempts
+                            failures.append({"url": url, "error": message, "fetch_attempts": attempts})
+                            progress.append({"url": url, "status": "FAILED", "error": message, "fetch_attempts": attempts})
                         return
                     child: dict[str, Any] = {"url": str(response.url), "status_code": response.status_code, "body": response.text}
                     soup = BeautifulSoup(response.text, "lxml")
@@ -448,7 +469,7 @@ class FollowLinksNode:
                             detail = {**child, **table_row}
                             row = parent if merge_mode == "PARENT_ONLY" else detail if merge_mode == "CHILD_ONLY" else {**parent, **detail}
                             records.append(row)
-                        progress.append({"url": url, "status": "SUCCESS", "status_code": response.status_code, "detail_rows": len(table_rows)})
+                        progress.append({"url": url, "status": "SUCCESS", "status_code": response.status_code, "detail_rows": len(table_rows), "fetch_attempts": fetch_attempts(response)})
 
             await asyncio.gather(*(fetch(parent) for parent in parents))
         if failures and policy == "FAIL_FAST":
@@ -531,16 +552,17 @@ class CrawlLinksNode:
 
         concurrency = min(max(int(config.get("concurrency", 3)), 1), 20)
         delay_ms = max(int(config.get("delay_ms", 400)), 0)
-        retries = min(max(int(config.get("request_retries", 2)), 0), 5)
-        timeout = min(max(float(config.get("request_timeout", 45)), 1), 120)
+        fetch_policy = FetchPolicy.from_config(config)
         headers = {"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5", "User-Agent": "Mozilla/5.0 (compatible; ParserStudio/1.0)"}
         headers.update(render_object(config.get("headers") or {}, context, inputs))
         semaphore = asyncio.Semaphore(concurrency)
         records: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
+        detail_diagnostics: list[dict[str, Any]] = []
         record_lock = asyncio.Lock()
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
+        cookies = render_object(config.get("cookies") or {}, context, inputs)
+        async with httpx.AsyncClient(follow_redirects=True, headers=headers, cookies=cookies) as client:
             async def crawl(candidate: dict[str, Any]) -> None:
                 if context.cancelled:
                     return
@@ -550,9 +572,10 @@ class CrawlLinksNode:
                     artifact_content = b""
                     artifact_content_type = "text/html"
                     error: Exception | None = None
+                    response: httpx.Response | None = None
                     if self._detail_uses_browser(context, config):
                         rendered: dict[str, Any] | None = None
-                        for attempt in range(retries + 1):
+                        for attempt in range(fetch_policy.retries + 1):
                             try:
                                 # Explicit browser transport must not depend on
                                 # a successful direct HTTP probe. Some sites
@@ -565,7 +588,7 @@ class CrawlLinksNode:
                                 break
                             except Exception as exc:
                                 error = exc
-                                if attempt < retries:
+                                if attempt < fetch_policy.retries:
                                     await asyncio.sleep(min(0.5 * (attempt + 1), 2))
                         if rendered is None:
                             async with record_lock:
@@ -575,19 +598,24 @@ class CrawlLinksNode:
                         detail_html = str(rendered.get("html") or rendered.get("body") or "")
                         artifact_content = detail_html.encode("utf-8")
                     else:
-                        response: httpx.Response | None = None
-                        for attempt in range(retries + 1):
-                            try:
-                                response = await client.get(candidate["url"])
-                                response.raise_for_status()
-                                break
-                            except Exception as exc:  # request failures are reported per item, not hidden
-                                error = exc
-                                if attempt < retries:
-                                    await asyncio.sleep(min(0.5 * (attempt + 1), 2))
+                        try:
+                            response = await request_with_policy(
+                                client,
+                                "GET",
+                                candidate["url"],
+                                fetch_policy,
+                            )
+                            response.raise_for_status()
+                        except Exception as exc:  # request failures are reported per item, not hidden
+                            error = exc
                         if response is None or not response.is_success:
                             async with record_lock:
-                                errors.append({"url": candidate["url"], "record_id": candidate["record_id"], "error": str(error or "HTTP request failed")})
+                                errors.append({
+                                    "url": candidate["url"],
+                                    "record_id": candidate["record_id"],
+                                    "error": str(error or "HTTP request failed"),
+                                    "fetch_attempts": fetch_attempts(response) if response is not None else getattr(error, "fetch_attempts", []),
+                                })
                             return
                         detail_url = str(response.url)
                         detail_html = response.text
@@ -599,6 +627,13 @@ class CrawlLinksNode:
                         artifact = await store_artifact(context, artifact_content, artifact_content_type, detail_url, f"{artifact_id}.json" if "json" in artifact_content_type else f"{artifact_id}.html", "raw_article")
                     fetched_candidate = {**candidate, "fetched_at": datetime.now(UTC).isoformat()}
                     record = extract_article_record(detail_html, detail_url, fetched_candidate, config, artifact)
+                    if response is not None:
+                        async with record_lock:
+                            detail_diagnostics.append({
+                                "url": detail_url,
+                                "status_code": response.status_code,
+                                "fetch_attempts": fetch_attempts(response),
+                            })
                     async with record_lock:
                         records.append(record)
                     if delay_ms:
@@ -609,7 +644,8 @@ class CrawlLinksNode:
         records.sort(key=lambda row: (str(row.get("published_at", "")), str(row.get("record_id", ""))), reverse=True)
         context.log("INFO", "Crawl Links завершён", found=len(candidates), extracted=len(records), errors=len(errors))
         return {"records": records, "count": len(records), "discovered": len(candidates), "errors": errors,
-                "listing_diagnostics": listing_diagnostics, "artifacts": list(context.artifacts)}
+                "listing_diagnostics": listing_diagnostics, "detail_diagnostics": detail_diagnostics,
+                "artifacts": list(context.artifacts)}
 
     @staticmethod
     def _detail_uses_browser(context: ExecutionContext, config: dict[str, Any]) -> bool:
@@ -717,9 +753,21 @@ class CrawlLinksNode:
                 "tab_labels": rendered.get("tab_labels", []), "collection_source": "rendered_html",
             }
             return rendered.get("html") or rendered.get("body") or "", str(rendered.get("url") or listing_url)
-        async with httpx.AsyncClient(follow_redirects=True, timeout=min(max(float(config.get("listing_timeout", 60)), 1), 120), headers=headers) as client:
-            response = await client.get(listing_url, params=params)
+        listing_policy = FetchPolicy.from_config({**config, "request_timeout": config.get("listing_timeout", 60)})
+        cookies = render_object(config.get("cookies") or {}, context, inputs)
+        async with httpx.AsyncClient(follow_redirects=True, headers=headers, cookies=cookies) as client:
+            response = await request_with_policy(
+                client,
+                "GET",
+                listing_url,
+                listing_policy,
+                params=params,
+            )
             response.raise_for_status()
+        context.variables["_crawl_listing_diagnostics"] = {
+            "fetch_mode": "HTTP",
+            "fetch_attempts": fetch_attempts(response),
+        }
         if config.get("save_artifacts", True):
             await store_artifact(context, response.content, response.headers.get("content-type", "application/octet-stream"), str(response.url), "listing.json" if "json" in response.headers.get("content-type", "") else "listing.html", "raw_listing")
         if "json" in response.headers.get("content-type", ""):
