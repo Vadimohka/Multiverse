@@ -108,7 +108,7 @@ def test_compatibility_article_extractor_uses_standard_semantics_only():
     )
     assert record["record_id"] == "42"
     assert record["title"] == "Release note"
-    assert record["published_at"] == "2026-07-28T17:28:35"
+    assert record["published_at"] == "2026-07-28T17:28:35Z"
     assert record["url"] == "https://news.example.test/releases/42"
     assert record["body_text"] == "First paragraph.\n\nSecond paragraph.\n\nRules"
     assert record["attachments_json"] == '[{"title": "Rules", "url": "https://news.example.test/files/rules.pdf"}]'

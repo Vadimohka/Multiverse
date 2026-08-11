@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
+from soupsieve import escape as css_escape
 
 
 async def profile_url(url: str, timeout: float = 20) -> dict[str, Any]:
@@ -143,13 +144,13 @@ def detect_repeating_candidates(soup: BeautifulSoup) -> list[dict[str, Any]]:
     for element in soup.select("body *"):
         classes = element.get("class") or []
         if len(classes) > 1:
-            compound = "." + ".".join(str(item) for item in classes if item)
+            compound = "." + ".".join(css_escape(str(item)) for item in classes if item)
             if compound:
                 counts[compound] = counts.get(compound, 0) + 1
         for class_name in classes:
             if len(class_name) < 3:
                 continue
-            selector = f"{element.name}.{class_name}"
+            selector = f"{element.name}.{css_escape(str(class_name))}"
             counts[selector] = counts.get(selector, 0) + 1
     candidates: list[dict[str, Any]] = []
     for selector, count in sorted(counts.items(), key=lambda item: item[1], reverse=True):
@@ -209,7 +210,7 @@ def infer_repeating_fields(container: Any) -> list[dict[str, Any]]:
     if links:
         link = links[0]
         link_classes = [str(item) for item in (link.get("class") or [])]
-        selector = "." + ".".join(link_classes) if link_classes else "a[href]"
+        selector = "." + ".".join(css_escape(item) for item in link_classes) if link_classes else "a[href]"
         add("url", selector, attribute="href")
         if link.get_text(" ", strip=True):
             add("title", selector)
@@ -218,16 +219,16 @@ def infer_repeating_fields(container: Any) -> list[dict[str, Any]]:
         heading = container.select_one("h1, h2, h3, h4, h5, h6, [itemprop='headline']")
         if heading:
             classes = [str(item) for item in (heading.get("class") or [])]
-            selector = "." + ".".join(classes) if classes else heading.name
+            selector = "." + ".".join(css_escape(item) for item in classes) if classes else heading.name
             add("title", selector)
     image = container.select_one("img[src]")
     if image:
         classes = [str(item) for item in (image.get("class") or [])]
-        add("image", "." + ".".join(classes) if classes else "img[src]", attribute="src")
+        add("image", "." + ".".join(css_escape(item) for item in classes) if classes else "img[src]", attribute="src")
     published = container.select_one("time[datetime], [itemprop='datePublished']")
     if published:
         classes = [str(item) for item in (published.get("class") or [])]
-        selector = "." + ".".join(classes) if classes else published.name
+        selector = "." + ".".join(css_escape(item) for item in classes) if classes else published.name
         add("source_published_at", selector, attribute="datetime" if published.get("datetime") else None)
     return fields
 

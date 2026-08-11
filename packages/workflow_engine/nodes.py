@@ -827,21 +827,52 @@ class CrawlLinksNode:
         if client is None:
             cookies = render_object(config.get("cookies") or {}, context, inputs)
             client = httpx.AsyncClient(follow_redirects=True, headers=headers, cookies=cookies)
+        responses: list[httpx.Response] = []
+        documents: list[str] = []
         try:
             response = await request_with_policy(client, "GET", listing_url, listing_policy, params=params)
             response.raise_for_status()
+            responses.append(response)
+            content_type = response.headers.get("content-type", "")
+            if "json" not in content_type:
+                documents.append(response.text)
+            if config.get("pagination_enabled") and documents:
+                maximum_pages = min(max(int(config.get("pagination_max_pages", 25)), 1), 500)
+                selector = str(config.get("pagination_next_selector") or "a[rel='next']")
+                seen_pages = {canonical_url(str(response.url))}
+                while len(documents) < maximum_pages:
+                    soup = BeautifulSoup(documents[-1], "lxml")
+                    next_link = soup.select_one(selector) or soup.select_one("a[rel='next'][href]")
+                    next_href = str(next_link.get("href") or "").strip() if next_link else ""
+                    if not next_href:
+                        break
+                    next_url = canonical_url(urljoin(str(response.url), next_href))
+                    if next_url in seen_pages:
+                        break
+                    seen_pages.add(next_url)
+                    response = await request_with_policy(client, "GET", next_url, listing_policy)
+                    response.raise_for_status()
+                    responses.append(response)
+                    documents.append(response.text)
         finally:
             if owns_client:
                 await close_http_client(client)
         context.variables["_crawl_listing_diagnostics"] = {
             "fetch_mode": "HTTP",
-            "fetch_attempts": fetch_attempts(response),
+            "fetch_attempts": [
+                attempt
+                for page_response in responses
+                for attempt in fetch_attempts(page_response)
+            ],
+            "pages": len(responses),
         }
+        listing_body = merge_rendered_sections(documents) if len(documents) > 1 else response.text
         if config.get("save_artifacts", True):
-            await store_artifact(context, response.content, response.headers.get("content-type", "application/octet-stream"), str(response.url), "listing.json" if "json" in response.headers.get("content-type", "") else "listing.html", "raw_listing")
+            artifact_content = listing_body.encode("utf-8") if documents else response.content
+            await store_artifact(context, artifact_content, response.headers.get("content-type", "application/octet-stream"), str(response.url), "listing.json" if "json" in response.headers.get("content-type", "") else "listing.html", "raw_listing")
         if "json" in response.headers.get("content-type", ""):
             return response.json(), str(response.url)
-        return response.text, str(response.url)
+        return listing_body, str(responses[0].url)
 
     def _listing_items(self, listing: Any, config: dict[str, Any]) -> list[Any]:
         if isinstance(listing, str):
@@ -1753,6 +1784,9 @@ def extract_article_record(
     date_text = listing_date if re.search(r"\d{4}-\d{2}-\d{2}", listing_date) else select_text(soup, date_selector) if date_selector else ""
     if not date_text:
         date_text = next((element.get("datetime") or element.get("content") or element.get_text(" ", strip=True) for element in soup.select("time, [itemprop='datePublished'], meta[property='article:published_time'], meta[name='date']") if element.get("datetime") or element.get("content") or element.get_text(" ", strip=True)), "")
+    jsonld_dates = extract_jsonld_dates(soup)
+    if not date_text:
+        date_text = jsonld_dates.get("source_published_at", "")
     body_selector = str(config.get("body_selector") or "")
     body = soup.select_one(body_selector) if body_selector else None
     if not body:
@@ -1780,10 +1814,15 @@ def extract_article_record(
             href = element.get("href")
             if href:
                 attachments.append({"title": element.get_text(" ", strip=True) or Path(urlsplit(href).path).name, "url": canonical_url(urljoin(page_url, href))})
+    published_at = (
+        normalize_source_datetime(date_text)
+        if re.search(r"T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})$", date_text)
+        else normalize_publication_date(date_text)
+    )
     record: dict[str, Any] = {
         "record_id": candidate.get("record_id") or candidate.get("news_id") or hashlib.sha256(canonical_url(page_url).encode("utf-8")).hexdigest()[:20],
         "title": clean_inline_text(title),
-        "published_at": normalize_publication_date(date_text),
+        "published_at": published_at or "",
         "url": canonical_url(page_url),
         "body_text": body_text,
         "body_html": body_html,
@@ -1794,6 +1833,10 @@ def extract_article_record(
         "fetched_at": candidate.get("fetched_at") or datetime.now(UTC).isoformat(),
         "observed_at": datetime.now(UTC).isoformat(),
     }
+    if jsonld_dates.get("source_modified_at"):
+        record["source_modified_at"] = normalize_source_datetime(
+            jsonld_dates["source_modified_at"]
+        )
     # Older saved workflows may have supplied an additional domain identifier.
     # Preserve it as data, without making the crawler or the system template
     # depend on a particular field name.
@@ -1802,6 +1845,31 @@ def extract_article_record(
     if artifact:
         record["__provenance"] = {"raw_artifact": artifact}
     return record
+
+
+def extract_jsonld_dates(soup: BeautifulSoup) -> dict[str, str]:
+    """Read generic Schema.org dates without assuming a site or industry."""
+    result: dict[str, str] = {}
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            if not result.get("source_published_at") and value.get("datePublished"):
+                result["source_published_at"] = str(value["datePublished"])
+            if not result.get("source_modified_at") and value.get("dateModified"):
+                result["source_modified_at"] = str(value["dateModified"])
+            for child in value.values():
+                if isinstance(child, (dict, list)):
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:
+            visit(json.loads(script.string or script.get_text() or ""))
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return result
 
 
 def normalize_source_datetime(value: str, *, timezone: str = "UTC", date_format: str = "") -> str | None:
