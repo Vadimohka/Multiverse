@@ -37,10 +37,15 @@ SYSTEM_TEMPLATES: list[dict[str, Any]] = [
     {
         "id": "system-bcse-news",
         "name": "Новости БВФБ",
-        "description": "Готовый site preset: JSON-календарь БВФБ → Playwright detail → точное source_published_at → versioned dataset.",
-        "tags": ["site-preset", "БВФБ", "news", "list-detail"],
+        "description": "Готовый site preset: все карточки и страницы пагинации пресс-центра БВФБ → полный текст, HTML и вложения → versioned dataset.",
+        "tags": ["site-preset", "БВФБ", "news", "list-detail", "pagination"],
         "is_system": True,
         "site_preset": True,
+        "preset_defaults": {
+            "project_slug": "bcse-news",
+            "source_entry_url": "https://www.bcse.by/press-center/releases",
+            "dataset_slug": "bcse-news",
+        },
         "graph_json": bcse_news_graph("", "", incremental=True),
     },
     {

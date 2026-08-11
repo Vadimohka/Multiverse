@@ -299,6 +299,7 @@ class WorkflowTemplateOut(ORMModel):
     tags: list[str] = []
     graph_json: dict[str, Any]
     is_system: bool = False
+    preset_defaults: dict[str, str] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

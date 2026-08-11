@@ -40,6 +40,8 @@ def test_bcse_news_template_output_is_persistable_business_records():
         "body_text": "Полный текст новости",
         "body_html": "<p>Полный текст новости</p>",
         "attachments_json": "[]",
+        "tags": None,
+        "category": None,
         "language": "ru",
         "source_name": "БВФБ",
     }
@@ -57,6 +59,8 @@ def test_bcse_news_template_output_is_persistable_business_records():
         "body_text": "Полный текст новости",
         "body_html": "<p>Полный текст новости</p>",
         "attachments_json": "[]",
+        "tags": None,
+        "category": None,
         "language": "ru",
         "source_name": "БВФБ",
     }]
@@ -102,40 +106,69 @@ def test_generic_html_link_discovery_skips_navigation():
     ]
 
 
-def test_bcse_preset_keeps_site_date_range_and_selectors_in_configuration():
+def test_bcse_preset_keeps_listing_pagination_and_detail_api_in_configuration():
     graph = bcse_news_graph("source-1", "dataset-1", incremental=True)
     crawl = next(node for node in graph["nodes"] if node["id"] == "crawl")["config"]
 
-    assert crawl["date_range_query"] == {
-        "from_param": "sFrom",
-        "to_param": "sTo",
-        "lookback_days": 45,
-        "format": "DD.MM.YYYY",
-        "timezone": "Europe/Minsk",
+    assert crawl["listing_url"] == "https://www.bcse.by/press-center/releases"
+    assert crawl["listing_fetch_mode"] == "PLAYWRIGHT"
+    assert crawl["link_selector"] == "#pc-0c a.text-pc[href*='/press-center/']"
+    assert crawl["pagination_enabled"] is True
+    assert crawl["pagination_max_pages"] >= 25
+    assert crawl["pagination_next_selector"] == "#pc-0 li.paginationjs-next:not(.disabled) a"
+    assert crawl["detail_fetch_mode"] == "HTTP"
+    assert crawl["detail_request"] == {
+        "url": "https://www.bcse.by/solo/calendar",
+        "method": "GET",
+        "query_params": {
+            "sType": "6",
+            "sDay": "{{publication_time}}",
+            "link": "{{record_id}}",
+        },
+        "html_path": "solo.html",
+        "not_found_path": "solo.notFound",
     }
-    assert "lookback_days" not in crawl
-    assert crawl["listing_fetch_mode"] == "HTTP"
-    assert crawl["detail_fetch_mode"] == "PLAYWRIGHT"
+    effective = CrawlLinksNode()._effective_config(
+        ExecutionContext(run_id="run-1", project_id="project-1", workflow_version_id="version-1"),
+        {},
+        crawl,
+    )
+    assert effective["detail_request"]["query_params"]["sDay"] == "{{publication_time}}"
+    assert effective["detail_request"]["query_params"]["link"] == "{{record_id}}"
     assert crawl["base_url"] == "https://www.bcse.by/"
     publication = next(field for field in crawl["detail_fields"] if field["name"] == "source_published_at")
     assert publication == {
         "name": "source_published_at",
-        "source": "listing",
-        "source_path": "shortDate",
+        "source": "response",
+        "source_path": "day",
         "timezone": "Europe/Minsk",
     }
 
     record = extract_article_record(
-        """<html><span id='title'>Новости торгов</span>
-        <div class='dynamic-publicationdate'>10 августа 2026</div>
-        <div id='pc_body'>Итоги торговой сессии<a href='/files/result.pdf'>Протокол</a></div></html>""",
-        "https://www.bcse.by/press-center/news/n100820261?utm_source=test",
-        {"record_id": "n100820261", "item": {"shortDate": "2026-08-10T14:27:03"}},
+        """<p>Итоги торговой сессии<a href='/files/result.pdf'>Протокол</a></p>""",
+        "https://www.bcse.by/press-center/releases/pr100820261/2026-08-10T17:27:03?utm_source=test",
+        {
+            "record_id": "pr100820261",
+            "detail_response": {
+                "day": "2026-08-10T17:27:03",
+                "solo": {
+                    "title": "Новости торгов",
+                    "html": "<p>Итоги торговой сессии<a href='/files/result.pdf'>Протокол</a></p>",
+                    "tags": ["итоги торгов", "фондовый рынок"],
+                    "categoryName": "Фондовый рынок",
+                },
+            },
+        },
         crawl,
         None,
     )
-    assert record["source_published_at"] == "2026-08-10T11:27:03Z"
-    assert record["url"] == "https://www.bcse.by/press-center/news/n100820261"
+    assert record["source_published_at"] == "2026-08-10T14:27:03Z"
+    assert record["url"] == "https://www.bcse.by/press-center/releases/pr100820261/2026-08-10T17:27:03"
+    assert record["title"] == "Новости торгов"
+    assert record["body_text"] == "Итоги торговой сессии Протокол"
+    assert record["body_html"].startswith("<p>Итоги торговой сессии")
+    assert record["tags"] == "итоги торгов|фондовый рынок"
+    assert record["category"] == "Фондовый рынок"
     assert record["attachments_json"] == '[{"title": "Протокол", "url": "https://www.bcse.by/files/result.pdf"}]'
 
 
