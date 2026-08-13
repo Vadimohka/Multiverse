@@ -672,11 +672,9 @@ class CrawlLinksNode:
                 candidate.update({key: value for key, value in match.groupdict().items() if value is not None})
             candidate["record_id"] = (
                 candidate.get("record_id")
-                or match.group(1)
-                if match and match.groups()
-                else match.group(0)
-                if match
-                else hashlib.sha256(candidate["url"].encode("utf-8")).hexdigest()[:20]
+                or (candidate.get("item") or {}).get("record_id")
+                or (match.group(1) if match and match.groups() else match.group(0) if match else None)
+                or hashlib.sha256(candidate["url"].encode("utf-8")).hexdigest()[:20]
             )
             candidate["depth"] = 1
 
@@ -2138,7 +2136,10 @@ def build_url_frontier(
         if parts.scheme not in {"http", "https"}:
             continue
         candidate_host = (parts.hostname or "").lower()
-        if allowed_domains and candidate_host not in allowed_domains:
+        if allowed_domains and not any(
+            candidate_host == domain or candidate_host.endswith(f".{domain}")
+            for domain in allowed_domains
+        ):
             continue
         if (
             not allowed_domains

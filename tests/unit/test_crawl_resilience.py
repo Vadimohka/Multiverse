@@ -61,6 +61,35 @@ async def test_frontier_deduplicates_canonical_urls_and_enforces_domain_and_max_
 
 
 @pytest.mark.asyncio
+async def test_crawl_preserves_source_record_ids_and_allows_configured_subdomains(monkeypatch):
+    requested: list[str] = []
+
+    async def request(_client, method, url, _policy, **_kwargs):
+        requested.append(url)
+        return success_response(method, url)
+
+    monkeypatch.setattr("workflow_engine.nodes.request_with_policy", request)
+    result = await CrawlLinksNode().execute(
+        context(),
+        {
+            "url": "https://www.example.test/list",
+            "records": [{"url": "https://api.example.test/items/42", "record_id": "upstream-42"}],
+        },
+        {
+            "input_path": "records",
+            "allowed_domains": ["example.test"],
+            "detail_fields": [{"name": "title", "selector": "h1"}],
+            "save_artifacts": False,
+            "delay_ms": 0,
+            "egress_resolver": lambda *_: ["93.184.216.34"],
+        },
+    )
+
+    assert requested == ["https://api.example.test/items/42"]
+    assert result["records"][0]["record_id"] == "upstream-42"
+
+
+@pytest.mark.asyncio
 async def test_listing_and_detail_share_cookie_session(monkeypatch):
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/list":
