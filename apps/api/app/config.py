@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:8080,http://localhost:5173"
     access_token_minutes: int = 30
     refresh_token_days: int = 7
+    run_default_deadline_seconds: int = 900
+    run_max_deadline_seconds: int = 3600
+    run_lease_seconds: int = 60
+    run_heartbeat_interval_seconds: int = 5
 
     @property
     def cors_origin_list(self) -> list[str]:

@@ -2,17 +2,30 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
-from workflow_engine import NODE_CATALOG, WorkflowEngine, validate_dag
+from workflow_engine import (
+    NODE_CATALOG,
+    PUBLIC_PHASES,
+    WorkflowEngine,
+    compile_executable_plan,
+    standard_v2_graph,
+    validate_dag,
+)
 from workflow_engine.nodes import validate_json_schema
-from workflow_engine.types import ExecutionContext
+from workflow_engine.types import (
+    ExecutionContext,
+    RunCancelledError,
+    RunDeadlineExceededError,
+    RunLeaseLostError,
+)
 
 from app.audit import audit
 from app.config import get_settings
@@ -53,10 +66,62 @@ from app.schemas import (
 )
 from app.security import decrypt_secret
 from app.services.artifact_storage import ArtifactStorage
+from app.services.authorization import (
+    require_project,
+    require_project_object,
+    require_same_project,
+    scope_to_projects,
+)
+from app.services.run_lifecycle import (
+    claim_run,
+    finalize_owned_run,
+    mark_cancelled_if_owned,
+    should_stop_run,
+)
 from app.services.run_routing import queue_for_graph
 
 router = APIRouter(prefix="/workflows", tags=["Workflows"])
 settings = get_settings()
+
+
+def assert_graph_capability_bindings(db: Session, project_id: str, graph: dict[str, Any]) -> None:
+    """Reject literal credentials and foreign project capability references."""
+    graph_text = json.dumps(graph, ensure_ascii=False)
+    forbidden = ("encrypted_api_key", "encrypted_password", "encrypted_value", "storage_state")
+    if any(f'"{key}"' in graph_text for key in forbidden):
+        raise HTTPException(status_code=422, detail="Workflow configuration must reference project capabilities, not embed credentials")
+    for node in graph.get("nodes", []):
+        config = node.get("config") or node.get("data", {}).get("config", {})
+        node_type = node.get("type") or node.get("data", {}).get("type")
+        if not isinstance(config, dict):
+            continue
+        if node_type == "save_external_db" and config.get("connection"):
+            connection = db.scalar(select(DatabaseConnection).where(DatabaseConnection.project_id == project_id, DatabaseConnection.name == str(config["connection"])))
+            if not connection:
+                raise HTTPException(status_code=422, detail="Database connection is not available in this project")
+        if node_type in {"llm_extract", "llm_classify"} and str(config.get("provider") or "deepseek") != "mock":
+            provider = db.scalar(select(AIProviderConfig).where(AIProviderConfig.project_id == project_id, AIProviderConfig.provider_name == str(config.get("provider") or "deepseek"), AIProviderConfig.enabled.is_(True)))
+            if not provider:
+                raise HTTPException(status_code=422, detail="AI provider is not available in this project")
+        refs = secret_template_references(config)
+        if refs:
+            allowed_nodes = {"http_request", "download_file", "follow_links", "crawl_links"}
+            if node_type not in allowed_nodes or any(path.split(".", 1)[0] not in {"headers", "cookies"} for _, path in refs):
+                raise HTTPException(status_code=422, detail="Secrets may be used only in HTTP authentication headers or cookies")
+            names = {name for name, _ in refs}
+            found = set(db.scalars(select(Secret.name).where(Secret.project_id == project_id, Secret.name.in_(names))).all())
+            if found != names:
+                raise HTTPException(status_code=422, detail="Referenced secret is not available in this project")
+
+
+def secret_template_references(value: Any, path: str = "") -> list[tuple[str, str]]:
+    if isinstance(value, str):
+        return [(name, path) for name in re.findall(r"{{\s*secret\.([A-Za-z_][A-Za-z0-9_]*)\s*}}", value)]
+    if isinstance(value, list):
+        return [item for index, child in enumerate(value) for item in secret_template_references(child, f"{path}.{index}".strip("."))]
+    if isinstance(value, dict):
+        return [item for key, child in value.items() for item in secret_template_references(child, f"{path}.{key}".strip("."))]
+    return []
 
 
 @router.get("/catalog")
@@ -64,17 +129,30 @@ def node_catalog(_: User = Depends(get_current_user)) -> list[dict[str, Any]]:
     return NODE_CATALOG
 
 
+@router.get("/v2-skeleton")
+def v2_skeleton(_: User = Depends(get_current_user)) -> dict[str, Any]:
+    """Expose the fixed public canvas for guided v2 authoring clients."""
+
+    return {
+        "contractVersion": 2,
+        "roles": PUBLIC_PHASES,
+        "graph": standard_v2_graph(),
+    }
+
+
 @router.get("", response_model=list[WorkflowOut])
 def list_workflows(
     project_id: str | None = None,
     include_legacy: bool = False,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> list[Workflow]:
+    if project_id:
+        require_project(db, user, project_id)
     stmt = select(Workflow).order_by(Workflow.updated_at.desc())
     if project_id:
         stmt = stmt.where(Workflow.project_id == project_id)
-    workflows = list(db.scalars(stmt).all())
+    workflows = list(db.scalars(scope_to_projects(stmt, Workflow.project_id, db, user)).all())
     return workflows
 
 
@@ -84,6 +162,8 @@ def create_workflow(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
 ) -> Workflow:
+    require_project(db, user, payload.project_id)
+    assert_graph_capability_bindings(db, payload.project_id, payload.graph_json)
     errors = validate_dag(payload.graph_json)
     if errors:
         raise HTTPException(status_code=422, detail=errors)
@@ -98,11 +178,13 @@ def create_workflow(
 
 @router.post("/import", response_model=WorkflowOut, status_code=201)
 def import_workflow(payload: WorkflowImportRequest, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> Workflow:
+    require_project(db, user, payload.project_id)
     graph = deepcopy(payload.graph_json)
     graph.setdefault("settings", {}).pop("source_id", None)
     errors = validate_dag(graph)
     if errors:
         raise HTTPException(status_code=422, detail=errors)
+    assert_graph_capability_bindings(db, payload.project_id, graph)
     workflow = Workflow(project_id=payload.project_id, name=payload.name, description=payload.description, graph_json=graph)
     db.add(workflow); db.flush()
     audit(db, user.id, "IMPORT", "workflow", workflow.id, after={"name": workflow.name})
@@ -111,8 +193,8 @@ def import_workflow(payload: WorkflowImportRequest, db: Session = Depends(get_db
 
 
 @router.get("/{workflow_id}/export")
-def export_workflow(workflow_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> Response:
-    workflow = db.get(Workflow, workflow_id)
+def export_workflow(workflow_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> Response:
+    workflow = require_project_object(db, user, Workflow, workflow_id, label="Workflow")
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow not found")
     graph = deepcopy(workflow.graph_json)
@@ -128,7 +210,7 @@ def create_from_source(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
 ) -> Workflow:
-    source = db.get(Source, payload.source_id)
+    source = require_project_object(db, user, Source, payload.source_id, label="Source")
     if not source:
         raise HTTPException(status_code=404, detail="Источник не найден")
     # Older clients/profile API calls may store the profiler result separately.
@@ -157,9 +239,9 @@ def create_from_source(
 def get_workflow(
     workflow_id: str,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> Workflow:
-    workflow = db.get(Workflow, workflow_id)
+    workflow = require_project_object(db, user, Workflow, workflow_id, label="Workflow")
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow не найден")
     return workflow
@@ -172,10 +254,11 @@ def update_workflow(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
 ) -> Workflow:
-    workflow = db.get(Workflow, workflow_id)
+    workflow = require_project_object(db, user, Workflow, workflow_id, label="Workflow")
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow не найден")
     if payload.graph_json is not None:
+        assert_graph_capability_bindings(db, workflow.project_id, payload.graph_json)
         errors = validate_dag(payload.graph_json)
         if errors:
             raise HTTPException(status_code=422, detail=errors)
@@ -200,18 +283,29 @@ def update_workflow(
 def validate(
     workflow_id: str,
     db: Session = Depends(get_db),
-    _: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
+    user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
 ) -> dict[str, Any]:
-    workflow = db.get(Workflow, workflow_id)
+    workflow = require_project_object(db, user, Workflow, workflow_id, label="Workflow")
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow не найден")
+    assert_graph_capability_bindings(db, workflow.project_id, workflow.graph_json)
     errors = validate_dag(workflow.graph_json)
     known = {item["type"] for item in NODE_CATALOG}
     for node in workflow.graph_json.get("nodes", []):
         node_type = node.get("type") or node.get("data", {}).get("type")
         if node_type not in known:
             errors.append(f"Неизвестный тип узла: {node_type}")
-    return {"valid": not errors, "errors": errors}
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "contract_version": workflow.graph_json.get(
+            "contractVersion", (workflow.graph_json.get("settings") or {}).get("contractVersion", 1)
+        ),
+        "public_phases": [
+            (item.get("type") or item.get("data", {}).get("type"))
+            for item in workflow.graph_json.get("nodes", [])
+        ],
+    }
 
 
 @router.post("/{workflow_id}/publish", response_model=WorkflowOut)
@@ -220,12 +314,13 @@ def publish(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
 ) -> Workflow:
-    workflow = db.get(Workflow, workflow_id)
+    workflow = require_project_object(db, user, Workflow, workflow_id, label="Workflow")
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow не найден")
     errors = validate_dag(workflow.graph_json)
     if errors:
         raise HTTPException(status_code=422, detail=errors)
+    assert_graph_capability_bindings(db, workflow.project_id, workflow.graph_json)
     # WorkflowVersion is the immutable draft revision created by PATCH.  A
     # publication must point at that same revision, not at a separate counter:
     # otherwise the counters eventually collide and a newly published graph can
@@ -260,8 +355,12 @@ async def test_node(
     user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER", "OPERATOR")),
 ) -> dict[str, Any]:
     graph = node_test_graph(payload)
-    source = db.get(Source, payload.source_id) if payload.source_id else None
-    variables, secrets = build_execution_variables(db, source)
+    source = require_project_object(db, user, Source, payload.source_id, label="Source") if payload.source_id else None
+    if source:
+        assert_graph_capability_bindings(db, source.project_id, graph)
+    elif secret_template_references(graph):
+        raise HTTPException(status_code=422, detail="Node test with secrets requires a project source")
+    variables, secrets, capabilities = build_execution_variables(db, source, graph)
     context = ExecutionContext(
         run_id="node-test",
         project_id=source.project_id if source else "test",
@@ -269,9 +368,107 @@ async def test_node(
         user_id=user.id,
         variables={**variables, **payload.inputs},
         secrets=secrets,
+        capabilities=capabilities,
         artifact_storage=ArtifactStorage(),
     )
-    return await WorkflowEngine().execute(graph, context, payload.inputs)
+    result = await WorkflowEngine().execute(graph, context, payload.inputs)
+    return compact_node_test_result(result) if payload.response_preview else result
+
+
+def compact_node_test_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Return UI-safe node-test evidence without sending rendered pages twice.
+
+    Node tests retain raw pages as artifacts.  Sending every raw HTML page in
+    the synchronous JSON response makes the browser inspector unresponsive on
+    normal public listings, so the UI receives a bounded diagnostic preview
+    while records, counts, URLs and artifact references stay intact.
+    """
+    def compact(value: Any, depth: int = 0) -> Any:
+        if depth >= 6:
+            return "… nested value omitted from preview"
+        if isinstance(value, str):
+            if len(value) > 2_000:
+                return f"{value[:2_000]}\n… preview truncated ({len(value):,} characters total); use retained artifact for raw content."
+            return value
+        if isinstance(value, list):
+            items = [compact(item, depth + 1) for item in value[:25]]
+            if len(value) > 25:
+                items.append({"_preview": f"{len(value) - 25} more items omitted"})
+            return items
+        if isinstance(value, dict):
+            item = {str(key): compact(child, depth + 1) for key, child in list(value.items())[:50]}
+            if len(value) > 50:
+                item["_preview"] = f"{len(value) - 50} more keys omitted"
+            return item
+        return value
+
+    # The full upstream envelopes are useful to the engine but exceptionally
+    # noisy in the editor (the Source object can include profiler evidence
+    # such as XHR payloads).  Keep a compact node-by-node inspection surface;
+    # JSONPath still receives a bounded upstream ``body`` preview.
+    def node_preview(output: Any) -> dict[str, Any]:
+        if not isinstance(output, dict):
+            return {"value": compact(output)}
+        records = output.get("records")
+        if isinstance(records, list):
+            # Detail traversal places the full fetched response in every
+            # record for the following Extract phase.  Raw files/pages are
+            # already retained as artifacts; duplicating them in the node-test
+            # response is neither useful nor responsive in the editor.
+            preview_records: list[Any] = []
+            for row in records[:25]:
+                if not isinstance(row, dict):
+                    preview_records.append(compact(row))
+                    continue
+                preview = {
+                    str(key): compact(value)
+                    for key, value in row.items()
+                    if key not in {"body", "html", "content_base64"}
+                }
+                if any(key in row for key in {"body", "html", "content_base64"}):
+                    preview["_raw_content"] = "retained as an artifact; omitted from node-test preview"
+                preview_records.append(preview)
+            if len(records) > 25:
+                preview_records.append({"_preview": f"{len(records) - 25} more items omitted"})
+        else:
+            preview_records = compact(records) if records is not None else None
+        pages = output.get("pages")
+        if isinstance(pages, list):
+            preview_pages = [
+                {
+                    key: compact(page[key])
+                    for key in ("url", "state", "origin", "status", "content_type", "artifacts")
+                    if isinstance(page, dict) and key in page
+                }
+                for page in pages[:25]
+            ]
+            if len(pages) > 25:
+                preview_pages.append({"_preview": f"{len(pages) - 25} more pages omitted"})
+        else:
+            preview_pages = None
+        visible_keys = (
+            "url", "title", "content_type", "count", "partial", "errors",
+            "body", "text", "traversal",
+            "artifacts", "_contract", "_adaptive_attempts",
+        )
+        preview = {key: compact(output[key]) for key in visible_keys if key in output}
+        if records is not None:
+            preview["records"] = preview_records
+        if pages is not None:
+            preview["pages"] = preview_pages
+        return preview
+
+    return {
+        "node_outputs": {
+            str(node_id): node_preview(output)
+            for node_id, output in (result.get("node_outputs") or {}).items()
+        },
+        "result": node_preview(result.get("result")),
+        "result_node_id": result.get("result_node_id"),
+        "skipped_nodes": compact(result.get("skipped_nodes") or []),
+        "artifacts": compact(result.get("artifacts") or []),
+        "logs": compact(result.get("logs") or []),
+    }
 
 
 def node_test_graph(payload: NodeTestRequest) -> dict[str, Any]:
@@ -310,6 +507,7 @@ def node_test_graph(payload: NodeTestRequest) -> dict[str, Any]:
         stack.extend(incoming.get(current, []))
     return {
         "version": payload.graph.get("version", 1),
+        "contractVersion": payload.graph.get("contractVersion", payload.graph.get("settings", {}).get("contractVersion", 1)),
         "settings": payload.graph.get("settings", {}),
         "nodes": [node for node in payload.graph.get("nodes", []) if str(node.get("id")) in included],
         "edges": [
@@ -319,128 +517,56 @@ def node_test_graph(payload: NodeTestRequest) -> dict[str, Any]:
     }
 
 
-def _source_extractor_config(source: Source) -> dict[str, Any]:
-    """Return the profiler suggestion plus explicit source overrides.
-
-    Source settings are intentionally JSON: users can edit them in the
-    workflow editor and a new site never requires a bank-specific code change.
-    """
-    settings = source.settings if isinstance(source.settings, dict) else {}
-    profile = settings.get("profile") if isinstance(settings.get("profile"), dict) else {}
-    configured = settings.get("extractor") if isinstance(settings.get("extractor"), dict) else {}
-    profile_extractor = profile.get("extractor") if isinstance(profile.get("extractor"), dict) else {}
-    candidates = profile.get("repeating_candidates") if isinstance(profile.get("repeating_candidates"), list) else []
-    candidate = configured.get("candidate") if isinstance(configured.get("candidate"), dict) else None
-    if not candidate:
-        usable = [item for item in candidates if isinstance(item, dict) and item.get("selector")]
-        candidate = max(usable, key=lambda item: (len(item.get("fields") or []), int(item.get("count") or 0)), default={})
-    container_selector = str(configured.get("container_selector") or profile_extractor.get("container_selector") or candidate.get("selector") or "")
-    fields = configured.get("fields") if isinstance(configured.get("fields"), list) else profile_extractor.get("fields") if isinstance(profile_extractor.get("fields"), list) else candidate.get("fields")
-    fields = [dict(item) for item in (fields or []) if isinstance(item, dict) and item.get("name") and item.get("selector")]
-    if not fields and container_selector:
-        fields = [{"name": "url", "selector": "a[href]", "attribute": "href"}]
-    link_field = next((item for item in fields if item.get("name") in {"url", "link", "href"} and item.get("attribute") == "href"), None)
-    if link_field and link_field.get("name") != "url":
-        link_field = {**link_field, "name": "url"}
-        fields = [link_field if item.get("name") in {"link", "href"} else item for item in fields]
-    detail = configured.get("detail") if isinstance(configured.get("detail"), dict) else settings.get("detail")
-    if not isinstance(detail, dict):
-        detail = {}
-    return {
-        "container_selector": container_selector,
-        "fields": fields,
-        "follow_links": bool(configured.get("follow_links", settings.get("follow_links", profile_extractor.get("follow_links", bool(link_field))))),
-        "detail": detail,
-    }
-
-
 def build_source_template(source: Source, template: str) -> dict[str, Any]:
-    fetch_type = "browser_open" if source.fetch_mode == "PLAYWRIGHT" else "download_file" if source.fetch_mode == "DOCUMENT" else "http_request"
-    fetch_config: dict[str, Any] = {"url": "{{source.url}}", "timeout": source.settings.get("timeout", 45)}
-    if source.fetch_mode == "XHR_JSON":
-        fetch_config.update(source.settings.get("http_request") or {})
-        nodes = [
-            {"id": "trigger", "type": "manual_trigger", "position": {"x": 20, "y": 160}, "config": {}},
-            {"id": "fetch", "type": "http_request", "position": {"x": 280, "y": 160}, "config": fetch_config},
-            {"id": "json", "type": "json_path", "position": {"x": 540, "y": 160}, "config": {"input_path": "body", "path": "$"}},
-            {"id": "mapping", "type": "mapping", "position": {"x": 690, "y": 160}, "config": {"input_path": "records", "fields": []}},
-            {"id": "output", "type": "output", "position": {"x": 900, "y": 160}, "config": {"input_path": "records"}},
-        ]
-        edges = [
-            {"id": "e-trigger-fetch", "source": "trigger", "target": "fetch"},
-            {"id": "e-fetch-json", "source": "fetch", "target": "json"},
-            {"id": "e-json-mapping", "source": "json", "target": "mapping"}, {"id": "e-mapping-output", "source": "mapping", "target": "output"},
-        ]
-        return {"version": 1, "settings": {"source_id": source.id, "review_policy": {"new": True, "changed": True, "confidence_below": 0.8}}, "nodes": nodes, "edges": edges}
-    extractor = _source_extractor_config(source)
-    nodes: list[dict[str, Any]] = [
-        {"id": "trigger", "type": "manual_trigger", "position": {"x": 20, "y": 160}, "config": {}},
-        {"id": "fetch", "type": fetch_type, "position": {"x": 240, "y": 160}, "config": fetch_config},
-    ]
-    edges: list[dict[str, Any]] = [{"id": "e-trigger-fetch", "source": "trigger", "target": "fetch"}]
-    if fetch_type == "download_file":
-        nodes.extend([
-            {"id": "parse", "type": "parse_document", "position": {"x": 480, "y": 160}, "config": {"input_path": "content_base64", "filename_path": "filename"}},
-            {"id": "mapping", "type": "mapping", "position": {"x": 620, "y": 160}, "config": {"input_path": "records", "fields": []}},
-            {"id": "output", "type": "output", "position": {"x": 820, "y": 160}, "config": {"input_path": "records"}},
-        ])
+    """Create the portable seven-phase starter for a newly selected Source.
+
+    Source profiling remains advisory: a site-specific selector is never
+    copied into the graph without an operator decision in the v2 editor.
+    This endpoint is retained for older clients, but it no longer creates a
+    legacy chain with hidden site-dependent behaviour.
+    """
+
+    del template
+    graph = standard_v2_graph(settings={
+        "source_id": source.id,
+        "review_policy": {"new": True, "changed": True, "confidence_below": 0.8},
+    })
+    nodes = {node["id"]: node for node in graph["nodes"]}
+    common = {
+        "contractVersion": 2,
+        "mode": "AUTO",
+        "budgets": {"maxRequests": 50, "maxBytes": 20_000_000, "maxPages": 25, "maxItems": 500, "deadlineSeconds": 600},
+        "successCriteria": [],
+        "errorPolicy": "FAIL_REQUIRED_SCOPE",
+        "evidencePolicy": {"retainRaw": True, "retainAttempts": True},
+    }
+    def configure(node_id: str, *, goal: str, allow: list[str], prefer: list[str] | None = None, **config: Any) -> None:
+        nodes[node_id]["config"] = {
+            **common,
+            "goal": goal,
+            "strategies": {"allow": allow, "deny": [], "prefer": prefer or [], "fallbackPolicy": "ON_POSTCONDITION_FAILURE"},
+            **config,
+        }
+
+    if source.fetch_mode == "DOCUMENT":
+        configure("acquire", goal="Скачать публичный документ", allow=["acquire-file"], prefer=["acquire-file"], url="{{source.url}}", timeout=60)
+        configure("traverse", goal="Передать документ на извлечение", allow=["traverse-links"], pagination={"enabled": False}, detail={"enabled": False})
+        configure("extract", goal="Извлечь записи из документа", allow=["extract-document"], document={"inputPath": "content_base64", "filenamePath": "filename", "header_row": 0, "ocr": False})
+    elif source.fetch_mode == "XHR_JSON":
+        request = source.settings.get("http_request") if isinstance(source.settings, dict) and isinstance(source.settings.get("http_request"), dict) else {}
+        configure("acquire", goal="Получить публичное JSON-представление", allow=["acquire-api", "acquire-browser-xhr"], prefer=["acquire-api"], url="{{source.url}}", timeout=45, endpoint="", xhr={"urlContains": "", "path": ""}, **{key: value for key, value in request.items() if key in {"method", "headers", "query_params", "json_body", "timeout"}})
+        configure("traverse", goal="Передать JSON на извлечение", allow=["traverse-links"], pagination={"enabled": False, "mode": "next", "maxPages": 25}, detail={"enabled": False})
+        configure("extract", goal="Извлечь JSON-записи", allow=["extract-json"], json={"inputPath": "body", "path": "$.items[*]"})
     else:
-        # Prefer profiler-generated selectors.  With no repeating candidate we
-        # still create a useful, editable link collector instead of demo CSS.
-        if extractor["container_selector"]:
-            parse_node = {"id": "parse", "type": "parse_html", "position": {"x": 480, "y": 160}, "config": {"input_path": "body"}}
-            extract_node = {"id": "extract", "type": "extract_repeating_list", "position": {"x": 700, "y": 160}, "config": {"input_path": "html", "container_selector": extractor["container_selector"], "fields": extractor["fields"]}}
-            nodes.extend([parse_node, extract_node])
-            edges.extend([{ "id": "e-fetch-parse", "source": "fetch", "target": "parse" }, {"id": "e-parse-extract", "source": "parse", "target": "extract"}])
-            previous = "extract"
-        else:
-            select_node = {"id": "select", "type": "select_elements", "position": {"x": 540, "y": 160}, "config": {"input_path": "body", "selector": str(extractor.get("selector") or "a[href]"), "attribute": str(extractor.get("attribute") or "href")}}
-            nodes.append(select_node)
-            edges.append({"id": "e-fetch-select", "source": "fetch", "target": "select"})
-            previous = "select"
-
-        if extractor["follow_links"]:
-            detail = extractor["detail"]
-            follow_config = {"input_collection": "records", "url_field": "url", "merge_mode": "MERGE_PARENT_CHILD", "max_pages": int(detail.get("max_pages", 50)), "detail_fields": detail.get("fields", [])}
-            if detail.get("table"):
-                follow_config["detail_table"] = detail["table"]
-            nodes.append({"id": "follow", "type": "follow_links", "position": {"x": 900, "y": 160}, "config": follow_config})
-            edges.append({"id": "e-extract-follow", "source": previous, "target": "follow"})
-            previous = "follow"
-
-        names = [str(item.get("name")) for item in extractor["fields"] if item.get("name")]
-        for name in extractor["detail"].get("field_names", []):
-            if name not in names:
-                names.append(str(name))
-        operations = []
-        if "rate" in names:
-            operations.append({"type": "rate", "field": "rate"})
-        if "term" in names:
-            operations.append({"type": "term", "field": "term"})
-        if "currency" in names:
-            operations.append({"type": "currency", "field": "currency"})
-        nodes.append({"id": "transform", "type": "transform", "position": {"x": 1080, "y": 160}, "config": {"input_path": "records", "operations": operations}})
-        edges.append({"id": "e-previous-transform", "source": previous, "target": "transform"})
-        mapping_fields = [{"target": name, "source_path": name} for name in names]
-        if "rate" in names:
-            mapping_fields.extend([{"target": "rate_value", "source_path": "rate_value"}])
-        if "term" in names:
-            mapping_fields.extend([
-                {"target": "term_min_days", "source_path": "term_min_days"},
-                {"target": "term_max_days", "source_path": "term_max_days"},
-            ])
-        nodes.append({"id": "mapping", "type": "mapping", "position": {"x": 1260, "y": 160}, "config": {"input_path": "records", "fields": mapping_fields}})
-        edges.append({"id": "e-transform-mapping", "source": "transform", "target": "mapping"})
-        key_fields = ["url"] if "url" in names else ([names[0]] if names else ["value"])
-        nodes.append({"id": "output", "type": "output", "position": {"x": 1440, "y": 160}, "config": {"input_path": "records", "natural_key_fields": key_fields, "on_empty": "warning"}})
-        edges.append({"id": "e-mapping-output", "source": "mapping", "target": "output"})
-        return {"version": 1, "settings": {"source_id": source.id, "review_policy": {"new": True, "changed": True, "confidence_below": 0.8}}, "nodes": nodes, "edges": edges}
-    edges.extend([
-        {"id": "e-fetch-parse", "source": "fetch", "target": "parse"},
-        {"id": "e-parse-mapping", "source": "parse", "target": "mapping"},
-        {"id": "e-mapping-output", "source": "mapping", "target": "output"},
-    ])
-    return {"version": 1, "settings": {"source_id": source.id, "review_policy": {"new": True, "changed": True, "confidence_below": 0.8}}, "nodes": nodes, "edges": edges}
+        browser = source.fetch_mode == "PLAYWRIGHT"
+        configure("acquire", goal="Получить публичное представление источника", allow=["acquire-browser"] if browser else ["acquire-http", "acquire-browser"], prefer=["acquire-browser"] if browser else ["acquire-http"], url="{{source.url}}", method="GET", timeout=45)
+        configure("traverse", goal="Передать HTML на извлечение", allow=["traverse-links"], pagination={"enabled": False, "mode": "next", "maxPages": 25}, detail={"enabled": False})
+        configure("extract", goal="Извлечь HTML-карточки", allow=["extract-dom"], dom={"inputPath": "body", "itemSelector": "", "fields": []})
+    configure("start", goal="Контекст ручного запуска", allow=["start-input"])
+    configure("process", goal="Нормализовать записи", allow=["process-operations"], input_path="records", operations=[], identityFields=[])
+    configure("assure", goal="Проверить полноту результата", allow=["assure-validation"], input_path="records", required=[], schema={}, fail_on_error=False, expectedScope={"allowEmpty": False, "requireComplete": False})
+    configure("output", goal="Сохранить явно извлечённые записи", allow=["output-dataset"], input_path="records", natural_key_fields=["url"], on_empty="warning", name="records")
+    return graph
 
 
 def persist_result(db: Session, workflow: Workflow, run: Run, result: dict[str, Any]) -> dict[str, Any]:
@@ -767,7 +893,11 @@ def active_graph(db: Session, workflow: Workflow, workflow_version: int) -> dict
     return version.graph_json if version else workflow.graph_json
 
 
-def build_execution_variables(db: Session, source: Source | None) -> tuple[dict[str, Any], dict[str, str]]:
+def build_execution_variables(
+    db: Session,
+    source: Source | None,
+    graph: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
     variables: dict[str, Any] = {
         "source": {
             "id": source.id if source else None,
@@ -778,34 +908,61 @@ def build_execution_variables(db: Session, source: Source | None) -> tuple[dict[
             "settings": source.settings if source else {},
         },
         "deepseek_base_url": settings.deepseek_base_url,
-        "ai_providers": {},
-        "database_connections": {},
     }
     secrets: dict[str, str] = {"_CRAWL_RESUME_SECRET": settings.app_secret_key}
-    for secret in db.scalars(select(Secret)).all():
-        secrets[secret.name] = decrypt_secret(secret.encrypted_value)
-    if settings.deepseek_api_key:
+    capabilities: dict[str, Any] = {"ai_providers": {}, "database_connections": {}}
+    project_id = source.project_id if source else None
+    secret_names = {name for name, _ in secret_template_references(graph or {})}
+    connection_names = {
+        str(node.get("config", {}).get("connection"))
+        for node in (graph or {}).get("nodes", [])
+        if (node.get("type") or node.get("data", {}).get("type")) == "save_external_db"
+        and str(node.get("config", {}).get("connection") or "")
+    }
+    provider_names = {
+        str(node.get("config", {}).get("provider") or "deepseek")
+        for node in (graph or {}).get("nodes", [])
+        if (node.get("type") or node.get("data", {}).get("type")) in {"llm_extract", "llm_classify"}
+    }
+    if project_id:
+        for secret in db.scalars(select(Secret).where(Secret.project_id == project_id, Secret.name.in_(secret_names))).all():
+            secrets[secret.name] = decrypt_secret(secret.encrypted_value)
+    if settings.deepseek_api_key and not project_id:
         secrets.setdefault("DEEPSEEK_API_KEY", settings.deepseek_api_key)
     from app.routers.settings import connection_url
-    for connection in db.scalars(select(DatabaseConnection).where(DatabaseConnection.enabled.is_(True))).all():
-        variables["database_connections"][connection.name] = {
-            "url": connection_url(connection),
+    if project_id:
+        connections = db.scalars(select(DatabaseConnection).where(DatabaseConnection.project_id == project_id, DatabaseConnection.enabled.is_(True), DatabaseConnection.name.in_(connection_names))).all()
+    else:
+        connections = []
+    for connection in connections:
+        password = decrypt_secret(connection.encrypted_password) if connection.encrypted_password else ""
+        if password:
+            secrets[f"_CONNECTION_{connection.id}_PASSWORD"] = password
+        connection_string = connection_url(connection)
+        secrets[f"_CONNECTION_{connection.id}_URL"] = connection_string
+        capabilities["database_connections"][connection.name] = {
+            "url": connection_string,
             "engine": connection.engine,
             "schema": connection.schema_name,
             "allowed_tables": connection.allowed_tables,
         }
-    for provider in db.scalars(select(AIProviderConfig).where(AIProviderConfig.enabled.is_(True))).all():
+    if project_id:
+        providers = db.scalars(select(AIProviderConfig).where(AIProviderConfig.project_id == project_id, AIProviderConfig.enabled.is_(True), AIProviderConfig.provider_name.in_(provider_names))).all()
+    else:
+        providers = []
+    for provider in providers:
         api_key = decrypt_secret(provider.encrypted_api_key) if provider.encrypted_api_key else ""
-        variables["ai_providers"][provider.provider_name] = {
+        capabilities["ai_providers"][provider.provider_name] = {
             "base_url": provider.base_url,
             "default_model": provider.default_model,
             "timeout": provider.timeout,
-            "api_key": api_key,
         }
         if api_key:
             secrets[f"AI_PROVIDER_{provider.provider_name}"] = api_key
     if source and source.settings.get("browser_profile_id"):
         profile = db.get(BrowserProfile, source.settings["browser_profile_id"])
+        if profile is None or profile.project_id != source.project_id or not profile.enabled:
+            raise ValueError("Configured browser profile is unavailable in this project")
         if profile:
             storage_state: dict[str, Any] | None = None
             if profile.encrypted_storage_state:
@@ -814,25 +971,37 @@ def build_execution_variables(db: Session, source: Source | None) -> tuple[dict[
                     storage_state = decoded if isinstance(decoded, dict) else None
                 except (ValueError, TypeError, json.JSONDecodeError):
                     storage_state = None
-            variables["browser_profile"] = {"viewport": profile.viewport, "locale": profile.locale, "timezone": profile.timezone, "user_agent": profile.user_agent, "proxy": profile.proxy, "storage_state": storage_state}
-    return variables, secrets
+            for value in nested_strings({"storage_state": storage_state, "proxy": profile.proxy}):
+                secrets[f"_BROWSER_{profile.id}_{len(secrets)}"] = value
+            capabilities["browser_profile"] = {"viewport": profile.viewport, "locale": profile.locale, "timezone": profile.timezone, "user_agent": profile.user_agent, "proxy": profile.proxy, "storage_state": storage_state}
+    return variables, secrets, capabilities
+
+
+def nested_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [item for child in value for item in nested_strings(child)]
+    if isinstance(value, dict):
+        return [item for child in value.values() for item in nested_strings(child)]
+    return []
 
 
 async def execute_run(run_id: str) -> None:
     db = SessionLocal()
-    run: Run | None = None
+    lease_token: str | None = None
+    secrets: dict[str, str] = {}
     try:
+        lease_token = claim_run(db, run_id)
+        if lease_token is None:
+            return
         run = db.get(Run, run_id)
         workflow = db.get(Workflow, run.workflow_id) if run else None
         if not run or not workflow:
             return
-        if run.status == "CANCELLED":
-            return
-        run.status = "RUNNING"
-        run.started_at = datetime.now(UTC)
-        db.commit()
         source = db.get(Source, run.source_id) if run.source_id else None
-        variables, secrets = build_execution_variables(db, source)
+        graph = active_graph(db, workflow, run.workflow_version)
+        variables, secrets, capabilities = build_execution_variables(db, source, graph)
         variables.update(run.input_json)
         clock_meta = run.input_json.get("_run_clock", {})
         effective_clock = datetime.fromisoformat(clock_meta["effective"].replace("Z", "+00:00")) if clock_meta.get("effective") else datetime.now(UTC)
@@ -843,10 +1012,18 @@ async def execute_run(run_id: str) -> None:
             user_id=run.created_by,
             variables=variables,
             secrets=secrets,
+            capabilities=capabilities,
             artifact_storage=ArtifactStorage(),
             effective_run_clock=effective_clock,
+            deadline_at=run.deadline_at,
+            heartbeat_interval_seconds=max(0.2, float(settings.run_heartbeat_interval_seconds)),
+            executable_plan=run.executable_plan_json or None,
         )
-        graph = active_graph(db, workflow, run.workflow_version)
+
+        async def stop_check() -> str | None:
+            return should_stop_run(db, run_id, lease_token)
+
+        context.stop_check = stop_check
 
         async def callback(node_id: str, node_type: str, input_json: dict[str, Any], output_json: dict[str, Any], duration_ms: int, error: dict[str, Any]) -> None:
             status = "FAILED" if error else "SUCCESS"
@@ -874,29 +1051,76 @@ async def execute_run(run_id: str) -> None:
 
         initial_inputs = {**run.input_json, "source": variables["source"]}
         result = await WorkflowEngine().execute(graph, context, initial_inputs, callback)
+        stop_reason = should_stop_run(db, run_id, lease_token)
+        if stop_reason == "CANCELLED":
+            raise RunCancelledError("Run cancellation was requested")
+        if stop_reason == "DEADLINE_EXCEEDED":
+            raise RunDeadlineExceededError("Run deadline was exceeded")
+        if stop_reason == "LEASE_LOST":
+            raise RunLeaseLostError("Run lease was lost")
         for artifact in context.artifacts:
             if artifact.get("storage_key"):
                 db.add(RawDocument(run_id=run.id, source_id=run.source_id, url=artifact.get("url", ""), content_type=artifact.get("content_type", ""), sha256=artifact.get("sha256", ""), storage_key=artifact["storage_key"], metadata_json={key: value for key, value in artifact.items() if key != "storage_key"}))
         db.flush()
         persistence = persist_result(db, workflow, run, result)
-        run.output_json = {**result, "persistence": persistence}
-        run.status = determine_run_status(graph, result, persistence)
+        output_json = {**result, "persistence": persistence}
+        error_json: dict[str, Any] | None = None
         if persistence.get("blocked"):
-            run.error_json = {
+            error_json = {
                 "code": "PERSISTENCE_BLOCKED",
                 "message": persistence.get("warning") or "Dataset persistence validation failed",
                 "details": persistence.get("validation_errors") or [],
             }
-        run.finished_at = datetime.now(UTC)
+        if not finalize_owned_run(
+            db,
+            run_id,
+            lease_token,
+            status=determine_run_status(graph, result, persistence),
+            output_json=output_json,
+            error_json=error_json,
+        ):
+            # The competing cancellation transition wins.  Rolling back also
+            # prevents a half-completed persistence transaction from escaping.
+            db.rollback()
+            mark_cancelled_if_owned(db, run_id, lease_token)
         db.commit()
+    except RunCancelledError:
+        db.rollback()
+        if lease_token:
+            mark_cancelled_if_owned(db, run_id, lease_token)
+            db.commit()
+    except RunDeadlineExceededError:
+        db.rollback()
+        if lease_token:
+            if finalize_owned_run(
+                db,
+                run_id,
+                lease_token,
+                status="TIMED_OUT",
+                error_json={"code": "RUN_DEADLINE_EXCEEDED", "message": "Run deadline was exceeded"},
+            ):
+                db.commit()
+            else:
+                db.rollback()
+                mark_cancelled_if_owned(db, run_id, lease_token)
+                db.commit()
+    except RunLeaseLostError:
+        db.rollback()
     except Exception as exc:
         db.rollback()
-        failed_run = db.get(Run, run_id)
-        if failed_run:
-            failed_run.status = "FAILED"
-            failed_run.error_json = {"code": "WORKFLOW_ERROR", "message": str(exc)}
-            failed_run.finished_at = datetime.now(UTC)
-            db.commit()
+        if lease_token:
+            from workflow_engine.redaction import redact_value
+
+            error_json = redact_value(
+                {"code": "WORKFLOW_ERROR", "message": str(exc)},
+                list(secrets.values()),
+            )
+            if finalize_owned_run(db, run_id, lease_token, status="FAILED", error_json=error_json):
+                db.commit()
+            else:
+                db.rollback()
+                mark_cancelled_if_owned(db, run_id, lease_token)
+                db.commit()
     finally:
         db.close()
 
@@ -908,11 +1132,14 @@ async def run_workflow(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER", "OPERATOR")),
 ) -> Run:
-    workflow = db.get(Workflow, workflow_id)
+    workflow = require_project_object(db, user, Workflow, workflow_id, label="Workflow")
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow не найден")
     source_id = payload.source_id or workflow.graph_json.get("settings", {}).get("source_id")
-    if source_id and not db.get(Source, source_id):
+    if source_id:
+        source = require_project_object(db, user, Source, source_id, label="Source")
+        require_same_project(workflow.project_id, source)
+    if source_id and not source:  # pragma: no cover - defensive invariant
         raise HTTPException(status_code=404, detail="Источник не найден")
     # A user-triggered run must validate exactly what is on the canvas after
     # Save.  Background schedules still create their runs from the published
@@ -921,6 +1148,10 @@ async def run_workflow(
         raise HTTPException(status_code=422, detail="Опубликованная версия отсутствует: сначала нажмите «Опубликовать»")
     run_version = workflow.published_version if payload.use_published else workflow.version
     graph = active_graph(db, workflow, run_version)
+    assert_graph_capability_bindings(db, workflow.project_id, graph)
+    errors = validate_dag(graph)
+    if errors:
+        raise HTTPException(status_code=422, detail=errors)
     if "{{source." in json.dumps(graph, ensure_ascii=False) and not source_id:
         raise HTTPException(status_code=422, detail="Выберите источник запуска: этот workflow использует URL источника")
     try:
@@ -934,7 +1165,26 @@ async def run_workflow(
     else:
         clock = datetime.now(zone)
     run_inputs = {**payload.inputs, "_run_clock": {"mode": payload.run_clock_mode, "timezone": payload.timezone, "effective": clock.isoformat()}}
-    run = Run(workflow_id=workflow.id, workflow_version=run_version, source_id=source_id, input_json=run_inputs, created_by=user.id)
+    requested_deadline = payload.deadline_seconds or settings.run_default_deadline_seconds
+    if not 1 <= requested_deadline <= settings.run_max_deadline_seconds:
+        raise HTTPException(status_code=422, detail="deadline_seconds is outside the allowed run budget")
+    plan = compile_executable_plan(
+        graph,
+        project_id=workflow.project_id,
+        workflow_id=workflow.id,
+        workflow_version=run_version,
+        source_id=source_id,
+        revision_refs=graph.get("settings", {}).get("presetRefs", {}),
+    )
+    run = Run(
+        workflow_id=workflow.id,
+        workflow_version=run_version,
+        source_id=source_id,
+        input_json=run_inputs,
+        created_by=user.id,
+        deadline_at=datetime.now(UTC) + timedelta(seconds=requested_deadline),
+        executable_plan_json=plan.as_dict(),
+    )
     db.add(run)
     db.commit()
     db.refresh(run)
@@ -959,7 +1209,7 @@ async def run_workflow_for_all_sources(
     raw artifacts, failures and retry controls while writing all results into
     the workflow's single output dataset.
     """
-    workflow = db.get(Workflow, workflow_id)
+    workflow = require_project_object(db, user, Workflow, workflow_id, label="Workflow")
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow not found")
     if payload.use_published and not workflow.published_version:
@@ -978,6 +1228,25 @@ async def run_workflow_for_all_sources(
     if not sources:
         raise HTTPException(status_code=422, detail="No public enabled sources in this project")
     run_version = workflow.published_version if payload.use_published else workflow.version
+    graph = active_graph(db, workflow, run_version)
+    assert_graph_capability_bindings(db, workflow.project_id, graph)
+    errors = validate_dag(graph)
+    if errors:
+        raise HTTPException(status_code=422, detail=errors)
+    requested_deadline = payload.deadline_seconds or settings.run_default_deadline_seconds
+    if not 1 <= requested_deadline <= settings.run_max_deadline_seconds:
+        raise HTTPException(status_code=422, detail="deadline_seconds is outside the allowed run budget")
+    plan_by_source = {
+        source.id: compile_executable_plan(
+            graph,
+            project_id=workflow.project_id,
+            workflow_id=workflow.id,
+            workflow_version=run_version,
+            source_id=source.id,
+            revision_refs=graph.get("settings", {}).get("presetRefs", {}),
+        ).as_dict()
+        for source in sources
+    }
     runs = [
         Run(
             workflow_id=workflow.id,
@@ -985,6 +1254,8 @@ async def run_workflow_for_all_sources(
             source_id=source.id,
             input_json={**payload.inputs, "batch": True, "_run_clock": {"mode": payload.run_clock_mode, "timezone": payload.timezone, "effective": clock.isoformat()}},
             created_by=user.id,
+            deadline_at=datetime.now(UTC) + timedelta(seconds=requested_deadline),
+            executable_plan_json=plan_by_source[source.id],
         )
         for source in sources
     ]

@@ -1,18 +1,32 @@
 from copy import deepcopy
 
 from app.routers.workflow_templates import SYSTEM_TEMPLATES, _clean_graph, _template_issues
+from workflow_engine import PUBLIC_PHASES, compile_executable_plan, validate_dag
 from workflow_engine.nodes import CrawlLinksNode, extract_article_record
 
 
 def test_system_templates_have_no_literal_source_bindings():
     for template in SYSTEM_TEMPLATES:
-        issues = _template_issues(template["graph_json"])
-        if template.get("site_preset"):
-            assert "site-preset" in template["tags"]
-            assert issues
-            assert all(issue.startswith("literal URL at ") for issue in issues)
-        else:
-            assert issues == []
+        graph = template["graph_json"]
+        assert _template_issues(graph) == []
+        assert graph["contractVersion"] == 2
+        assert [node["type"] for node in graph["nodes"]] == list(PUBLIC_PHASES)
+        assert validate_dag(graph) == []
+
+
+def test_system_templates_compile_to_portable_v2_execution_plans():
+    for template in SYSTEM_TEMPLATES:
+        plan = compile_executable_plan(
+            template["graph_json"],
+            project_id="project-1",
+            workflow_id=template["id"],
+            workflow_version=1,
+            source_id="source-1",
+        )
+
+        assert plan.contract_version == 2
+        assert [node.phase for node in plan.nodes] == list(PUBLIC_PHASES.values())
+        assert "https://" not in str(plan.as_dict())
 
 
 def test_clean_graph_removes_site_specific_crawl_settings():
@@ -59,6 +73,47 @@ def test_clean_graph_removes_site_specific_crawl_settings():
     assert "dataset_id" not in output
     assert output["natural_key_fields"] == ["url"]
     assert output["name"] == "records"
+    assert _template_issues(cleaned) == []
+
+
+def test_clean_graph_removes_v2_selectors_endpoints_and_mapping_but_keeps_public_capabilities():
+    graph = {
+        "contractVersion": 2,
+        "settings": {"source_id": "source-1", "dataset_id": "dataset-1", "presetRefs": {"sourcePreset": "one"}},
+        "nodes": [
+            {"id": "acquire", "type": "http_request", "config": {
+                "contractVersion": 2,
+                "strategies": {"allow": ["acquire-api", "acquire-browser-xhr"]},
+                "endpoint": "https://api.example.test/v1/items",
+                "xhr": {"urlContains": "/v1/items", "path": "$.data"},
+                "headers": {"X-Source": "one"},
+            }},
+            {"id": "traverse", "type": "crawl_links", "config": {
+                "contractVersion": 2,
+                "strategies": {"allow": ["traverse-browser"]},
+                "browserTraversal": {"listing": {"itemSelector": ".offer", "fields": [{"name": "title"}]}},
+            }},
+            {"id": "extract", "type": "mapping", "config": {
+                "contractVersion": 2,
+                "strategies": {"allow": ["extract-dom"]},
+                "dom": {"itemSelector": ".offer", "fields": [{"name": "title", "selector": "h2"}]},
+                "fieldCandidates": {"title": [{"kind": "dom", "selector": "h2"}]},
+            }},
+        ],
+        "edges": [],
+    }
+
+    cleaned = _clean_graph(graph)
+    configs = {node["id"]: node["config"] for node in cleaned["nodes"]}
+
+    assert cleaned["settings"] == {}
+    assert configs["acquire"]["strategies"]["allow"] == ["acquire-api", "acquire-browser-xhr"]
+    assert configs["acquire"]["endpoint"] == ""
+    assert configs["acquire"]["xhr"] == {"urlContains": "", "path": ""}
+    assert configs["acquire"]["headers"] == {}
+    assert configs["traverse"]["browserTraversal"]["listing"]["itemSelector"] == ""
+    assert configs["extract"]["dom"] == {"inputPath": "body", "itemSelector": "", "fields": []}
+    assert "fieldCandidates" not in configs["extract"]
     assert _template_issues(cleaned) == []
 
 

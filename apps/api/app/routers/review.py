@@ -13,6 +13,7 @@ from app.dependencies import get_current_user, require_roles
 from app.models import Record, RecordVersion, ReviewTask, User
 from app.routers.workflows import stable_record_hash
 from app.schemas import ReviewDecision, ReviewOut
+from app.services.authorization import require_project, scope_to_projects
 
 router = APIRouter(prefix="/review", tags=["Проверка данных"])
 
@@ -22,18 +23,21 @@ def list_review(
     project_id: str | None = None,
     status: str = "PENDING",
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> list[ReviewTask]:
+    if project_id:
+        require_project(db, user, project_id)
     stmt = select(ReviewTask).where(ReviewTask.status == status).order_by(ReviewTask.created_at.desc())
     if project_id:
         stmt = stmt.where(ReviewTask.project_id == project_id)
-    return list(db.scalars(stmt).all())
+    return list(db.scalars(scope_to_projects(stmt, ReviewTask.project_id, db, user)).all())
 
 
 def decide(task_id: str, status: str, payload: ReviewDecision, db: Session, user: User) -> ReviewTask:
     task = db.get(ReviewTask, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Задача проверки не найдена")
+    require_project(db, user, task.project_id)
     if task.status != "PENDING":
         raise HTTPException(status_code=409, detail="Решение уже принято")
     task.status = status

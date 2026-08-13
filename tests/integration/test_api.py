@@ -21,6 +21,48 @@ def test_node_test_runs_selected_node_with_its_upstream_inputs(client, auth):
     assert response.json()['result']['records'] == [{'title': 'one'}, {'title': 'two'}]
 
 
+def test_v2_node_test_preserves_contract_version_for_upstream_facades(client, auth):
+    graph = {
+        'version': 1,
+        'contractVersion': 2,
+        'settings': {},
+        'nodes': [
+            {'id': 'start', 'type': 'manual_trigger', 'config': {'contractVersion': 2, 'strategies': {'allow': ['start-input']}}},
+            {'id': 'extract', 'type': 'mapping', 'config': {'contractVersion': 2, 'strategies': {'allow': ['extract-json']}, 'json': {'path': '$.items[*]'}}},
+        ],
+        'edges': [{'source': 'start', 'target': 'extract'}],
+    }
+    response = client.post('/api/v1/workflows/node-test', headers=auth, json={
+        'node_type': 'mapping', 'config': graph['nodes'][1]['config'],
+        'graph': graph, 'target_node_id': 'extract',
+        'inputs': {'body': {'items': [{'title': 'one'}]}},
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()['result']['records'] == [{'title': 'one'}]
+
+
+def test_node_test_compacts_large_raw_html_but_keeps_record_metadata(client, auth, monkeypatch):
+    from app.routers import workflows
+
+    async def fake_execute(_self, *_args, **_kwargs):
+        return {
+            'node_outputs': {'test': {'body': 'x' * 10_001, 'records': [{'url': 'https://example.test/one'}], 'count': 1}},
+            'result': {'body': 'x' * 10_001, 'records': [{'url': 'https://example.test/one'}], 'count': 1},
+            'artifacts': [{'storage_key': 'runs/test/raw.html'}],
+        }
+
+    monkeypatch.setattr(workflows.WorkflowEngine, 'execute', fake_execute)
+    response = client.post('/api/v1/workflows/node-test', headers=auth, json={
+        'node_type': 'manual_trigger', 'config': {}, 'inputs': {},
+    })
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload['result']['records'] == [{'url': 'https://example.test/one'}]
+    assert 'preview truncated' in payload['result']['body']
+    assert payload['artifacts'] == [{'storage_key': 'runs/test/raw.html'}]
+    assert payload['node_outputs']['test']['body'] == payload['result']['body']
+
+
 def test_manual_run_uses_saved_draft_not_an_older_published_version(client, auth):
     project = client.get('/api/v1/projects', headers=auth).json()[0]
     initial_graph = {

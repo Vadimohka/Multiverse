@@ -1,8 +1,14 @@
+# Development override; use together with docker-compose.yml.
 services:
   api:
     volumes: ["./apps/api:/app/apps/api", "./packages:/app/packages"]
-    command: uvicorn app.main:app --app-dir apps/api --host 0.0.0.0 --port 8000 --reload
+    # This replaces the image CMD, so retain the migration gate from the base
+    # image before starting the auto-reloading development server.
+    command: sh -c 'alembic upgrade head && exec uvicorn app.main:app --app-dir apps/api --host 0.0.0.0 --port 8000 --reload'
   frontend:
     build: {context: apps/frontend, dockerfile: Dockerfile.dev}
+    environment:
+      VITE_API_PROXY_TARGET: http://api:8000
     volumes: ["./apps/frontend:/app", "/app/node_modules"]
-    ports: ["5173:5173"]
+    # Replace the production Nginx mapping (8080:80); Vite listens on 5173.
+    ports: !override ["5173:5173"]

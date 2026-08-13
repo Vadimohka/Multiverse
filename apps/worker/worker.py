@@ -1,31 +1,52 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from app.config import get_settings
 from app.database import SessionLocal
-from app.models import Run, Schedule, Source, Workflow
+from app.models import Run, Schedule, ScheduleOccurrence, Source, Workflow
 from app.routers.workflows import active_graph, execute_run
+from app.services.run_lifecycle import reconcile_stale_runs
 from app.services.run_routing import queue_for_graph
 from celery import Celery
 from celery.schedules import crontab
 from sqlalchemy import select
+from workflow_engine import compile_executable_plan
 
 settings = get_settings()
 celery_app = Celery("parser_studio", broker=settings.redis_url, backend=settings.redis_url)
 celery_app.conf.task_routes = {
     "parser_studio.execute_run": {"queue": "default"},
     "parser_studio.schedule_tick": {"queue": "maintenance"},
+    "parser_studio.reconcile_runs": {"queue": "maintenance"},
 }
 celery_app.conf.beat_schedule = {
     "parser-studio-schedule-tick": {
         "task": "parser_studio.schedule_tick",
         "schedule": crontab(minute="*"),
     }
+    ,
+    "parser-studio-reconcile-runs": {
+        "task": "parser_studio.reconcile_runs",
+        "schedule": crontab(minute="*"),
+    },
 }
 celery_app.conf.timezone = "UTC"
+
+
+def claim_schedule_occurrence(db, schedule_id: str, planned_at: datetime) -> ScheduleOccurrence | None:
+    """Acquire a schedule/minute occurrence without rolling back the tick."""
+
+    occurrence = ScheduleOccurrence(schedule_id=schedule_id, planned_at=planned_at)
+    try:
+        with db.begin_nested():
+            db.add(occurrence)
+            db.flush()
+    except Exception:
+        return None
+    return occurrence
 
 
 @celery_app.task(
@@ -45,6 +66,7 @@ def schedule_tick() -> int:
     enqueued = 0
     try:
         now_utc = datetime.now(UTC)
+        planned_at = now_utc.replace(second=0, microsecond=0)
         schedules = db.scalars(select(Schedule).where(Schedule.enabled.is_(True))).all()
         for schedule in schedules:
             workflow = db.get(Workflow, schedule.workflow_id)
@@ -57,7 +79,11 @@ def schedule_tick() -> int:
                 continue
             if not due:
                 continue
-            if schedule.last_run_at and schedule.last_run_at.astimezone(UTC).replace(second=0, microsecond=0) >= now_utc.replace(second=0, microsecond=0):
+            # A unique occurrence row is the inter-process lock.  ``flush``
+            # can race safely with another beat process; the loser does not
+            # enqueue any work.
+            occurrence = claim_schedule_occurrence(db, schedule.id, planned_at)
+            if occurrence is None:
                 continue
             workflow_version = workflow.published_version or workflow.version
             settings = workflow.graph_json.get("settings", {})
@@ -72,16 +98,35 @@ def schedule_tick() -> int:
                     workflow_id=workflow.id,
                     workflow_version=workflow_version,
                     source_id=source.id if source else None,
-                    input_json={"schedule_id": schedule.id, "scheduled_at": now_utc.isoformat(), "batch": bool(settings.get("run_all_project_sources"))},
+                    input_json={"schedule_id": schedule.id, "scheduled_at": planned_at.isoformat(), "batch": bool(settings.get("run_all_project_sources"))},
+                    deadline_at=now_utc + timedelta(seconds=get_settings().run_default_deadline_seconds),
+                    executable_plan_json=compile_executable_plan(
+                        active_graph(db, workflow, workflow_version),
+                        project_id=workflow.project_id,
+                        workflow_id=workflow.id,
+                        workflow_version=workflow_version,
+                        source_id=source.id if source else None,
+                        revision_refs=active_graph(db, workflow, workflow_version).get("settings", {}).get("presetRefs", {}),
+                    ).as_dict(),
                 )
                 db.add(run)
                 db.flush()
                 queue = queue_for_graph(active_graph(db, workflow, workflow_version), source)
                 celery_app.send_task("parser_studio.execute_run", args=[run.id], queue=queue)
                 enqueued += 1
-            schedule.last_run_at = now_utc
+            occurrence.run_count = len(targets)
+            schedule.last_run_at = planned_at
         db.commit()
         return enqueued
+    finally:
+        db.close()
+
+
+@celery_app.task(name="parser_studio.reconcile_runs")
+def reconcile_runs() -> int:
+    db = SessionLocal()
+    try:
+        return reconcile_stale_runs(db)
     finally:
         db.close()
 

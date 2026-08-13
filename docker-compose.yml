@@ -36,7 +36,9 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: "postgresql+psycopg://${POSTGRES_USER:-parser}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-parser_studio}"
-    depends_on: {postgres: {condition: service_healthy}, redis: {condition: service_healthy}}
+    # The API applies Alembic migrations on startup.  Do not let a worker
+    # consume an existing scheduled task against a pre-migration schema.
+    depends_on: {api: {condition: service_healthy}}
     command: celery -A worker:celery_app worker --loglevel=INFO -Q default,http,exports,maintenance
     restart: unless-stopped
   worker-browser:

@@ -1,3 +1,4 @@
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -52,14 +53,38 @@ class ExecutionContext:
     user_id: str | None = None
     variables: dict[str, Any] = field(default_factory=dict)
     secrets: dict[str, str] = field(default_factory=dict)
+    capabilities: dict[str, Any] = field(default_factory=dict)
     artifact_storage: Any | None = None
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     logs: list[dict[str, Any]] = field(default_factory=list)
     cancelled: bool = False
     effective_run_clock: datetime | None = None
+    deadline_at: datetime | None = None
+    stop_check: Callable[[], Awaitable[str | None]] | None = None
+    heartbeat_interval_seconds: float = 5.0
+    executable_plan: dict[str, Any] | None = None
 
     def log(self, level: str, message: str, **data: Any) -> None:
-        self.logs.append({"level": level, "message": message, "data": data})
+        from .redaction import redact_value
+
+        values = list(self.secrets.values())
+        self.logs.append({
+            "level": level,
+            "message": redact_value(message, values),
+            "data": redact_value(data, values),
+        })
+
+
+class RunCancelledError(RuntimeError):
+    """Raised cooperatively so network/browser tasks are cancelled promptly."""
+
+
+class RunDeadlineExceededError(RuntimeError):
+    """Raised when a run-wide deadline wins over an individual node timeout."""
+
+
+class RunLeaseLostError(RuntimeError):
+    """A previous worker may no longer write results after losing its lease."""
 
 
 class WorkflowNode(Protocol):

@@ -113,7 +113,7 @@ async def test_fetch_nodes_expose_shared_policy_diagnostics(monkeypatch):
 
     monkeypatch.setattr("workflow_engine.nodes.request_with_policy", fake_request)
     context = ExecutionContext(run_id="transport", project_id="project", workflow_version_id="1")
-    shared = {"request_retries": 3, "retry_backoff_seconds": 0.25, "request_timeout": 12}
+    shared = {"request_retries": 3, "retry_backoff_seconds": 0.25, "request_timeout": 12, "egress_resolver": lambda *_: ["93.184.216.34"]}
 
     http_result = await HTTPRequestNode().execute(
         context,
@@ -152,3 +152,34 @@ async def test_fetch_nodes_expose_shared_policy_diagnostics(monkeypatch):
     assert download_result["fetch_attempts"][0]["status_code"] == 200
     assert follow_result["progress"][0]["fetch_attempts"][0]["status_code"] == 200
     assert crawl_result["detail_diagnostics"][0]["fetch_attempts"][0]["status_code"] == 200
+
+
+@pytest.mark.asyncio
+async def test_http_request_preserves_query_in_source_url_when_query_editor_is_empty(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def fake_request(_client, _method, url, _policy, **kwargs):
+        captured["url"] = url
+        captured["params"] = kwargs.get("params")
+        return httpx.Response(
+            200,
+            request=httpx.Request("GET", url),
+            content=b"[]",
+            headers={"content-type": "application/json"},
+        )
+
+    monkeypatch.setattr("workflow_engine.nodes.request_with_policy", fake_request)
+    execution = ExecutionContext(
+        run_id="query-preservation",
+        project_id="project",
+        workflow_version_id="1",
+        variables={"source": {"url": "https://example.test/rates?periodicity=0", "settings": {}}},
+    )
+
+    await HTTPRequestNode().execute(
+        execution,
+        {},
+        {"url": "{{source.url}}", "query_params": {}, "egress_resolver": lambda *_: ["93.184.216.34"]},
+    )
+
+    assert captured == {"url": "https://example.test/rates?periodicity=0", "params": None}

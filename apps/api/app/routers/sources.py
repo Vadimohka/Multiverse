@@ -8,23 +8,37 @@ from sqlalchemy.orm import Session
 from app.audit import audit
 from app.database import get_db
 from app.dependencies import get_current_user, require_roles
-from app.models import Source, SourceProfile, User, Workflow
+from app.models import BrowserProfile, Source, SourceProfile, User, Workflow
 from app.schemas import EndpointUseRequest, ProfileRequest, SourceCreate, SourceOut, SourceUpdate
+from app.services.authorization import require_project, require_project_object, scope_to_projects
 from app.services.selector_picker import build_selector_snapshot
 from app.services.source_profiler import profile_url
 
 router = APIRouter(prefix="/sources", tags=["Источники"])
 
 
+def validate_source_capability_bindings(db: Session, project_id: str, settings: dict) -> None:
+    profile_id = settings.get("browser_profile_id") if isinstance(settings, dict) else None
+    if not profile_id:
+        return
+    profile = db.get(BrowserProfile, str(profile_id))
+    if profile is None or profile.project_id != project_id or not profile.enabled:
+        raise HTTPException(status_code=422, detail="Browser profile is not available in this project")
+
+
 @router.get("", response_model=list[SourceOut])
-def list_sources(project_id: str | None = None, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> list[Source]:
+def list_sources(project_id: str | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list[Source]:
+    if project_id:
+        require_project(db, user, project_id)
     stmt = select(Source).order_by(Source.created_at.desc())
     if project_id: stmt = stmt.where(Source.project_id == project_id)
-    return list(db.scalars(stmt).all())
+    return list(db.scalars(scope_to_projects(stmt, Source.project_id, db, user)).all())
 
 
 @router.post("", response_model=SourceOut, status_code=201)
 def create_source(payload: SourceCreate, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> Source:
+    require_project(db, user, payload.project_id)
+    validate_source_capability_bindings(db, payload.project_id, payload.settings)
     source = Source(**payload.model_dump()); db.add(source); db.flush(); audit(db, user.id, "CREATE", "source", source.id, after=payload.model_dump()); db.commit(); db.refresh(source); return source
 
 
@@ -35,7 +49,7 @@ def update_source(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
 ) -> Source:
-    source = db.get(Source, source_id)
+    source = require_project_object(db, user, Source, source_id, label="Source")
     if not source:
         raise HTTPException(status_code=404, detail="Источник не найден")
     changes = payload.model_dump(exclude_none=True)
@@ -63,7 +77,7 @@ def update_access(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
 ) -> Source:
-    source = db.get(Source, source_id)
+    source = require_project_object(db, user, Source, source_id, label="Source")
     if not source:
         raise HTTPException(status_code=404, detail="Источник не найден")
     settings = dict(source.settings or {})
@@ -93,37 +107,42 @@ def use_endpoint(payload: EndpointUseRequest, db: Session = Depends(get_db), use
     http_config = {"url": url, "method": method, "headers": headers, "query_params": query_params, "json_body": json_body, "timeout": 30}
     if payload.mode == "source":
         if not payload.project_id: raise HTTPException(status_code=422, detail="Для источника выберите проект")
+        require_project(db, user, payload.project_id)
         source = Source(project_id=payload.project_id, name=payload.name or urlsplit(url).netloc or "JSON endpoint", source_type="JSON_API", entry_url=url, base_url=f"{urlsplit(url).scheme}://{urlsplit(url).netloc}", fetch_mode="XHR_JSON", settings={"http_request": http_config})
         db.add(source); db.commit(); db.refresh(source)
         return {"mode": "source", "source": SourceOut.model_validate(source).model_dump()}
     if payload.mode == "workflow_node":
         if not payload.workflow_id: raise HTTPException(status_code=422, detail="Выберите workflow")
-        workflow = db.get(Workflow, payload.workflow_id)
+        workflow = require_project_object(db, user, Workflow, payload.workflow_id, label="Workflow")
         if not workflow: raise HTTPException(status_code=404, detail="Workflow не найден")
         return {"mode": "workflow_node", "node": {"type": "http_request", "config": http_config}}
     raise HTTPException(status_code=422, detail="Неизвестный способ использования endpoint")
 
 
 @router.post("/profile")
-async def profile(payload: ProfileRequest, db: Session = Depends(get_db), _: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> dict:
+async def profile(payload: ProfileRequest, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> dict:
+    if payload.source_id:
+        require_project_object(db, user, Source, payload.source_id, label="Source")
     try: result = await profile_url(payload.url, payload.timeout)
     except Exception as exc: raise HTTPException(status_code=422, detail=f"Не удалось профилировать URL: {exc}") from exc
     db.add(SourceProfile(source_id=payload.source_id, url=payload.url, result_json=result)); db.commit(); return result
 
 
 @router.post("/{source_id}/test")
-async def test_source(source_id: str, db: Session = Depends(get_db), _: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER", "OPERATOR"))) -> dict:
-    source = db.get(Source, source_id)
+async def test_source(source_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER", "OPERATOR"))) -> dict:
+    source = require_project_object(db, user, Source, source_id, label="Source")
     if not source: raise HTTPException(status_code=404, detail="Источник не найден")
     return await profile_url(source.entry_url)
 
 
 class SelectorSnapshotRequest(BaseModel):
     url: str
+    project_id: str
     timeout: float = 30
 
 
 @router.post("/selector-snapshot")
-async def selector_snapshot(payload: SelectorSnapshotRequest, _: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> dict:
+async def selector_snapshot(payload: SelectorSnapshotRequest, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> dict:
+    require_project(db, user, payload.project_id)
     try: return await build_selector_snapshot(payload.url, payload.timeout)
     except Exception as exc: raise HTTPException(status_code=422, detail=f"Не удалось создать selector snapshot: {exc}") from exc

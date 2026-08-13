@@ -81,6 +81,19 @@ class ProjectOut(ORMModel):
     updated_at: datetime
 
 
+class ProjectMemberCreate(BaseModel):
+    user_id: str
+    role: str = "VIEWER"
+
+
+class ProjectMemberOut(ORMModel):
+    id: str
+    project_id: str
+    user_id: str
+    role: str
+    created_at: datetime
+
+
 class SourceCreate(BaseModel):
     project_id: str
     name: str
@@ -304,6 +317,66 @@ class WorkflowTemplateOut(ORMModel):
     updated_at: datetime | None = None
 
 
+class WorkflowBlueprintRevisionCreate(BaseModel):
+    project_id: str
+    slug: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=200)
+    description: str = ""
+    graph_json: dict[str, Any] | None = None
+    parameter_schema_json: dict[str, Any] = {}
+    status: str = "DRAFT"
+
+
+class WorkflowBlueprintRevisionOut(ORMModel):
+    id: str
+    project_id: str
+    slug: str
+    name: str
+    description: str
+    revision: int
+    status: str
+    graph_json: dict[str, Any]
+    parameter_schema_json: dict[str, Any]
+    conversion_report_json: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+class SourcePresetRevisionCreate(BaseModel):
+    project_id: str
+    blueprint_revision_id: str
+    slug: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=200)
+    config_json: dict[str, Any]
+    source_policy_ref: str = ""
+    dataset_schema_ref: str = ""
+    fixture_refs: list[str] = []
+    status: str = "DRAFT"
+
+
+class SourcePresetRevisionOut(ORMModel):
+    id: str
+    project_id: str
+    blueprint_revision_id: str
+    slug: str
+    name: str
+    revision: int
+    status: str
+    config_json: dict[str, Any]
+    source_policy_ref: str
+    dataset_schema_ref: str
+    fixture_refs: list[str]
+    last_verified_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class SourcePresetInstantiateRequest(BaseModel):
+    name: str | None = None
+    source_id: str | None = None
+    dataset_id: str | None = None
+
+
 class RunRequest(BaseModel):
     source_id: str | None = None
     inputs: dict[str, Any] = {}
@@ -312,6 +385,7 @@ class RunRequest(BaseModel):
     run_clock_mode: str = "current"  # current | manual
     run_at: datetime | None = None
     timezone: str = "Europe/Minsk"
+    deadline_seconds: int | None = None
 
 
 class RunOut(ORMModel):
@@ -326,6 +400,10 @@ class RunOut(ORMModel):
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+    heartbeat_at: datetime | None = None
+    cancel_requested_at: datetime | None = None
+    deadline_at: datetime | None = None
+    executable_plan_json: dict[str, Any] = {}
 
 
 class PromptCreate(BaseModel):
@@ -380,6 +458,7 @@ class ScheduleCreate(BaseModel):
 
 
 class ConnectionCreate(BaseModel):
+    project_id: str
     name: str
     engine: str = "postgresql"
     host: str
@@ -395,11 +474,13 @@ class ConnectionCreate(BaseModel):
 
 
 class SecretCreate(BaseModel):
+    project_id: str
     name: str
     value: str = Field(min_length=1)
 
 
 class BrowserProfileCreate(BaseModel):
+    project_id: str
     name: str
     browser: str = "chromium"
     viewport: dict[str, int] = {"width": 1440, "height": 900}
@@ -412,6 +493,7 @@ class BrowserProfileCreate(BaseModel):
 
 
 class AIProviderCreate(BaseModel):
+    project_id: str
     provider_name: str
     provider_type: str = "OPENAI_COMPATIBLE"
     base_url: str
@@ -431,6 +513,7 @@ class NodeTestRequest(BaseModel):
     source_id: str | None = None
     graph: dict[str, Any] | None = None
     target_node_id: str | None = None
+    response_preview: bool = True
 
 
 class WorkflowTemplateRequest(BaseModel):

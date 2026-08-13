@@ -106,27 +106,18 @@ For low-resource servers (1 vCPU, 1 GiB RAM), see [the minimal Compose deploymen
 
 On first startup, Multiverse seeds a deterministic bank-deposit demo. It fetches local financial HTML, extracts deposit cards, normalizes values, validates and versions three records, creates review tasks, approves the records, and exports the dataset to XLSX. Use it to verify the installation before connecting external websites.
 
-It also installs the executable `Новости БВФБ` site preset. The preset opens
-`https://www.bcse.by/press-center/releases`, follows every client-side pagination
-page, and collects every publication card. Full text, HTML, tags, category and
-attachments are read from the same public detail endpoint used by the site;
-publication timestamps are normalized from `Europe/Minsk` and records are stored
-in the `bcse-news` dataset.
-Site URLs and selectors live in this preset, not in the generic crawler. See the
-[Data API contract](docs/audit/DATA_API_CONTRACT.md) for read-only token and
-`from`/`to` query examples.
+It also installs seven source-agnostic public-data templates: HTML cards,
+list-to-detail pages, HTML tables, RSS/XML feeds, JSON API/XHR, browser-rendered
+lists and public documents. Create a Source first, then choose a template and
+configure its selectors, JSONPath, pagination and mapping in the UI. Templates
+do not embed a site URL, selector, source ID or dataset ID.
 
-After deployment, open **Шаблоны workflow → Новости БВФБ**. The project
-**Новости БВФБ**, source **БВФБ — публикации пресс-центра**, and dataset
-`bcse-news` are preselected: create the workflow, verify it, publish it, and run
-it once. In **API-токены**, create a
-`datasets:read` token scoped to `bcse-news`. An external agent asking for
-“yesterday” must calculate the Minsk interval itself and request, for example:
-
-```http
-GET /api/v1/datasets/bcse-news/records?view=current&time_basis=source_published_at&from=2026-08-10T00:00:00%2B03:00&to=2026-08-11T00:00:00%2B03:00&sort=asc
-Authorization: Bearer mv_<token>
-```
+The supported boundary is the representation normally delivered to an anonymous
+visitor: public HTML, feed, API/XHR, browser render and downloadable documents.
+Multiverse does not bypass login, CAPTCHA, paywalls, robots restrictions or other
+access controls. See the [universal scraper blueprint](docs/audit/UNIVERSAL_SCRAPER_BLUEPRINT_2026-08-12.md)
+for the source matrix and the [Data API contract](docs/audit/DATA_API_CONTRACT.md)
+for read-only token and `from`/`to` query examples.
 
 ## Node catalog
 
@@ -243,7 +234,7 @@ python scripts/load_test_data_api.py
 docker compose config --quiet
 ```
 
-The smoke test can be run separately with `python scripts/smoke_test.py`; it starts the API on an available local port and exercises the seeded workflow from authentication through parsing, review, export, and metrics.
+The smoke test can be run separately with `python scripts/smoke_test.py`; it starts the API on an available local port and exercises the seeded input workflow from authentication through normalization, review, export, and metrics. HTTP/browser egress safety is verified separately by the egress regression suite, so the smoke test never weakens the private-network block for a local fixture.
 
 ## Project status and limitations
 
