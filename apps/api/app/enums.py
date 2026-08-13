@@ -26,6 +26,7 @@ class SourceType(StrEnum):
 class RunStatus(StrEnum):
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
+    CANCEL_REQUESTED = "CANCEL_REQUESTED"
     WAITING_FOR_REVIEW = "WAITING_FOR_REVIEW"
     SUCCESS = "SUCCESS"
     PARTIAL_SUCCESS = "PARTIAL_SUCCESS"
@@ -36,7 +37,11 @@ class RunStatus(StrEnum):
     SUCCESS_EMPTY_UNEXPECTED = "SUCCESS_EMPTY_UNEXPECTED"
 
 
-TERMINAL_RUN_STATUSES = frozenset(status.value for status in RunStatus if status not in {RunStatus.QUEUED, RunStatus.RUNNING})
+TERMINAL_RUN_STATUSES = frozenset(
+    status.value
+    for status in RunStatus
+    if status not in {RunStatus.QUEUED, RunStatus.RUNNING, RunStatus.CANCEL_REQUESTED}
+)
 SUCCESSFUL_RUN_STATUSES = frozenset({
     RunStatus.SUCCESS.value,
     RunStatus.PARTIAL_SUCCESS.value,

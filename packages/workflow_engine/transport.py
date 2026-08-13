@@ -100,6 +100,16 @@ async def request_with_policy(
                 request_kwargs = {**request_options}
                 if supports_timeout:
                     request_kwargs["timeout"] = policy.timeout
+                # Minimal test transports and compatibility clients may not
+                # expose httpx's per-request redirect flag.  The surrounding
+                # AsyncClient is already created with follow_redirects=False;
+                # only send the override where that method accepts it.
+                supports_redirects = any(
+                    parameter.name == "follow_redirects" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
+                if not supports_redirects:
+                    request_kwargs.pop("follow_redirects", None)
                 response = await method_handler(url, **request_kwargs)
         except httpx.HTTPError as exc:
             if attempt_number > policy.retries:

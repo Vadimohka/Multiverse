@@ -27,6 +27,11 @@ def context() -> ExecutionContext:
     return ExecutionContext(run_id="fixtures", project_id="project", workflow_version_id="1")
 
 
+def public_resolver(_host: str, _port: int) -> list[str]:
+    """Synthetic fixtures never reach DNS; egress still validates every hop."""
+    return ["93.184.216.34"]
+
+
 @pytest.mark.asyncio
 async def test_simple_repeating_cards_fixture():
     result = await ExtractRepeatingListNode().execute(
@@ -45,6 +50,26 @@ async def test_simple_repeating_cards_fixture():
         {"title": "First item", "url": "/details/one", "value": "10"},
         {"title": "Second item", "url": "/details/two", "value": "20"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_repeating_cards_can_extract_an_attribute_from_the_container_itself():
+    result = await ExtractRepeatingListNode().execute(
+        context(),
+        {"html": '<a class="card" href="/one"><h4>One</h4></a>'},
+        {"container_selector": "a.card", "fields": [
+            {"name": "url", "selector": ":scope", "attribute": "href"},
+            {"name": "title", "selector": "h4"},
+        ]},
+    )
+
+    assert result["records"] == [{
+        "url": "/one", "title": "One",
+        "evidence": {
+            "url": {"css_selector": "a.card", "text": "/one"},
+            "title": {"css_selector": "a.card h4", "text": "One"},
+        },
+    }]
 
 
 @pytest.mark.asyncio
@@ -77,6 +102,7 @@ async def test_list_to_detail_fixture(monkeypatch):
             ],
             "save_artifacts": False,
             "delay_ms": 0,
+            "egress_resolver": public_resolver,
         },
     )
     assert sorted((row["title"], row["body"]) for row in result["records"]) == [
@@ -122,6 +148,7 @@ async def test_http_next_link_fixture_is_bounded_and_merged(monkeypatch):
             "pagination_next_selector": "a[rel='next']",
             "pagination_max_pages": 2,
             "save_artifacts": False,
+            "egress_resolver": public_resolver,
         },
     )
     assert "Page one" in listing and "Page two" in listing
@@ -146,7 +173,11 @@ async def test_query_parameter_pagination_fixture(monkeypatch):
     result = await PaginationNode().execute(
         context(),
         {},
-        {"url_template": "https://example.test/items?page={{page}}", "max_pages": 2},
+        {
+            "url_template": "https://example.test/items?page={{page}}",
+            "max_pages": 2,
+            "egress_resolver": public_resolver,
+        },
     )
     assert [item["url"] for item in result["pages"]] == [item["url"] for item in expected]
 
@@ -183,6 +214,9 @@ async def test_js_shell_fixture_recommends_browser(monkeypatch):
 
     monkeypatch.setattr(source_profiler.httpx, "AsyncClient", lambda **_kwargs: Client())
     monkeypatch.setattr(source_profiler, "enrich_with_playwright", unavailable)
+    async def request(*_args, **_kwargs):
+        return response
+    monkeypatch.setattr(source_profiler, "request_with_egress_policy", request)
     profile = await source_profiler.profile_url("https://example.test/app")
     assert profile["recommended_fetch_mode"] == "PLAYWRIGHT"
     assert profile["requires_javascript"] is True

@@ -97,6 +97,28 @@ class Project(Base, TimestampMixin):
     created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
 
 
+class ProjectMember(Base, TimestampMixin):
+    """A user-scoped grant for a project.
+
+    ``Project.created_by`` remains the compatibility owner for projects that
+    predate this table.  New projects also receive an explicit OWNER grant so
+    access checks and audit tooling have one consistent representation.
+    """
+
+    __tablename__ = "project_members"
+    __table_args__ = (
+        UniqueConstraint("project_id", "user_id", name="uq_project_member"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[str] = mapped_column(String(32), default="VIEWER")
+
+
 class Source(Base, TimestampMixin):
     __tablename__ = "sources"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
@@ -219,6 +241,15 @@ class Run(Base):
     status: Mapped[str] = mapped_column(String(32), default="QUEUED", index=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # A worker owns a run only while it can renew this lease.  The token makes
+    # terminal writes compare-and-set safe when a task is delivered twice.
+    lease_token: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancellation_reason: Mapped[str] = mapped_column(String(500), default="")
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    executable_plan_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     input_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     output_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     error_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -370,6 +401,83 @@ class Schedule(Base, TimestampMixin):
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class ScheduleOccurrence(Base):
+    """One durable scheduler claim per schedule/minute.
+
+    Multiple Celery beat instances may legitimately invoke the same tick.  The
+    database identity, rather than an in-process ``last_run_at`` check, is the
+    idempotency boundary that prevents duplicate run creation.
+    """
+
+    __tablename__ = "schedule_occurrences"
+    __table_args__ = (
+        UniqueConstraint("schedule_id", "planned_at", name="uq_schedule_occurrence"),
+        Index("ix_schedule_occurrences_schedule_planned", "schedule_id", "planned_at"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    schedule_id: Mapped[str] = mapped_column(
+        ForeignKey("schedules.id", ondelete="CASCADE"), index=True
+    )
+    planned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    run_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class WorkflowBlueprintRevision(Base, TimestampMixin):
+    """An immutable, source-independent seven-phase workflow blueprint.
+
+    ``WorkflowTemplate`` stays available for legacy/import compatibility.  A
+    blueprint revision deliberately owns just topology and generic defaults;
+    concrete endpoints, selectors and bindings belong to ``SourcePreset``.
+    """
+
+    __tablename__ = "workflow_blueprint_revisions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "slug", "revision", name="uq_blueprint_revision"),
+        Index("ix_blueprint_project_slug", "project_id", "slug"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    slug: Mapped[str] = mapped_column(String(200), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str] = mapped_column(Text, default="")
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(16), default="DRAFT", index=True)
+    graph_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    parameter_schema_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    conversion_report_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+
+class SourcePresetRevision(Base, TimestampMixin):
+    """Immutable declarative source configuration compiled over a blueprint."""
+
+    __tablename__ = "source_preset_revisions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "slug", "revision", name="uq_source_preset_revision"),
+        Index("ix_source_preset_project_slug", "project_id", "slug"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    blueprint_revision_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_blueprint_revisions.id", ondelete="RESTRICT"), index=True
+    )
+    slug: Mapped[str] = mapped_column(String(200), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(16), default="DRAFT", index=True)
+    config_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    source_policy_ref: Mapped[str] = mapped_column(String(200), default="")
+    dataset_schema_ref: Mapped[str] = mapped_column(String(200), default="")
+    fixture_refs: Mapped[list[str]] = mapped_column(JSON, default=list)
+    last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
@@ -386,8 +494,12 @@ class AuditLog(Base):
 
 class Secret(Base, TimestampMixin):
     __tablename__ = "secrets"
+    __table_args__ = (UniqueConstraint("project_id", "name", name="uq_secret_project_name"),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    name: Mapped[str] = mapped_column(String(200), unique=True)
+    project_id: Mapped[str | None] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    name: Mapped[str] = mapped_column(String(200))
     encrypted_value: Mapped[str] = mapped_column(Text)
     masked_value: Mapped[str] = mapped_column(String(50))
 
@@ -424,8 +536,12 @@ class LLMCall(Base):
 
 class DatabaseConnection(Base, TimestampMixin):
     __tablename__ = "database_connections"
+    __table_args__ = (UniqueConstraint("project_id", "name", name="uq_database_connection_project_name"),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    name: Mapped[str] = mapped_column(String(200), unique=True)
+    project_id: Mapped[str | None] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    name: Mapped[str] = mapped_column(String(200))
     engine: Mapped[str] = mapped_column(String(40))
     host: Mapped[str] = mapped_column(String(255), default="")
     port: Mapped[int] = mapped_column(Integer, default=5432)
@@ -443,8 +559,12 @@ class DatabaseConnection(Base, TimestampMixin):
 
 class BrowserProfile(Base, TimestampMixin):
     __tablename__ = "browser_profiles"
+    __table_args__ = (UniqueConstraint("project_id", "name", name="uq_browser_profile_project_name"),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    name: Mapped[str] = mapped_column(String(200), unique=True)
+    project_id: Mapped[str | None] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    name: Mapped[str] = mapped_column(String(200))
     browser: Mapped[str] = mapped_column(String(40), default="chromium")
     viewport: Mapped[dict[str, Any]] = mapped_column(
         JSON, default=lambda: {"width": 1440, "height": 900}
@@ -462,8 +582,12 @@ class BrowserProfile(Base, TimestampMixin):
 
 class AIProviderConfig(Base, TimestampMixin):
     __tablename__ = "ai_providers"
+    __table_args__ = (UniqueConstraint("project_id", "provider_name", name="uq_ai_provider_project_name"),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    provider_name: Mapped[str] = mapped_column(String(200), unique=True)
+    project_id: Mapped[str | None] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    provider_name: Mapped[str] = mapped_column(String(200))
     provider_type: Mapped[str] = mapped_column(String(64))
     base_url: Mapped[str] = mapped_column(Text, default="")
     encrypted_api_key: Mapped[str] = mapped_column(Text, default="")

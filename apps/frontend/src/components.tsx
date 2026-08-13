@@ -18,7 +18,25 @@ export function Table({rows,columns,onRowClick,empty='Нет данных'}:{row
   return <div className="table-wrap"><table><thead><tr>{cols.map(column=><th key={column}>{humanize(column)}</th>)}</tr></thead><tbody>{rows.map((row,index)=><tr key={row.id||index} onClick={()=>onRowClick?.(row)} className={onRowClick?'clickable':''}>{cols.map(column=><td key={column} title={display(row[column])}>{display(row[column])}</td>)}</tr>)}</tbody></table></div>;
 }
 
-export function JsonView({value,maxHeight=420}:{value:any;maxHeight?:number}){return <pre style={{maxHeight}}>{JSON.stringify(value,null,2)}</pre>}
+function compactJsonPreview(value:any,depth=0):any{
+  if(typeof value==='string')return value.length>10_000?`${value.slice(0,10_000)}\n… string preview truncated (${value.length.toLocaleString()} characters total).`:value;
+  if(value===null||typeof value!=='object')return value;
+  if(depth>=8)return '… nested value omitted from preview';
+  if(Array.isArray(value)){
+    const items=value.slice(0,100).map(item=>compactJsonPreview(item,depth+1));
+    return value.length>100?[...items,`… ${value.length-100} more array items omitted from preview`]:items;
+  }
+  const entries=Object.entries(value).slice(0,100).map(([key,item])=>[key,compactJsonPreview(item,depth+1)]);
+  const compact=Object.fromEntries(entries);
+  if(Object.keys(value).length>100)compact.__preview__=`… ${Object.keys(value).length-100} more object keys omitted from preview`;
+  return compact;
+}
+
+export function JsonView({value,maxHeight=420,maxChars=200_000}:{value:any;maxHeight?:number;maxChars?:number}){
+  const serialized=JSON.stringify(compactJsonPreview(value),null,2);
+  const preview=serialized.length>maxChars?`${serialized.slice(0,maxChars)}\n\n… JSON preview truncated.`:serialized;
+  return <pre style={{maxHeight}}>{preview}</pre>
+}
 
 export function ConfirmButton({children,onConfirm,className}:{children:ReactNode;onConfirm:()=>void|Promise<void>;className?:string}){
   const [busy,setBusy]=useState(false);

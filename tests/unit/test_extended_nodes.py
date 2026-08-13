@@ -7,6 +7,7 @@ from workflow_engine import WorkflowEngine
 from workflow_engine.nodes import (
     BrowserOpenNode,
     CrawlLinksNode,
+    ExtractRepeatingListNode,
     FormulaNode,
     LLMExtractNode,
     MappingNode,
@@ -34,6 +35,30 @@ async def test_parse_table_with_headers():
         {"Банк": "А", "Ставка": "12,5%"},
         {"Банк": "Б", "Ставка": "10%"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_rss_link_tail_is_extracted_without_a_site_specific_rule():
+    result = await ExtractRepeatingListNode().execute(
+        context(),
+        {
+            "body": """<?xml version='1.0'?><rss><channel><item>
+            <link/>https://example.test/news/42<title>Release</title>
+            </item></channel></rss>"""
+        },
+        {
+            "container_selector": "item",
+            "fields": [
+                {"name": "title", "selector": "title"},
+                {"name": "url", "selector": "link"},
+            ],
+        },
+    )
+
+    assert result["records"] == [{"title": "Release", "url": "https://example.test/news/42", "evidence": {
+        "title": {"css_selector": "item title", "text": "Release"},
+        "url": {"css_selector": "item link", "text": "https://example.test/news/42"},
+    }}]
 
 
 @pytest.mark.asyncio
@@ -229,6 +254,9 @@ async def test_playwright_detail_does_not_require_successful_http_probe(monkeypa
 async def test_explicit_http_listing_overrides_browser_source_profile(monkeypatch):
     class Response:
         url = "https://example.test/list"
+        status_code = 200
+        is_redirect = False
+        extensions = {}
         content = b"<main></main>"
         text = "<main></main>"
         headers = {"content-type": "text/html"}
@@ -257,6 +285,7 @@ async def test_explicit_http_listing_overrides_browser_source_profile(monkeypatc
             "listing_url": "https://example.test/list",
             "listing_fetch_mode": "HTTP",
             "save_artifacts": False,
+            "egress_resolver": lambda *_: ["93.184.216.34"],
         },
     )
 

@@ -68,23 +68,24 @@ def test_bcse_news_template_output_is_persistable_business_records():
     assert result["result"]["preflight"]["validation_errors"] == []
 
 
-def test_system_list_detail_template_is_source_independent_and_persistable():
-    template = next(item for item in SYSTEM_TEMPLATES if item["id"] == "system-list-detail-crawl")
+def test_system_universal_list_detail_template_uses_public_v2_facades():
+    template = next(item for item in SYSTEM_TEMPLATES if item["id"] == "system-universal-html-list-detail")
     graph = template["graph_json"]
     nodes = {node["id"]: node for node in graph["nodes"]}
 
     assert validate_dag(graph) == []
-    assert nodes["crawl"]["config"]["listing_url"] == ""
-    assert nodes["crawl"]["config"]["items_path"] == ""
-    assert nodes["crawl"]["config"]["url_pattern"] == ""
-    assert nodes["crawl"]["config"]["same_origin_only"] is True
-    assert nodes["crawl"]["config"]["pagination_enabled"] is True
-    assert nodes["crawl"]["config"]["pagination_max_pages"] >= 1
-    assert nodes["crawl"]["config"]["tabs_enabled"] is False
-    assert nodes["crawl"]["config"]["detail_fields"] == []
-    assert {field["target"] for field in nodes["mapping"]["config"]["fields"]} == {"record_id", "url"}
+    assert graph["contractVersion"] == 2
+    assert nodes["acquire"]["config"]["url"] == "{{source.url}}"
+    assert nodes["traverse"]["config"]["strategies"]["allow"] == ["traverse-links"]
+    assert nodes["traverse"]["config"]["pagination"] == {"enabled": False, "mode": "next", "maxPages": 25}
+    assert nodes["traverse"]["config"]["detail"] == {
+        "enabled": True, "selector": "", "itemsPath": "", "urlPath": "url", "maxItems": 100, "fields": [],
+    }
+    assert nodes["extract"]["config"]["strategies"]["allow"] == ["extract-mapping"]
+    assert nodes["extract"]["config"]["fields"] == []
     assert {(edge["source"], edge["target"]) for edge in graph["edges"]} == {
-        ("trigger", "crawl"), ("crawl", "mapping"), ("mapping", "output"),
+        ("start", "acquire"), ("acquire", "traverse"), ("traverse", "extract"),
+        ("extract", "process"), ("process", "assure"), ("assure", "output"),
     }
 
 

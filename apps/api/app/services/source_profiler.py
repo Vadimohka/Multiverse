@@ -7,6 +7,8 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 import httpx
 from bs4 import BeautifulSoup
 from soupsieve import escape as css_escape
+from workflow_engine.egress import BrowserEgressGuard, EgressPolicy, request_with_egress_policy
+from workflow_engine.transport import FetchPolicy
 
 
 async def profile_url(url: str, timeout: float = 20) -> dict[str, Any]:
@@ -18,8 +20,9 @@ async def profile_url(url: str, timeout: float = 20) -> dict[str, Any]:
         "xhr_candidates": [],
     }
     headers = {"User-Agent": "Mozilla/5.0 ParserStudio/1.0"}
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-        response = await client.get(url, headers=headers)
+    policy = FetchPolicy(timeout=timeout, retries=0)
+    async with httpx.AsyncClient(follow_redirects=False, timeout=timeout) as client:
+        response = await request_with_egress_policy(client, "GET", url, policy, headers=headers)
     response.raise_for_status()
     content_type = response.headers.get("content-type", "")
     result.update({
@@ -29,6 +32,7 @@ async def profile_url(url: str, timeout: float = 20) -> dict[str, Any]:
         "size": len(response.content),
         "headers": dict(response.headers),
         "encoding": response.encoding,
+        "redirect_chain": response.extensions.get("redirect_chain", []),
     })
     lower_url = url.lower()
     if "json" in content_type:
@@ -66,7 +70,7 @@ async def profile_url(url: str, timeout: float = 20) -> dict[str, Any]:
         result["warnings"].append("Обнаружены признаки CAPTCHA; может потребоваться браузерный профиль и ручная авторизация")
     should_render = len(text) < 1500 or len(scripts) > 8
     if should_render:
-        await enrich_with_playwright(result, url, timeout)
+        await enrich_with_playwright(result, str(response.url), timeout)
     # For client-rendered catalogues the initial response often contains only
     # the page shell. Build selector suggestions from the rendered DOM instead
     # of accidentally choosing navigation links from that shell.
@@ -95,12 +99,17 @@ async def profile_url(url: str, timeout: float = 20) -> dict[str, Any]:
 
 async def enrich_with_playwright(result: dict[str, Any], url: str, timeout: float) -> None:
     try:
+        egress_policy = EgressPolicy()
+        egress_policy.validate_url(url)
         from playwright.async_api import async_playwright
 
         xhr_candidates: list[dict[str, Any]] = []
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
-            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+            browser_context = await browser.new_context(viewport={"width": 1440, "height": 900})
+            guard = BrowserEgressGuard(egress_policy)
+            await guard.install(browser_context)
+            page = await browser_context.new_page()
 
             async def capture(response: Any) -> None:
                 content_type = response.headers.get("content-type", "")
@@ -126,6 +135,8 @@ async def enrich_with_playwright(result: dict[str, Any], url: str, timeout: floa
 
             page.on("response", capture)
             await page.goto(url, wait_until="networkidle", timeout=int(timeout * 1000))
+            egress_policy.validate_url(page.url)
+            guard.assert_safe()
             rendered_text = await page.locator("body").inner_text()
             rendered_soup = BeautifulSoup(await page.content(), "lxml")
             rendered_candidates = detect_repeating_candidates(rendered_soup)
@@ -134,7 +145,9 @@ async def enrich_with_playwright(result: dict[str, Any], url: str, timeout: floa
             result["rendered_repeating_candidates"] = rendered_candidates
             result["rendered_extractor"] = build_extractor_suggestion(rendered_candidates)
             result["xhr_candidates"] = unique_dicts(xhr_candidates, "url")[:50]
+            result["browser_redirect_chain"] = guard.redirect_chain
             result["screenshot_available"] = True
+            await browser_context.close()
             await browser.close()
     except Exception as exc:
         result["rendered_text_length"] = None

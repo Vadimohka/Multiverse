@@ -53,7 +53,7 @@ def test_profiler_prefers_extractable_record_container_over_repeated_link():
     assert suggestion["follow_links"] is True
 
 
-def test_source_template_preserves_profile_fields_and_natural_key():
+def test_source_template_creates_neutral_v2_graph_without_copying_profile_selectors():
     profile = {
         "extractor": {
             "container_selector": ".entry-card.x9k2",
@@ -70,9 +70,14 @@ def test_source_template_preserves_profile_fields_and_natural_key():
     nodes = {node["id"]: node for node in graph["nodes"]}
 
     extract = nodes["extract"]["config"]
-    assert extract["container_selector"] == ".entry-card.x9k2"
-    assert {field["name"] for field in extract["fields"]} == {"url", "title"}
-    assert "detail_table" not in nodes["follow"]["config"]
+    assert graph["contractVersion"] == 2
+    assert [node["type"] for node in graph["nodes"]] == [
+        "manual_trigger", "http_request", "crawl_links", "mapping", "transform", "validate", "output",
+    ]
+    assert extract["strategies"]["allow"] == ["extract-dom"]
+    assert extract["dom"]["itemSelector"] == ""
+    assert extract["dom"]["fields"] == []
+    assert "follow" not in nodes
     assert nodes["output"]["config"]["natural_key_fields"] == ["url"]
     assert nodes["output"]["config"]["on_empty"] != "allow"
 

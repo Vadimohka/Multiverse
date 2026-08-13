@@ -10,6 +10,11 @@ describe('guided node editors',()=>{
     expect(onChange).toHaveBeenLastCalledWith([{type:'click',selector:'#new'}]);
   });
 
+  it('does not offer arbitrary JavaScript browser actions',()=>{
+    render(<GuidedJsonEditor fieldName="actions" label="Actions" value={[{type:'click',selector:'#old'}]} onChange={vi.fn()}/>);
+    expect(screen.queryByRole('option',{name:'javascript'})).toBeNull();
+  });
+
   it('serializes timestamp range controls as the backend config object',()=>{
     const onChange=vi.fn();
     render(<GuidedJsonEditor fieldName="date_range_query" label="Date range" value={{from_param:'from',to_param:'to',timezone:'UTC'}} onChange={onChange}/>);

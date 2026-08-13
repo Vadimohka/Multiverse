@@ -32,6 +32,13 @@ from app.models import (
     User,
 )
 from app.schemas import DataRecordsResponse, DatasetCreate, DatasetOut, DatasetUpdate
+from app.services.authorization import (
+    has_project_access,
+    require_project,
+    require_project_object,
+    require_same_project,
+    scope_to_projects,
+)
 from app.services.data_records import RecordPage, load_current_page, load_observation_page
 from app.services.exporter import export_xlsx
 
@@ -62,12 +69,14 @@ def dataset_out(dataset: Dataset) -> dict:
 def list_datasets(
     project_id: str | None = None,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> list[dict]:
+    if project_id:
+        require_project(db, user, project_id)
     stmt = select(Dataset).order_by(Dataset.updated_at.desc())
     if project_id:
         stmt = stmt.where(Dataset.project_id == project_id)
-    datasets = db.scalars(stmt).all()
+    datasets = db.scalars(scope_to_projects(stmt, Dataset.project_id, db, user)).all()
     return [dataset_out(d) for d in datasets]
 
 
@@ -75,10 +84,14 @@ def list_datasets(
 def create_dataset(
     payload: DatasetCreate,
     db: Session = Depends(get_db),
-    _: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
+    user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
 ) -> Dataset:
+    require_project(db, user, payload.project_id)
     if db.scalar(select(Dataset).where(Dataset.slug == payload.slug)):
         raise HTTPException(status_code=409, detail="Slug dataset уже используется")
+    if payload.schema_id:
+        schema = require_project_object(db, user, DataSchema, payload.schema_id, label="Schema")
+        require_same_project(payload.project_id, schema)
     if payload.schema_id and not db.get(DataSchema, payload.schema_id):
         raise HTTPException(status_code=404, detail="Схема не найдена")
     dataset = Dataset(**payload.model_dump())
@@ -93,9 +106,9 @@ def update_dataset(
     dataset_id: str,
     payload: DatasetUpdate,
     db: Session = Depends(get_db),
-    _: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
+    user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
 ) -> Dataset:
-    dataset = db.get(Dataset, dataset_id)
+    dataset = require_project_object(db, user, Dataset, dataset_id, label="Dataset")
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset не найден")
     changes = payload.model_dump(exclude_unset=True)
@@ -105,6 +118,9 @@ def update_dataset(
         and db.scalar(select(Dataset).where(Dataset.slug == changes["slug"]))
     ):
         raise HTTPException(status_code=409, detail="Slug dataset уже используется")
+    if changes.get("schema_id"):
+        schema = require_project_object(db, user, DataSchema, changes["schema_id"], label="Schema")
+        require_same_project(dataset.project_id, schema)
     if changes.get("schema_id") and not db.get(DataSchema, changes["schema_id"]):
         raise HTTPException(status_code=404, detail="Схема не найдена")
     for key, value in changes.items():
@@ -134,6 +150,7 @@ def clear_dataset(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
 ) -> dict:
+    require_project_object(db, user, Dataset, dataset_id, label="Dataset")
     if not db.get(Dataset, dataset_id):
         raise HTTPException(status_code=404, detail="Dataset не найден")
     removed = clear_dataset_records(db, dataset_id)
@@ -148,7 +165,7 @@ def delete_dataset(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
 ) -> None:
-    dataset = db.get(Dataset, dataset_id)
+    dataset = require_project_object(db, user, Dataset, dataset_id, label="Dataset")
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset не найден")
     removed = clear_dataset_records(db, dataset_id)
@@ -166,8 +183,9 @@ def delete_dataset(
 
 @router.get("/datasets/{dataset_id}/summary")
 def dataset_summary(
-    dataset_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)
+    dataset_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ) -> dict:
+    require_project_object(db, user, Dataset, dataset_id, label="Dataset")
     if not db.get(Dataset, dataset_id):
         raise HTTPException(status_code=404, detail="Dataset не найден")
     base = (Record.dataset_id == dataset_id, Record.status == "ACTIVE")
@@ -220,6 +238,10 @@ def list_records(
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset не найден")
     authorize_dataset_read(principal, dataset.id)
+    if not has_project_access(db, principal.user, dataset.project_id):
+        if include_pending and not principal.api_token:
+            raise HTTPException(status_code=403, detail="Pending records require a project grant")
+        raise HTTPException(status_code=404, detail="Dataset не найден")
     if include_pending and (
         principal.api_token
         or not role_names(principal.user).intersection({"ADMINISTRATOR", "OPERATOR"})
@@ -518,6 +540,7 @@ def accept_baseline(
     Later changed versions keep their own Review Queue tasks and are never
     silently accepted by this convenience action.
     """
+    require_project_object(db, user, Dataset, dataset_id, label="Dataset")
     if not db.get(Dataset, dataset_id):
         raise HTTPException(status_code=404, detail="Dataset не найден")
     records = list(
@@ -566,10 +589,12 @@ def accept_baseline(
 
 @router.get("/records/{record_id}/history")
 def record_history(
-    record_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)
+    record_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ) -> list[dict]:
-    if not db.get(Record, record_id):
+    record = db.get(Record, record_id)
+    if not record:
         raise HTTPException(status_code=404, detail="Запись не найдена")
+    require_project_object(db, user, Dataset, record.dataset_id, label="Dataset")
     versions = db.scalars(
         select(RecordVersion)
         .where(RecordVersion.record_id == record_id)
@@ -595,9 +620,9 @@ def export_dataset(
     dataset_id: str,
     format: str = "xlsx",
     db: Session = Depends(get_db),
-    _: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER", "OPERATOR", "VIEWER")),
+    user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER", "OPERATOR", "VIEWER")),
 ) -> Response:
-    dataset = db.get(Dataset, dataset_id)
+    dataset = require_project_object(db, user, Dataset, dataset_id, label="Dataset")
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset не найден")
     rows = [

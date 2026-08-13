@@ -12,6 +12,7 @@ from app.dependencies import get_current_user, require_roles
 from app.models import AIProviderConfig, Prompt, User
 from app.schemas import PromptCreate, PromptOut
 from app.security import decrypt_secret
+from app.services.authorization import require_project, require_project_object, scope_to_projects
 from app.services.llm import MockProvider, OpenAICompatibleProvider, get_provider
 
 router = APIRouter(prefix="/prompts", tags=["Промпты"])
@@ -21,22 +22,25 @@ router = APIRouter(prefix="/prompts", tags=["Промпты"])
 def list_prompts(
     project_id: str | None = None,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> list[Prompt]:
+    if project_id:
+        require_project(db, user, project_id)
     stmt = select(Prompt).order_by(Prompt.updated_at.desc())
     if project_id:
         stmt = stmt.where(Prompt.project_id == project_id)
-    return list(db.scalars(stmt).all())
+    return list(db.scalars(scope_to_projects(stmt, Prompt.project_id, db, user)).all())
 
 
 @router.post("", response_model=PromptOut, status_code=201)
 def create_prompt(
     payload: PromptCreate,
     db: Session = Depends(get_db),
-    _: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
+    user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
 ) -> Prompt:
+    require_project(db, user, payload.project_id)
     if payload.provider != "mock":
-        provider = db.scalar(select(AIProviderConfig).where(AIProviderConfig.provider_name == payload.provider, AIProviderConfig.enabled.is_(True)))
+        provider = db.scalar(select(AIProviderConfig).where(AIProviderConfig.project_id == payload.project_id, AIProviderConfig.provider_name == payload.provider, AIProviderConfig.enabled.is_(True)))
         if not provider:
             raise HTTPException(status_code=422, detail="Выберите включённого AI provider")
         if payload.model not in (set(provider.available_models or []) | {provider.default_model}):
@@ -58,9 +62,9 @@ async def test_prompt(
     prompt_id: str,
     payload: PromptTestRequest,
     db: Session = Depends(get_db),
-    _: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
+    user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
 ) -> dict[str, Any]:
-    prompt = db.get(Prompt, prompt_id)
+    prompt = require_project_object(db, user, Prompt, prompt_id, label="Prompt")
     if not prompt:
         raise HTTPException(status_code=404, detail="Промпт не найден")
     content = payload.content if isinstance(payload.content, str) else __import__("json").dumps(payload.content, ensure_ascii=False)
@@ -68,7 +72,7 @@ async def test_prompt(
     user_prompt = user_prompt.replace("{{schema}}", __import__("json").dumps(prompt.response_schema, ensure_ascii=False))
     for key, value in payload.variables.items():
         user_prompt = user_prompt.replace("{{" + key + "}}", str(value))
-    provider_config = db.scalar(select(AIProviderConfig).where(AIProviderConfig.provider_name == prompt.provider, AIProviderConfig.enabled.is_(True)))
+    provider_config = db.scalar(select(AIProviderConfig).where(AIProviderConfig.project_id == prompt.project_id, AIProviderConfig.provider_name == prompt.provider, AIProviderConfig.enabled.is_(True)))
     if prompt.provider == "mock":
         provider = MockProvider()
     elif provider_config:

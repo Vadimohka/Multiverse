@@ -13,6 +13,7 @@ from app.database import get_db
 from app.dependencies import require_roles
 from app.models import RawDocument, Source, User
 from app.services.artifact_storage import ArtifactStorage
+from app.services.authorization import require_project
 
 router = APIRouter(prefix="/documents", tags=["Документы"])
 MAX_FILE_SIZE = 100 * 1024 * 1024
@@ -60,6 +61,7 @@ async def upload_source_document(
     user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
 ) -> dict[str, Any]:
     """Store an uploaded document as a reusable source and raw artifact."""
+    require_project(db, user, project_id)
     data = await read_limited(file)
     filename = Path(file.filename or "document").name
     if Path(filename).suffix.lower() not in {".pdf", ".docx", ".xlsx", ".csv", ".json"}:

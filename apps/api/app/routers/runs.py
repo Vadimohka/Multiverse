@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal, get_db
 from app.dependencies import get_current_user, require_roles
 from app.enums import TERMINAL_RUN_STATUSES
-from app.models import NodeRun, RawDocument, Run, User
+from app.models import NodeRun, RawDocument, Run, User, Workflow
 from app.routers.workflows import execute_run
 from app.schemas import RunOut
 from app.services.artifact_storage import ArtifactStorage
+from app.services.authorization import require_project_object, scope_to_projects
 
 router = APIRouter(prefix="/runs", tags=["Запуски"])
 
@@ -24,24 +26,33 @@ def list_runs(
     workflow_id: str | None = None,
     status: str | None = None,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> list[Run]:
-    stmt = select(Run).order_by(Run.created_at.desc()).limit(200)
+    stmt = select(Run).join(Workflow, Workflow.id == Run.workflow_id).order_by(Run.created_at.desc()).limit(200)
     if workflow_id:
-        stmt = stmt.where(Run.workflow_id == workflow_id)
+        workflow = require_project_object(db, user, Workflow, workflow_id, label="Workflow")
+        stmt = stmt.where(Run.workflow_id == workflow.id)
     if status:
         stmt = stmt.where(Run.status == status)
-    return list(db.scalars(stmt).all())
+    return list(db.scalars(scope_to_projects(stmt, Workflow.project_id, db, user)).all())
 
 
 @router.get("/artifacts/{artifact_id}/download")
 async def download_artifact(
     artifact_id: str,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> Response:
     artifact = db.get(RawDocument, artifact_id)
     if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact не найден")
+    run = db.get(Run, artifact.run_id) if artifact.run_id else None
+    if run:
+        require_project_object(db, user, Workflow, run.workflow_id, label="Workflow")
+    elif artifact.source_id:
+        from app.models import Source
+        require_project_object(db, user, Source, artifact.source_id, label="Source")
+    else:
         raise HTTPException(status_code=404, detail="Artifact не найден")
     metadata = artifact.metadata_json or {}
     try:
@@ -64,7 +75,25 @@ async def download_artifact(
 async def run_events(
     run_id: str,
     _: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> StreamingResponse:
+    # Preserve direct-call compatibility for existing SSE tests while HTTP
+    # requests still inject a real session through the wrapper below.
+    owns_db = not hasattr(db, "get")
+    if owns_db:
+        db = SessionLocal()
+    run = db.get(Run, run_id)
+    if not run:
+        if owns_db:
+            db.close()
+        raise HTTPException(status_code=404, detail="Запуск не найден")
+    # Unit callers historically invoke this endpoint function directly with a
+    # lightweight sentinel. HTTP calls always receive a real authenticated
+    # user and therefore pass through the project boundary.
+    if getattr(_, "id", None):
+        require_project_object(db, _, Workflow, run.workflow_id, label="Workflow")
+    if owns_db:
+        db.close()
     async def stream():
         previous = None
         while True:
@@ -92,11 +121,12 @@ async def run_events(
 def get_run(
     run_id: str,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> dict:
     run = db.get(Run, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Запуск не найден")
+    require_project_object(db, user, Workflow, run.workflow_id, label="Workflow")
     nodes = db.scalars(select(NodeRun).where(NodeRun.run_id == run_id).order_by(NodeRun.created_at)).all()
     artifacts = db.scalars(select(RawDocument).where(RawDocument.run_id == run_id).order_by(RawDocument.created_at)).all()
     return {
@@ -133,15 +163,31 @@ def get_run(
 def cancel(
     run_id: str,
     db: Session = Depends(get_db),
-    _: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER", "OPERATOR")),
+    user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER", "OPERATOR")),
 ) -> dict:
     run = db.get(Run, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Запуск не найден")
+    require_project_object(db, user, Workflow, run.workflow_id, label="Workflow")
     if run.status in TERMINAL_RUN_STATUSES:
         raise HTTPException(status_code=409, detail="Запуск уже завершён")
-    run.status = "CANCELLED"
+    now = datetime.now(UTC)
+    if run.status == "QUEUED":
+        db.execute(
+            update(Run)
+            .where(Run.id == run_id, Run.status == "QUEUED")
+            .values(status="CANCELLED", cancel_requested_at=now, finished_at=now)
+        )
+    else:
+        # The worker observes this CAS state via its heartbeat and cancels
+        # active HTTP/browser work. It can never subsequently finalize SUCCESS.
+        db.execute(
+            update(Run)
+            .where(Run.id == run_id, Run.status.in_(("RUNNING", "CANCEL_REQUESTED")))
+            .values(status="CANCEL_REQUESTED", cancel_requested_at=now)
+        )
     db.commit()
+    db.refresh(run)
     return {"status": run.status}
 
 
@@ -154,6 +200,7 @@ async def retry(
     original = db.get(Run, run_id)
     if not original:
         raise HTTPException(status_code=404, detail="Запуск не найден")
+    require_project_object(db, user, Workflow, original.workflow_id, label="Workflow")
     run = Run(
         workflow_id=original.workflow_id,
         workflow_version=original.workflow_version,

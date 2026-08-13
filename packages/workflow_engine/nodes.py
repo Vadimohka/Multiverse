@@ -23,7 +23,9 @@ from lxml import etree
 from lxml import html as lxml_html
 from openpyxl import Workbook, load_workbook
 
+from .egress import BrowserEgressGuard, EgressPolicy, default_resolver, request_with_egress_policy
 from .normalizers import normalize_currency, normalize_number, normalize_term, parse_rate_expression
+from .redaction import redact_artifact_bytes, redact_text
 from .transport import FetchPolicy, fetch_attempts, request_with_policy
 from .types import ExecutionContext
 
@@ -56,14 +58,25 @@ class HTTPRequestNode:
         policy = FetchPolicy.from_config(config)
         headers = render_object(config.get("headers") or {}, context, inputs)
         cookies = render_object(config.get("cookies") or {}, context, inputs)
+        # ``httpx`` replaces the query string embedded in ``url`` when
+        # ``params={}`` is passed.  An empty editor value must therefore mean
+        # "preserve the selected Source URL", not "strip its query".  This is
+        # especially important for public JSON endpoints whose required query
+        # parameters live in the Source URL.
         query_params = render_object(config.get("query_params") or {}, context, inputs)
+        if not query_params:
+            query_params = None
         json_body = render_object(config.get("json_body") or {}, context, inputs)
-        async with httpx.AsyncClient(follow_redirects=True, cookies=cookies) as client:
-            response = await request_with_policy(
+        resolver = config.get("egress_resolver")
+        async with httpx.AsyncClient(follow_redirects=False, cookies=cookies) as client:
+            response = await request_with_egress_policy(
                 client,
                 method,
                 url,
                 policy,
+                egress_policy=EgressPolicy.from_config(config),
+                resolver=resolver or default_resolver,
+                request_fn=request_with_policy,
                 headers=headers,
                 params=query_params,
                 json=json_body or None,
@@ -71,6 +84,7 @@ class HTTPRequestNode:
             response.raise_for_status()
         payload = await response_payload(context, response)
         payload["fetch_attempts"] = fetch_attempts(response)
+        payload["redirect_chain"] = response.extensions.get("redirect_chain", [])
         return payload
 
 
@@ -81,18 +95,23 @@ class BrowserOpenNode:
         url = render_template(str(config.get("url") or "{{source.url}}"), context, inputs)
         if not url:
             raise ValueError("Browser Open: URL не задан")
+        egress_policy = EgressPolicy.from_config(config)
+        resolver = config.get("egress_resolver") or default_resolver
+        egress_policy.validate_url(url, resolver=resolver)
         timeout_ms = int(float(config.get("timeout", 45)) * 1000)
         network: list[dict[str, Any]] = []
         try:
             from playwright.async_api import async_playwright
 
             async with async_playwright() as playwright:
-                profile = context.variables.get("browser_profile", {})
+                profile = context.capabilities.get("browser_profile", {})
                 proxy = profile.get("proxy") if isinstance(profile, dict) else None
                 browser = await playwright.chromium.launch(headless=True, proxy=proxy or None)
                 browser_context = await browser.new_context(
                     **browser_context_options(profile if isinstance(profile, dict) else {}, config)
                 )
+                egress_guard = BrowserEgressGuard(egress_policy, resolver=resolver)
+                await egress_guard.install(browser_context)
                 configured_cookies = config.get("browser_cookies") or profile.get("cookies") or []
                 if isinstance(configured_cookies, dict):
                     origin = urlunsplit((*urlsplit(url)[:2], "", "", ""))
@@ -114,13 +133,17 @@ class BrowserOpenNode:
                             network.append({"url": response.url, "status": response.status, "content_type": content_type, "body": body})
                     page.on("response", on_response)
                 await page.goto(url, wait_until=str(config.get("wait_until", "networkidle")), timeout=timeout_ms)
+                egress_guard.assert_safe()
                 for action in config.get("actions", []):
                     await perform_browser_action(page, action, timeout_ms)
+                    egress_guard.assert_safe()
                 tab_descriptors = await discover_tab_descriptors(page) if config.get("tabs_enabled", False) else []
-                rendered_html = await collect_paginated_html(page, config, timeout_ms, start_url=page.url)
+                rendered_html = await collect_paginated_html(page, config, timeout_ms, start_url=page.url, egress_guard=egress_guard)
                 screenshot = await page.screenshot(full_page=bool(config.get("full_page", True)), type="png")
                 title = await page.title()
                 final_url = page.url
+                final_target = egress_policy.validate_url(final_url, resolver=resolver)
+                egress_guard.assert_safe()
                 await browser_context.close()
                 await browser.close()
             raw = rendered_html.encode("utf-8")
@@ -148,6 +171,12 @@ class BrowserOpenNode:
                 "tab_labels": [item.get("text") for item in tab_descriptors],
                 "artifacts": artifacts,
                 "browser_mode": "PLAYWRIGHT",
+                "redirect_chain": egress_guard.redirect_chain or [{
+                    "hop": 0,
+                    "requested_url": url,
+                    "location": final_url,
+                    "resolved_addresses": final_target["addresses"],
+                }],
             }
         except ImportError as exc:
             context.log("WARNING", "Playwright не установлен; использован HTTP fallback", error=str(exc))
@@ -206,7 +235,13 @@ def browser_context_options(profile: dict[str, Any], config: dict[str, Any]) -> 
     return options
 
 
-async def collect_paginated_html(page: Any, config: dict[str, Any], timeout_ms: int, start_url: str | None = None) -> str:
+async def collect_paginated_html(
+    page: Any,
+    config: dict[str, Any],
+    timeout_ms: int,
+    start_url: str | None = None,
+    egress_guard: BrowserEgressGuard | None = None,
+) -> str:
     """Collect every semantic tab and every page exposed by its paginator.
 
     The controls are discovered from ARIA/data-toggle semantics rather than
@@ -223,9 +258,13 @@ async def collect_paginated_html(page: Any, config: dict[str, Any], timeout_ms: 
         async def visit(path: list[dict[str, str]]) -> None:
             try:
                 await page.goto(initial_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                if egress_guard:
+                    egress_guard.assert_safe()
                 for control in path:
                     await click_tab_descriptor(page, control, timeout_ms)
                     await page.wait_for_timeout(wait_ms)
+                    if egress_guard:
+                        egress_guard.assert_safe()
                 visible = await discover_tab_descriptors(page)
                 current_depth = int(path[-1].get("scope_depth") or 0)
                 path_keys = {tab_descriptor_key(item) for item in path}
@@ -234,7 +273,7 @@ async def collect_paginated_html(page: Any, config: dict[str, Any], timeout_ms: 
                     for child in children:
                         await visit(path + [child])
                 else:
-                    sections.append(await collect_current_paginated_html(page, config, timeout_ms))
+                    sections.append(await collect_current_paginated_html(page, config, timeout_ms, egress_guard=egress_guard))
             except Exception:
                 return
 
@@ -242,7 +281,7 @@ async def collect_paginated_html(page: Any, config: dict[str, Any], timeout_ms: 
             await visit([descriptor])
         if sections:
             return merge_rendered_sections(sections)
-    return await collect_current_paginated_html(page, config, timeout_ms)
+    return await collect_current_paginated_html(page, config, timeout_ms, egress_guard=egress_guard)
 
 
 async def discover_tab_descriptors(page: Any) -> list[dict[str, str]]:
@@ -304,7 +343,12 @@ def css_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
-async def collect_current_paginated_html(page: Any, config: dict[str, Any], timeout_ms: int) -> str:
+async def collect_current_paginated_html(
+    page: Any,
+    config: dict[str, Any],
+    timeout_ms: int,
+    egress_guard: BrowserEgressGuard | None = None,
+) -> str:
     """Collect the current tab through visible pagination controls."""
     if not config.get("pagination_enabled"):
         return await page.content()
@@ -312,13 +356,19 @@ async def collect_current_paginated_html(page: Any, config: dict[str, Any], time
     selector = str(config.get("pagination_next_selector") or "li[aria-label='Next page'] a")
     rendered_pages: list[str] = []
     seen_signatures: set[str] = set()
-    for _ in range(max_pages):
+    for index in range(max_pages):
         document = await page.content()
         rendered_pages.append(document)
         signature = await page_text_signature(page)
         if signature in seen_signatures:
             break
         seen_signatures.add(signature)
+        # ``max_pages`` is a fetch budget, not a number of navigation
+        # attempts.  After retaining the last requested page, do not advance
+        # the live tab one more time; doing so used to leave provenance on an
+        # uncollected third page for a two-page traversal.
+        if index + 1 >= max_pages:
+            break
         candidates = page.locator(selector)
         next_link = None
         for index in range(await candidates.count()):
@@ -342,6 +392,8 @@ async def collect_current_paginated_html(page: Any, config: dict[str, Any], time
             await next_link.click(timeout=timeout_ms)
             await page.wait_for_timeout(int(config.get("pagination_wait_ms", 500)))
             await page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 15000))
+            if egress_guard:
+                egress_guard.assert_safe()
         except Exception:
             break
         if await page_text_signature(page) == signature:
@@ -398,12 +450,16 @@ class DownloadFileNode:
             return {"url": url, "filename": filename, "content_type": content_type, "content_base64": base64.b64encode(content).decode("ascii"), "size": len(content), "sha256": artifact["sha256"], "artifact": artifact}
         policy = FetchPolicy.from_config(config)
         cookies = render_object(config.get("cookies") or {}, context, inputs)
-        async with httpx.AsyncClient(follow_redirects=True, cookies=cookies) as client:
-            response = await request_with_policy(
+        resolver = config.get("egress_resolver")
+        async with httpx.AsyncClient(follow_redirects=False, cookies=cookies) as client:
+            response = await request_with_egress_policy(
                 client,
                 "GET",
                 url,
                 policy,
+                egress_policy=EgressPolicy.from_config(config),
+                resolver=resolver or default_resolver,
+                request_fn=request_with_policy,
                 headers=render_object(config.get("headers") or {}, context, inputs),
             )
             response.raise_for_status()
@@ -415,6 +471,7 @@ class DownloadFileNode:
             "content_base64": base64.b64encode(response.content).decode("ascii"), "size": len(response.content),
             "sha256": artifact["sha256"], "artifact": artifact,
             "fetch_attempts": fetch_attempts(response),
+            "redirect_chain": response.extensions.get("redirect_chain", []),
         }
 
 
@@ -459,24 +516,37 @@ class FollowLinksNode:
 
         headers = render_object(config.get("headers") or {}, context, inputs)
         cookies = render_object(config.get("cookies") or {}, context, inputs)
-        async with httpx.AsyncClient(follow_redirects=True, headers=headers, cookies=cookies) as client:
+        egress_policy = EgressPolicy.from_config(config)
+        resolver = config.get("egress_resolver") or default_resolver
+        async with httpx.AsyncClient(follow_redirects=False, headers=headers, cookies=cookies) as client:
             async def fetch(parent: dict[str, Any]) -> None:
                 url = str(parent[url_field])
                 response: httpx.Response | None = None
                 message = ""
                 exception_attempts: list[dict[str, Any]] = []
+                exception_redirect_chain: list[dict[str, Any]] = []
                 async with semaphore:
                     try:
-                        response = await request_with_policy(client, "GET", url, fetch_policy)
+                        response = await request_with_egress_policy(
+                            client,
+                            "GET",
+                            url,
+                            fetch_policy,
+                            egress_policy=egress_policy,
+                            resolver=resolver,
+                            request_fn=request_with_policy,
+                        )
                         response.raise_for_status()
                     except Exception as exc:
                         message = str(exc)
                         exception_attempts = getattr(exc, "fetch_attempts", [])
+                        exception_redirect_chain = getattr(exc, "redirect_chain", [])
                     if response is None or not response.is_success:
                         async with lock:
                             attempts = fetch_attempts(response) if response is not None else exception_attempts
-                            failures.append({"url": url, "error": message, "fetch_attempts": attempts})
-                            progress.append({"url": url, "status": "FAILED", "error": message, "fetch_attempts": attempts})
+                            redirect_chain = response.extensions.get("redirect_chain", []) if response is not None else exception_redirect_chain
+                            failures.append({"url": url, "error": message, "fetch_attempts": attempts, "redirect_chain": redirect_chain})
+                            progress.append({"url": url, "status": "FAILED", "error": message, "fetch_attempts": attempts, "redirect_chain": redirect_chain})
                         return
                     child: dict[str, Any] = {"url": str(response.url), "status_code": response.status_code, "body": response.text}
                     soup = BeautifulSoup(response.text, "lxml")
@@ -498,7 +568,7 @@ class FollowLinksNode:
                             detail = {**child, **table_row}
                             row = parent if merge_mode == "PARENT_ONLY" else detail if merge_mode == "CHILD_ONLY" else {**parent, **detail}
                             records.append(row)
-                        progress.append({"url": url, "status": "SUCCESS", "status_code": response.status_code, "detail_rows": len(table_rows), "fetch_attempts": fetch_attempts(response)})
+                        progress.append({"url": url, "status": "SUCCESS", "status_code": response.status_code, "detail_rows": len(table_rows), "fetch_attempts": fetch_attempts(response), "redirect_chain": response.extensions.get("redirect_chain", [])})
 
             await asyncio.gather(*(fetch(parent) for parent in parents))
         if failures and policy == "FAIL_FAST":
@@ -517,17 +587,28 @@ class PaginationNode:
         current = int(config.get("start", 1))
         step = int(config.get("step", 1))
         pages: list[dict[str, Any]] = []
-        async with httpx.AsyncClient(follow_redirects=True, timeout=float(config.get("timeout", 30))) as client:
+        policy = FetchPolicy.from_config(config)
+        egress_policy = EgressPolicy.from_config(config)
+        resolver = config.get("egress_resolver") or default_resolver
+        async with httpx.AsyncClient(follow_redirects=False, timeout=policy.timeout) as client:
             for _ in range(min(int(config.get("max_pages", 10)), 1000)):
                 url = render_template(template, context, {**inputs, "page": current, "offset": current})
-                response = await client.get(url)
+                response = await request_with_egress_policy(
+                    client,
+                    "GET",
+                    url,
+                    policy,
+                    egress_policy=egress_policy,
+                    resolver=resolver,
+                    request_fn=request_with_policy,
+                )
                 if not response.is_success:
                     break
                 body = response.text
                 stop_selector = str(config.get("stop_selector") or "")
                 if stop_selector and not BeautifulSoup(body, "lxml").select(stop_selector):
                     break
-                pages.append({"url": str(response.url), "status_code": response.status_code, "body": body})
+                pages.append({"url": str(response.url), "status_code": response.status_code, "body": body, "fetch_attempts": fetch_attempts(response), "redirect_chain": response.extensions.get("redirect_chain", [])})
                 current += step
         return {"pages": pages, "count": len(pages)}
 
@@ -547,7 +628,7 @@ class CrawlLinksNode:
         headers = {"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5", "User-Agent": "Mozilla/5.0 (compatible; ParserStudio/1.0)"}
         headers.update(render_object(config.get("headers") or {}, context, inputs))
         cookies = render_object(config.get("cookies") or {}, context, inputs)
-        client = httpx.AsyncClient(follow_redirects=True, headers=headers, cookies=cookies)
+        client = httpx.AsyncClient(follow_redirects=False, headers=headers, cookies=cookies)
         resume_token = str(inputs.get("resume_token") or config.get("resume_token") or "").strip()
         try:
             if resume_token:
@@ -602,6 +683,8 @@ class CrawlLinksNode:
         concurrency = min(max(int(config.get("concurrency", 3)), 1), 20)
         delay_ms = max(int(config.get("delay_ms", 400)), 0)
         fetch_policy = FetchPolicy.from_config(config)
+        egress_policy = EgressPolicy.from_config(config)
+        resolver = config.get("egress_resolver") or default_resolver
         semaphore = asyncio.Semaphore(concurrency)
         records: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
@@ -628,11 +711,14 @@ class CrawlLinksNode:
                         request_url = render_template(str(detail_request.get("url") or candidate["url"]), context, detail_scope)
                         request_params = render_object(detail_request.get("query_params") or {}, context, detail_scope)
                         try:
-                            response = await request_with_policy(
+                            response = await request_with_egress_policy(
                                 client,
                                 str(detail_request.get("method") or "GET").upper(),
                                 request_url,
                                 fetch_policy,
+                                egress_policy=egress_policy,
+                                resolver=resolver,
+                                request_fn=request_with_policy,
                                 params=request_params,
                             )
                             response.raise_for_status()
@@ -645,6 +731,7 @@ class CrawlLinksNode:
                                     "record_id": candidate["record_id"],
                                     "error": str(error or "Detail API request failed"),
                                     "fetch_attempts": fetch_attempts(response) if response is not None else getattr(error, "fetch_attempts", []),
+                                    "redirect_chain": response.extensions.get("redirect_chain", []) if response is not None else getattr(error, "redirect_chain", []),
                                 })
                             return []
                         try:
@@ -694,11 +781,14 @@ class CrawlLinksNode:
                         artifact_content = detail_html.encode("utf-8")
                     else:
                         try:
-                            response = await request_with_policy(
+                            response = await request_with_egress_policy(
                                 client,
                                 "GET",
                                 candidate["url"],
                                 fetch_policy,
+                                egress_policy=egress_policy,
+                                resolver=resolver,
+                                request_fn=request_with_policy,
                             )
                             response.raise_for_status()
                         except Exception as exc:  # request failures are reported per item, not hidden
@@ -710,6 +800,7 @@ class CrawlLinksNode:
                                     "record_id": candidate["record_id"],
                                     "error": str(error or "HTTP request failed"),
                                     "fetch_attempts": fetch_attempts(response) if response is not None else getattr(error, "fetch_attempts", []),
+                                    "redirect_chain": response.extensions.get("redirect_chain", []) if response is not None else getattr(error, "redirect_chain", []),
                                 })
                             return []
                         detail_url = str(response.url)
@@ -729,6 +820,7 @@ class CrawlLinksNode:
                                 "request_url": candidate.get("_detail_request_url") or detail_url,
                                 "status_code": response.status_code,
                                 "fetch_attempts": fetch_attempts(response),
+                                "redirect_chain": response.extensions.get("redirect_chain", []),
                             })
                     async with record_lock:
                         records.append(record)
@@ -890,6 +982,12 @@ class CrawlLinksNode:
                     "tabs_max_depth": config.get("tabs_max_depth", 4),
                     "full_page": False,
                     "http_fallback": True,
+                    "egress_resolver": config.get("egress_resolver"),
+                    "allowed_domains": config.get("allowed_domains"),
+                    "egress_allowed_domains": config.get("egress_allowed_domains"),
+                    "allowed_ports": config.get("allowed_ports"),
+                    "egress_allowed_ports": config.get("egress_allowed_ports"),
+                    "max_redirects": config.get("max_redirects"),
                 },
             )
             # Merge every discovered JSON/XHR collection.  Taking only the
@@ -913,11 +1011,22 @@ class CrawlLinksNode:
         owns_client = client is None
         if client is None:
             cookies = render_object(config.get("cookies") or {}, context, inputs)
-            client = httpx.AsyncClient(follow_redirects=True, headers=headers, cookies=cookies)
+            client = httpx.AsyncClient(follow_redirects=False, headers=headers, cookies=cookies)
         responses: list[httpx.Response] = []
         documents: list[str] = []
         try:
-            response = await request_with_policy(client, "GET", listing_url, listing_policy, params=params)
+            egress_policy = EgressPolicy.from_config(config)
+            resolver = config.get("egress_resolver") or default_resolver
+            response = await request_with_egress_policy(
+                client,
+                "GET",
+                listing_url,
+                listing_policy,
+                egress_policy=egress_policy,
+                resolver=resolver,
+                request_fn=request_with_policy,
+                params=params,
+            )
             response.raise_for_status()
             responses.append(response)
             content_type = response.headers.get("content-type", "")
@@ -937,7 +1046,15 @@ class CrawlLinksNode:
                     if next_url in seen_pages:
                         break
                     seen_pages.add(next_url)
-                    response = await request_with_policy(client, "GET", next_url, listing_policy)
+                    response = await request_with_egress_policy(
+                        client,
+                        "GET",
+                        next_url,
+                        listing_policy,
+                        egress_policy=egress_policy,
+                        resolver=resolver,
+                        request_fn=request_with_policy,
+                    )
                     response.raise_for_status()
                     responses.append(response)
                     documents.append(response.text)
@@ -952,6 +1069,11 @@ class CrawlLinksNode:
                 for attempt in fetch_attempts(page_response)
             ],
             "pages": len(responses),
+            "redirect_chain": [
+                hop
+                for page_response in responses
+                for hop in page_response.extensions.get("redirect_chain", [])
+            ],
         }
         listing_body = merge_rendered_sections(documents) if len(documents) > 1 else response.text
         if config.get("save_artifacts", True):
@@ -1099,7 +1221,13 @@ class ExtractRepeatingListNode:
                 name = field.get("name")
                 if not name:
                     continue
-                element = container.select_one(str(field.get("selector") or ""))
+                # Field selectors are relative to a repeating container.  A
+                # card is often the link itself, so the no-code editor needs
+                # an explicit way to select that container rather than an
+                # impossible descendant ``a.card``.  ``:scope`` (and the
+                # concise ``.`` alias) mean the current container.
+                field_selector = str(field.get("selector") or "").strip()
+                element = container if field_selector in {":scope", "."} else container.select_one(field_selector)
                 if not element:
                     row[name] = field.get("default")
                     continue
@@ -1109,7 +1237,27 @@ class ExtractRepeatingListNode:
                     row[name] = str(element)
                 else:
                     row[name] = element.get_text(" ", strip=True)
-                evidence[name] = {"css_selector": f"{selector} {field.get('selector')}", "text": str(row[name])[:500]}
+                    # A few public RSS generators emit ``<link/>`` followed
+                    # by the URL as the element's XML tail instead of putting
+                    # it inside ``<link>``.  BeautifulSoup models that URL as
+                    # a sibling string, so ordinary CSS text extraction sees
+                    # an empty link.  Treat the immediately following
+                    # non-empty text node as the link value only for an empty
+                    # XML/RSS ``link`` element.  This is content-shape
+                    # handling, not a site-specific preset, and normal Atom
+                    # links still use their configured ``href`` attribute.
+                    if (
+                        not row[name]
+                        and element.name == "link"
+                        and "xml" in str(html).lstrip()[:200].lower()
+                    ):
+                        sibling = element.next_sibling
+                        while sibling is not None and not str(sibling).strip():
+                            sibling = sibling.next_sibling
+                        candidate = str(sibling).strip() if sibling is not None else ""
+                        if candidate.startswith(("http://", "https://")):
+                            row[name] = candidate
+                evidence[name] = {"css_selector": selector if element is container else f"{selector} {field_selector}", "text": str(row[name])[:500]}
             row.setdefault("evidence", evidence)
             rows.append(row)
         return {"records": rows, "count": len(rows)}
@@ -1250,12 +1398,42 @@ class TransformNode:
             data = inputs
         records = data if isinstance(data, list) else [data]
         output: list[dict[str, Any]] = []
+        decisions: list[dict[str, Any]] = []
         for item in records:
             row = dict(item) if isinstance(item, dict) else {"value": item}
+            original = dict(row)
             for operation in config.get("operations", []):
                 apply_operation(row, operation)
-            output.append(row)
-        return {"records": output, "count": len(output), "business_records": bool(inputs.get("business_records"))}
+            include, reason = deterministic_filter_decision(row, config.get("filters") or [])
+            if include:
+                output.append(row)
+                decisions.append({"action": "INCLUDED", "reason": reason, "record": _decision_identity(row)})
+            else:
+                decisions.append({"action": "EXCLUDED", "reason": reason, "record": _decision_identity(original)})
+        identity_fields = config.get("identity") or config.get("identity_fields") or []
+        if isinstance(identity_fields, str):
+            identity_fields = [value.strip() for value in identity_fields.split(",") if value.strip()]
+        deduped, duplicates = deterministic_deduplicate(output, identity_fields)
+        decisions.extend(duplicates)
+        transform_revision = str(config.get("transformRevision") or config.get("transform_revision") or "process@2")
+        # Keep pass-through records byte/semantically compatible.  Process
+        # provenance starts when the preset actually declares a transformation
+        # or identity/filter decision.
+        if config.get("operations") or config.get("filters") or identity_fields:
+            for record in deduped:
+                provenance = record.get("__provenance") if isinstance(record.get("__provenance"), dict) else {}
+                record["__provenance"] = {
+                    **provenance,
+                    "process": {"transform_revision": transform_revision},
+                }
+        return {
+            "records": deduped,
+            "count": len(deduped),
+            "business_records": bool(inputs.get("business_records")),
+            "filter_decisions": decisions,
+            "duplicates_removed": len(duplicates),
+            "transform_revision": transform_revision,
+        }
 
 
 class MappingNode:
@@ -1264,6 +1442,8 @@ class MappingNode:
     type = "mapping"
 
     async def execute(self, context: ExecutionContext, inputs: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+        if config.get("fieldCandidates") or config.get("field_candidates"):
+            return schema_first_extract(context, inputs, config)
         value = find_value(inputs, str(config.get("input_path", "records")))
         rows = value if isinstance(value, list) else [value] if value is not None else []
         records: list[dict[str, Any]] = []
@@ -1294,12 +1474,205 @@ class MappingNode:
                 if spec.get("required") and result in (None, ""):
                     errors.append({"row": index, "field": target, "code": "REQUIRED"})
                 record[target] = result
+                evidence = source.get("evidence") if isinstance(source.get("evidence"), dict) else {}
+                if target in evidence:
+                    record.setdefault("__evidence", {})[target] = evidence[target]
             provenance = source.get("__provenance")
             if isinstance(provenance, dict):
                 record["__provenance"] = provenance
             records.append(record)
         return {"records": records, "count": len(records), "mapping_errors": errors,
                 "business_records": True, "schema_preview": records[:5]}
+
+
+def schema_first_extract(context: ExecutionContext, inputs: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Extract a target schema from ordered field candidates.
+
+    Candidates are declarative JSON/JSON-LD/DOM/table/document paths.  A field
+    is accepted only after its type/cardinality postconditions pass, and the
+    chosen candidate remains attached to the output record as evidence.
+    """
+
+    candidates_by_field = config.get("fieldCandidates") or config.get("field_candidates") or {}
+    if not isinstance(candidates_by_field, dict):
+        raise ValueError("fieldCandidates must be an object keyed by target field")
+    collection = _schema_collection(inputs, config)
+    selection = str(config.get("selection") or "first_valid").lower()
+    mode = str(config.get("mode") or "AUTO").upper()
+    records: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for index, source in enumerate(collection):
+        row: dict[str, Any] = {}
+        evidence: dict[str, Any] = {}
+        for target, raw_candidates in candidates_by_field.items():
+            candidates = raw_candidates if isinstance(raw_candidates, list) else []
+            choices: list[dict[str, Any]] = []
+            for position, candidate in enumerate(candidates):
+                if not isinstance(candidate, dict):
+                    continue
+                value, pointer = _extract_field_candidate(source, candidate, inputs)
+                result = _candidate_result(target, value, candidate, pointer, position)
+                choices.append(result)
+            accepted = [item for item in choices if item["passed"]]
+            pinned = str(config.get("selectedCandidates", {}).get(target, "")) if isinstance(config.get("selectedCandidates"), dict) else ""
+            if mode in {"MANUAL", "ASSISTED"} and pinned:
+                accepted = [item for item in accepted if item["id"] == pinned]
+            chosen: dict[str, Any] | None = None
+            if selection == "best_coverage":
+                chosen = max(accepted, key=lambda item: (item["coverage"], -item["position"]), default=None)
+            elif selection == "merge_non_conflicting":
+                values = {json.dumps(item["value"], sort_keys=True, default=str) for item in accepted}
+                chosen = accepted[0] if len(values) == 1 and accepted else None
+                if len(values) > 1:
+                    errors.append({"row": index, "field": target, "code": "CANDIDATE_CONFLICT", "candidates": choices})
+            else:
+                chosen = accepted[0] if accepted else None
+            if chosen is None:
+                if any(bool(item.get("required")) for item in candidates if isinstance(item, dict)):
+                    errors.append({"row": index, "field": target, "code": "FIELD_CANDIDATES_EXHAUSTED", "candidates": choices})
+                row[target] = None
+                continue
+            row[target] = chosen["value"]
+            evidence[target] = {
+                "candidate": chosen["id"],
+                "kind": chosen["kind"],
+                "pointer": chosen["pointer"],
+                "coverage": chosen["coverage"],
+                "source_value": chosen["value"],
+            }
+        provenance = source.get("__provenance") if isinstance(source, dict) and isinstance(source.get("__provenance"), dict) else {}
+        row["__provenance"] = {**provenance, "field_evidence": evidence}
+        records.append(row)
+    return {
+        "records": records,
+        "count": len(records),
+        "mapping_errors": errors,
+        "business_records": True,
+        "schema_ref": config.get("targetSchemaRef") or config.get("target_schema_ref"),
+        "field_evidence": [record.get("__provenance", {}).get("field_evidence", {}) for record in records],
+    }
+
+
+def _schema_collection(inputs: dict[str, Any], config: dict[str, Any]) -> list[dict[str, Any]]:
+    configured = find_value(inputs, str(config.get("collectionPath") or config.get("collection_path") or "records"))
+    if isinstance(configured, list):
+        return [item if isinstance(item, dict) else {"value": item} for item in configured]
+    if configured is not None:
+        return [configured if isinstance(configured, dict) else {"value": configured}]
+    return [inputs]
+
+
+def _extract_field_candidate(source: dict[str, Any], candidate: dict[str, Any], inputs: dict[str, Any]) -> tuple[Any, str]:
+    kind = str(candidate.get("kind") or candidate.get("source") or "path").lower()
+    path = str(candidate.get("path") or candidate.get("source_path") or candidate.get("selector") or "")
+    if kind in {"json", "path", "jsonpath", "listing", "document"}:
+        root = source if kind != "document" else (source.get("document") or source)
+        if path.startswith("$"):
+            values = simple_json_path(root, path)
+            return (values if candidate.get("multiple") else values[0] if values else None), path
+        return find_value(root, path), path
+    if kind in {"json_ld", "jsonld"}:
+        html = str(source.get("html") or source.get("body") or inputs.get("html") or inputs.get("body") or "")
+        values: list[Any] = []
+        for script in BeautifulSoup(html, "lxml").select("script[type='application/ld+json']"):
+            try:
+                payload = json.loads(script.get_text())
+            except (TypeError, json.JSONDecodeError):
+                continue
+            extracted = simple_json_path(payload, path if path.startswith("$") else f"$.{path}")
+            values.extend(extracted)
+        return (values if candidate.get("multiple") else values[0] if values else None), path
+    if kind in {"dom", "css", "table"}:
+        html = str(source.get("html") or source.get("body") or inputs.get("html") or inputs.get("body") or "")
+        soup = BeautifulSoup(html, "lxml")
+        elements = soup.select(path)
+        attribute = candidate.get("attribute")
+        values = [element.get(attribute) if attribute else element.get_text(" ", strip=True) for element in elements]
+        return (values if candidate.get("multiple") else values[0] if values else None), path
+    if kind == "constant":
+        return candidate.get("value"), "constant"
+    return None, path
+
+
+def _candidate_result(target: str, value: Any, candidate: dict[str, Any], pointer: str, position: int) -> dict[str, Any]:
+    multiple = bool(candidate.get("multiple"))
+    required = bool(candidate.get("required", True))
+    nonempty = bool(value) if multiple else value not in (None, "")
+    expected = str(candidate.get("valueType") or candidate.get("value_type") or "")
+    type_ok = _value_matches_type(value, expected, multiple)
+    coverage = 1.0 if nonempty else 0.0
+    minimum = float(candidate.get("minCoverage", candidate.get("min_coverage", 1.0 if required else 0.0)) or 0.0)
+    return {
+        "id": str(candidate.get("id") or f"{target}:{position}"),
+        "position": position,
+        "kind": str(candidate.get("kind") or candidate.get("source") or "path"),
+        "pointer": pointer,
+        "value": value,
+        "required": required,
+        "coverage": coverage,
+        "passed": nonempty and type_ok and coverage >= minimum,
+    }
+
+
+def _value_matches_type(value: Any, expected: str, multiple: bool) -> bool:
+    if value in (None, ""):
+        return False
+    if multiple:
+        return isinstance(value, list)
+    if not expected:
+        return True
+    if expected in {"string", "text"}:
+        return isinstance(value, str)
+    if expected in {"number", "decimal"}:
+        return isinstance(value, (int, float)) or normalize_number(value) is not None
+    if expected in {"object", "json"}:
+        return isinstance(value, dict)
+    if expected == "array":
+        return isinstance(value, list)
+    return True
+
+
+def deterministic_filter_decision(row: dict[str, Any], rules: list[Any]) -> tuple[bool, str]:
+    for raw in rules:
+        if not isinstance(raw, dict):
+            continue
+        field = str(raw.get("field") or "")
+        value = find_value(row, field)
+        operation = str(raw.get("operator") or "equals").lower()
+        expected = raw.get("value")
+        matched = {
+            "equals": value == expected,
+            "not_equals": value != expected,
+            "exists": value not in (None, ""),
+            "empty": value in (None, ""),
+            "contains": str(expected) in str(value or ""),
+            "regex": bool(re.search(str(expected or ""), str(value or ""), re.I)),
+            "in": value in (expected if isinstance(expected, list) else [expected]),
+        }.get(operation, False)
+        if matched and str(raw.get("action") or "exclude").lower() == "exclude":
+            return False, str(raw.get("reason") or f"{field}:{operation}")
+        if not matched and str(raw.get("action") or "").lower() == "include_only":
+            return False, str(raw.get("reason") or f"{field}:{operation}:not_matched")
+    return True, "PASSED_DETERMINISTIC_RULES"
+
+
+def deterministic_deduplicate(records: list[dict[str, Any]], keys: list[Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    decisions: list[dict[str, Any]] = []
+    for row in records:
+        identity = [find_value(row, str(key)) for key in keys] if keys else row
+        key = json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str)
+        if key in seen:
+            decisions.append({"action": "DEDUPLICATED", "reason": "NATURAL_IDENTITY", "record": _decision_identity(row)})
+            continue
+        seen.add(key)
+        unique.append(row)
+    return unique, decisions
+
+
+def _decision_identity(row: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 class SetConstantNode:
@@ -1336,7 +1709,7 @@ class LLMExtractNode:
     async def execute(self, context: ExecutionContext, inputs: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         content = find_value(inputs, str(config.get("input_path", "text")))
         provider = str(config.get("provider", "deepseek"))
-        provider_config = context.variables.get("ai_providers", {}).get(provider, {})
+        provider_config = context.capabilities.get("ai_providers", {}).get(provider, {})
         base_url = str(provider_config.get("base_url") or context.variables.get("deepseek_base_url") or "https://api.deepseek.com").rstrip("/")
         api_key = str(provider_config.get("api_key") or context.secrets.get(f"AI_PROVIDER_{provider}") or context.secrets.get("DEEPSEEK_API_KEY") or "")
         model = str(config.get("model") or provider_config.get("default_model") or "deepseek-chat")
@@ -1421,6 +1794,7 @@ class ValidateNode:
         records = find_value(inputs, str(config.get("input_path", "records")))
         records = records if isinstance(records, list) else [records]
         errors: list[dict[str, Any]] = []
+        quarantined: list[dict[str, Any]] = []
         for index, row in enumerate(records):
             for field in config.get("required", []):
                 if not isinstance(row, dict) or row.get(field) in (None, ""):
@@ -1433,9 +1807,49 @@ class ValidateNode:
                 validate_json_schema(row, config.get("schema") or {})
             except ValueError as exc:
                 errors.append({"row": index, "code": "SCHEMA", "message": str(exc)})
-        if errors and config.get("fail_on_error", True):
+        traversal = inputs.get("traversal") if isinstance(inputs.get("traversal"), dict) else {}
+        reconciliation = traversal.get("reconciliation") if isinstance(traversal.get("reconciliation"), dict) else {}
+        reconciliation = {
+            "discovered": int(reconciliation.get("discovered", len(records)) or 0),
+            "succeeded": int(reconciliation.get("succeeded", len(records)) or 0),
+            "intentionally_skipped": int(reconciliation.get("intentionally_skipped", 0) or 0),
+            "failed": int(reconciliation.get("failed", len(inputs.get("errors") or [])) or 0),
+            "duplicate": int(reconciliation.get("duplicate", 0) or 0),
+            "extracted": len(records),
+        }
+        expected = config.get("expectedScope") or config.get("expected_scope") or {}
+        expected = expected if isinstance(expected, dict) else {}
+        minimum = int(expected.get("minRecords", config.get("minimum_expected_records", 0)) or 0)
+        if len(records) < minimum:
+            errors.append({"code": "MINIMUM_EXPECTED_RECORDS", "expected": minimum, "actual": len(records)})
+        if bool(expected.get("requireComplete", False)) and reconciliation["failed"]:
+            errors.append({"code": "INCOMPLETE_SCOPE", "reconciliation": reconciliation})
+        allowed_empty = bool(expected.get("allowEmpty", config.get("on_empty") == "allow"))
+        if not records and not allowed_empty:
+            errors.append({"code": "EMPTY_UNEXPECTED"})
+        quarantine_enabled = bool(config.get("quarantine", config.get("quarantine_invalid", False)))
+        if errors and quarantine_enabled:
+            failed_rows = {int(error["row"]) for error in errors if isinstance(error.get("row"), int)}
+            quarantined = [row for index, row in enumerate(records) if index in failed_rows]
+            records = [row for index, row in enumerate(records) if index not in failed_rows]
+        fail_required = str(config.get("errorPolicy") or config.get("error_policy") or "").upper() in {
+            "FAIL", "FAIL_REQUIRED_SCOPE",
+        }
+        should_raise = bool(config.get("fail_on_error", True)) and int(config.get("contractVersion", 1)) != 2
+        if errors and (should_raise or fail_required and int(config.get("contractVersion", 1)) != 2) and not quarantine_enabled:
             raise ValueError(f"Schema validation failed: {errors[:20]}")
-        return {"records": records, "valid": not errors, "errors": errors, "count": len(records), "business_records": bool(inputs.get("business_records"))}
+        status = "PASS" if not errors else "PARTIAL" if records else "FAIL"
+        return {
+            "records": records,
+            "valid": not errors,
+            "errors": errors,
+            "quarantined_records": quarantined,
+            "count": len(records),
+            "business_records": bool(inputs.get("business_records")),
+            "assessment_status": status,
+            "reconciliation": reconciliation,
+            "commit_allowed": status == "PASS" or (status == "PARTIAL" and bool(config.get("allow_partial_commit", False))),
+        }
 
 
 class DeduplicateNode:
@@ -1484,6 +1898,14 @@ class OutputNode:
         minimum = max(0, int(config.get("minimum_expected_records", 0) or 0))
         on_empty = str(config.get("on_empty", "warning"))
         errors: list[dict[str, Any]] = list(inputs.get("mapping_errors") or [])
+        assessment_status = str(inputs.get("assessment_status") or "PASS")
+        commit_allowed = bool(inputs.get("commit_allowed", assessment_status == "PASS"))
+        if not commit_allowed:
+            errors.append({
+                "code": "ASSESSMENT_BLOCKED",
+                "assessment_status": assessment_status,
+                "reconciliation": inputs.get("reconciliation", {}),
+            })
         if not explicit and config.get("dataset_id"):
             errors.append({"code": "MAPPING_REQUIRED", "message": "Save Dataset принимает только business records из Mapping"})
         if record_count < minimum:
@@ -1494,6 +1916,7 @@ class OutputNode:
                 "business_records": explicit, "mapping_errors": inputs.get("mapping_errors", []),
                 "preflight": {"input_records": record_count, "minimum_expected_records": minimum,
                               "on_empty": on_empty, "validation_errors": errors,
+                              "assessment_status": assessment_status, "commit_allowed": not errors,
                               "schema_preview": records[:5] if isinstance(records, list) else records}}
 
 
@@ -1506,7 +1929,7 @@ class SaveExternalDatabaseNode:
         records = find_value(inputs, str(config.get("input_path", "records"))) or []
         records = records if isinstance(records, list) else [records]
         connection_name = str(config.get("connection") or "")
-        connection = context.variables.get("database_connections", {}).get(connection_name)
+        connection = context.capabilities.get("database_connections", {}).get(connection_name)
         if not connection:
             raise ValueError(f"Подключение к БД не найдено: {connection_name}")
         table_name = str(config.get("table") or "")
@@ -1590,11 +2013,17 @@ class SendWebhookNode:
 
     async def execute(self, context: ExecutionContext, inputs: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         url = render_template(str(config.get("url") or ""), context, inputs)
+        if not url:
+            raise ValueError("Webhook URL is required")
         payload = find_value(inputs, str(config.get("input_path", "records")))
-        async with httpx.AsyncClient(timeout=float(config.get("timeout", 30))) as client:
-            response = await client.post(url, json=payload, headers=render_object(config.get("headers") or {}, context, inputs))
+        policy = FetchPolicy.from_config(config)
+        async with httpx.AsyncClient(follow_redirects=False, timeout=policy.timeout) as client:
+            response = await request_with_egress_policy(
+                client, "POST", url, policy, egress_policy=EgressPolicy.from_config(config),
+                json=payload, headers=render_object(config.get("headers") or {}, context, inputs),
+            )
             response.raise_for_status()
-        return {"sent": True, "status_code": response.status_code, "response": response.text[:2000], "records": payload}
+        return {"sent": True, "status_code": response.status_code, "response": response.text[:2000], "records": payload, "redirect_chain": response.extensions.get("redirect_chain", [])}
 
 
 NODE_REGISTRY = {node.type: node() for node in [
@@ -2171,9 +2600,11 @@ def json_array_paths(value: Any, path: str = "$") -> list[dict[str, Any]]:
 
 
 async def store_artifact(context: ExecutionContext, data: bytes, content_type: str, url: str, filename: str, kind: str) -> dict[str, Any]:
+    secret_values = list(context.secrets.values())
+    data = redact_artifact_bytes(data, content_type, secret_values)
     sha256 = hashlib.sha256(data).hexdigest()
-    safe_filename = re.sub(r"[^a-zA-Z0-9._-]+", "_", filename or "artifact.bin")
-    artifact: dict[str, Any] = {"kind": kind, "url": url, "sha256": sha256, "content_type": content_type, "size": len(data), "filename": safe_filename}
+    safe_filename = re.sub(r"[^a-zA-Z0-9._-]+", "_", redact_text(filename or "artifact.bin", secret_values))
+    artifact: dict[str, Any] = {"kind": kind, "url": redact_text(url, secret_values), "sha256": sha256, "content_type": content_type, "size": len(data), "filename": safe_filename}
     if context.artifact_storage is not None:
         stored = await context.artifact_storage.put_bytes("raw" if kind != "export" else "exports", f"runs/{context.run_id}/{sha256}-{safe_filename}", data, content_type, {"run_id": context.run_id})
         artifact.update(stored)

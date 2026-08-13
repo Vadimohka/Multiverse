@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .contracts import CONTRACT_VERSION, PUBLIC_PHASES, V2_CONTRACTS, graph_contract_version
 from .types import DataType, NodeContract
 
 
@@ -150,5 +151,64 @@ for _item in NODE_CATALOG:
         "output_type": _contract.output_type.value,
         "output_item_path": _contract.output_item_path,
     })
+
+for _item in NODE_CATALOG:
+    phase = PUBLIC_PHASES.get(_item["type"])
+    if phase:
+        _item["public_phase"] = phase
+        _item["contract_versions"] = [1, CONTRACT_VERSION]
+        _item["v2_input_type"] = V2_CONTRACTS[_item["type"]].input_type.value
+        _item["v2_output_type"] = V2_CONTRACTS[_item["type"]].output_type.value
+
+
+# These are internal strategy plugins, not extra canvas nodes.  The editor
+# uses this serialisable metadata to make the v2 configuration discoverable
+# instead of requiring users to memorise string IDs.
+_PHASE_STRATEGIES: dict[str, list[dict[str, str]]] = {
+    "Start": [
+        {"id": "start-input", "label": "Вход запуска", "description": "Контекст, выбранный при запуске workflow."},
+    ],
+    "Acquire": [
+        {"id": "acquire-http", "label": "HTML / HTTP", "description": "Публичный HTTP-ответ с redirect provenance."},
+        {"id": "acquire-api", "label": "JSON / REST API", "description": "Публичный структурированный endpoint."},
+        {"id": "acquire-feed", "label": "RSS / XML feed", "description": "Публичная лента или XML-представление."},
+        {"id": "acquire-browser", "label": "Browser render", "description": "Рендер JavaScript-страницы и raw evidence."},
+        {"id": "acquire-browser-xhr", "label": "Browser XHR / fetch", "description": "JSON, захваченный при публичном browser render."},
+        {"id": "acquire-file", "label": "Файл / документ", "description": "Публичный PDF, DOCX, XLSX, CSV или JSON."},
+    ],
+    "Traverse": [
+        {"id": "traverse-links", "label": "HTTP pagination и detail", "description": "page/offset/cursor/next href и bounded detail fan-out."},
+        {"id": "traverse-browser", "label": "Browser states и detail", "description": "Tabs, filters, load-more, scroll и detail-карточки через CSS/actions."},
+    ],
+    "Extract": [
+        {"id": "extract-mapping", "label": "Mapping / schema", "description": "Преобразование полученных записей в business schema."},
+        {"id": "extract-dom", "label": "DOM-карточки", "description": "Повторяющиеся CSS-контейнеры и поля."},
+        {"id": "extract-json", "label": "JSONPath", "description": "Массивы/объекты в JSON или captured XHR."},
+        {"id": "extract-table", "label": "HTML-таблица", "description": "Таблица с заголовками и merged cells."},
+        {"id": "extract-document", "label": "PDF / DOCX / XLSX / CSV", "description": "Декларативный разбор скачанного документа."},
+    ],
+    "Process": [
+        {"id": "process-operations", "label": "Нормализация", "description": "Детерминированные операции, фильтры и identity."},
+    ],
+    "Assure": [
+        {"id": "assure-validation", "label": "Проверка полноты", "description": "Schema, required fields, coverage и reconciliation."},
+    ],
+    "Output": [
+        {"id": "output-dataset", "label": "Dataset", "description": "Idempotent dataset output и preflight."},
+    ],
+}
+
+for _item in NODE_CATALOG:
+    if phase := _item.get("public_phase"):
+        _item["strategy_options"] = _PHASE_STRATEGIES.get(str(phase), [])
+
+
+def contract_for_graph(node_type: str, graph: dict[str, Any]) -> NodeContract:
+    """Resolve a public port contract while retaining v1 semantics."""
+
+    legacy = _CONTRACTS[node_type]
+    if graph_contract_version(graph) == CONTRACT_VERSION and node_type in V2_CONTRACTS:
+        return V2_CONTRACTS[node_type]
+    return legacy
 
 CATALOG_BY_TYPE = {item["type"]: item for item in NODE_CATALOG}
