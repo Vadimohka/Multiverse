@@ -9,8 +9,10 @@ import hmac
 import io
 import json
 import re
+from collections.abc import Mapping
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as datetime_time
+from fnmatch import fnmatchcase
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -1397,11 +1399,15 @@ class TransformNode:
         records = data if isinstance(data, list) else [data]
         output: list[dict[str, Any]] = []
         decisions: list[dict[str, Any]] = []
-        for item in records:
-            row = dict(item) if isinstance(item, dict) else {"value": item}
+        transformed = [dict(item) if isinstance(item, dict) else {"value": item} for item in records]
+        for operation in config.get("operations", []):
+            if str(operation.get("type") or "") in _COLLECTION_OPERATION_TYPES:
+                transformed = apply_collection_operation(transformed, operation, context)
+            else:
+                for row in transformed:
+                    apply_operation(row, operation)
+        for row in transformed:
             original = dict(row)
-            for operation in config.get("operations", []):
-                apply_operation(row, operation)
             include, reason = deterministic_filter_decision(row, config.get("filters") or [])
             if include:
                 output.append(row)
@@ -1825,6 +1831,53 @@ class ValidateNode:
         allowed_empty = bool(expected.get("allowEmpty", config.get("on_empty") == "allow"))
         if not records and not allowed_empty:
             errors.append({"code": "EMPTY_UNEXPECTED"})
+        assessment_codes: list[str] = []
+        if not records and allowed_empty and bool(inputs.get("source_checked", True)):
+            assessment_codes.append("EMPTY_VALID_WINDOW")
+        coverage = config.get("requiredFieldCoverage") or config.get("required_field_coverage") or {}
+        if isinstance(coverage, dict) and records:
+            for field, minimum_coverage in coverage.items():
+                actual = sum(bool(isinstance(row, dict) and row.get(field) not in (None, "")) for row in records) / len(records)
+                if actual < float(minimum_coverage):
+                    errors.append({"code": "REQUIRED_FIELD_COVERAGE", "field": field, "expected": float(minimum_coverage), "actual": actual})
+        source_role = config.get("sourceRole") or config.get("source_role") or {}
+        if isinstance(source_role, dict) and source_role.get("expected"):
+            actual_role = inputs.get("source_role") or inputs.get("sourceRole") or next(
+                (
+                    row.get("segment") or row.get("source_role")
+                    for row in records
+                    if isinstance(row, dict)
+                    and (row.get("segment") or row.get("source_role"))
+                ),
+                None,
+            )
+            if actual_role != source_role["expected"]:
+                errors.append({"code": "SOURCE_ROLE_MISMATCH", "expected": source_role["expected"], "actual": actual_role})
+        expected_states = config.get("expectedStates") or config.get("expected_states") or {}
+        if isinstance(expected_states, dict) and expected_states.get("states"):
+            visited = {str(value) for value in (inputs.get("visited_states") or inputs.get("visitedStates") or [])}
+            missing = [str(value) for value in expected_states["states"] if str(value) not in visited]
+            if missing:
+                errors.append({"code": "EXPECTED_STATE_MISSING", "expected": expected_states["states"], "visited": sorted(visited), "missing": missing})
+        date_window = config.get("dateWindow") or config.get("date_window") or {}
+        if isinstance(date_window, dict) and bool(date_window.get("forbidOutside", date_window.get("forbid_outside", False))):
+            field = str(date_window.get("field") or "source_published_at")
+            lower = _parse_effective_date(date_window.get("from"))
+            upper = _parse_effective_date(date_window.get("to"))
+            for index, row in enumerate(records):
+                value = _parse_effective_date(row.get(field) if isinstance(row, dict) else None)
+                if value is None or (lower and value < lower) or (upper and value >= upper):
+                    errors.append({"code": "DATE_WINDOW_VIOLATION", "row": index, "field": field, "value": row.get(field) if isinstance(row, dict) else None})
+        for key, code, denominator in (
+            ("detailSuccessRatio", "DETAIL_COVERAGE_FAILED", reconciliation["discovered"]),
+            ("documentParseRatio", "DOCUMENT_PARSE_INCOMPLETE", int(inputs.get("documents_discovered", 0) or 0)),
+        ):
+            assertion = config.get(key) or config.get(re.sub(r"(?<!^)(?=[A-Z])", "_", key).lower()) or {}
+            if isinstance(assertion, dict) and assertion.get("min") is not None and denominator:
+                succeeded = reconciliation["succeeded"] if key == "detailSuccessRatio" else int(inputs.get("documents_parsed", 0) or 0)
+                actual = succeeded / denominator
+                if actual < float(assertion["min"]):
+                    errors.append({"code": code, "expected": float(assertion["min"]), "actual": actual})
         quarantine_enabled = bool(config.get("quarantine", config.get("quarantine_invalid", False)))
         if errors and quarantine_enabled:
             failed_rows = {int(error["row"]) for error in errors if isinstance(error.get("row"), int)}
@@ -1845,6 +1898,7 @@ class ValidateNode:
             "count": len(records),
             "business_records": bool(inputs.get("business_records")),
             "assessment_status": status,
+            "assessment_codes": assessment_codes + [str(error.get("code")) for error in errors if error.get("code")],
             "reconciliation": reconciliation,
             "commit_allowed": status == "PASS" or (status == "PARTIAL" and bool(config.get("allow_partial_commit", False))),
         }
@@ -2629,6 +2683,15 @@ def apply_operation(row: dict[str, Any], operation: dict[str, Any]) -> None:
         row[operation["to"]] = row.pop(field, None)
     elif kind == "constant":
         row[field] = operation.get("value")
+    elif kind == "copy":
+        target = str(operation.get("to") or field or "")
+        if target:
+            row[target] = find_value(row, str(operation.get("source") or operation.get("from") or ""))
+    elif kind == "coalesce":
+        target = str(operation.get("to") or field or "")
+        values = operation.get("fields") or operation.get("sources") or []
+        if target and isinstance(values, list):
+            row[target] = next((find_value(row, str(source)) for source in values if find_value(row, str(source)) not in (None, "")), operation.get("default"))
     elif kind == "trim" and row.get(field) is not None:
         row[field] = str(row[field]).strip()
     elif kind == "normalize_spaces" and row.get(field) is not None:
@@ -2656,6 +2719,199 @@ def apply_operation(row: dict[str, Any], operation: dict[str, Any]) -> None:
         row[operation.get("to", field)] = str(row[field]).split(str(operation.get("separator", ",")))
     elif kind == "concat":
         row[field] = str(operation.get("separator", " ")).join(str(row.get(source, "")) for source in operation.get("fields", []))
+    elif kind == "select_by_rules":
+        _apply_selection_rules(row, operation)
+    elif kind == "classify_access":
+        _apply_access_rules(row, operation)
+
+
+def _rule_text(row: Mapping[str, Any], fields: Any) -> str:
+    selected = fields if isinstance(fields, list) else [fields] if fields else list(row)
+    return "\n".join(str(find_value(dict(row), str(field)) or "") for field in selected)
+
+
+def _matches_rule(row: Mapping[str, Any], when: Any, default_fields: Any) -> tuple[bool, list[str]]:
+    """Evaluate transparent text rules stored in a preset revision.
+
+    Rule evaluation intentionally stays small and portable: case-insensitive
+    literal or regular-expression patterns over operator-selected fields.  It
+    is suitable for visible include/exclude/access policies but is never a
+    hidden classifier or a source-specific branch in the engine.
+    """
+
+    spec = dict(when) if isinstance(when, Mapping) else {}
+    text = _rule_text(row, spec.get("fields", default_fields))
+    flags = re.I if bool(spec.get("ignoreCase", spec.get("ignore_case", True))) else 0
+
+    def patterns(key: str) -> list[str]:
+        value = spec.get(key, [])
+        return [str(item) for item in (value if isinstance(value, list) else [value]) if str(item)]
+
+    def matched(pattern: str) -> bool:
+        try:
+            return bool(re.search(pattern, text, flags)) if bool(spec.get("regex", False)) else pattern.casefold() in text.casefold()
+        except re.error:
+            return False
+
+    any_patterns = patterns("anyPatterns") or patterns("any_patterns")
+    all_patterns = patterns("allPatterns") or patterns("all_patterns")
+    none_patterns = patterns("nonePatterns") or patterns("none_patterns")
+    matched_terms = [pattern for pattern in any_patterns + all_patterns + none_patterns if matched(pattern)]
+    return (
+        (not any_patterns or any(matched(pattern) for pattern in any_patterns))
+        and all(matched(pattern) for pattern in all_patterns)
+        and not any(matched(pattern) for pattern in none_patterns),
+        matched_terms,
+    )
+
+
+def _apply_selection_rules(row: dict[str, Any], operation: Mapping[str, Any]) -> None:
+    default = operation.get("default") if isinstance(operation.get("default"), Mapping) else {}
+    decision = {
+        "action": str(default.get("action") or "AMBIGUOUS").upper(),
+        "id": str(default.get("ruleId") or default.get("rule_id") or "unclassified-v1"),
+        "reason": str(default.get("reason") or "no deterministic rule matched"),
+        "matched": [],
+    }
+    for raw_rule in operation.get("rules") or []:
+        if not isinstance(raw_rule, Mapping):
+            continue
+        applies, matched = _matches_rule(row, raw_rule.get("when"), operation.get("fields"))
+        if applies:
+            decision = {
+                "action": str(raw_rule.get("action") or "AMBIGUOUS").upper(),
+                "id": str(raw_rule.get("id") or "unnamed-rule"),
+                "reason": str(raw_rule.get("reason") or raw_rule.get("id") or "configured selection rule"),
+                "matched": matched,
+            }
+            break
+    row["candidate_status"] = decision["action"] if decision["action"] in {"INCLUDE", "EXCLUDE", "AMBIGUOUS"} else "AMBIGUOUS"
+    row["selection_rule_id"] = decision["id"]
+    row["selection_reason"] = decision["reason"]
+    row["selection_evidence"] = {"matched_terms": decision["matched"], "fields": operation.get("fields") or []}
+
+
+def _apply_access_rules(row: dict[str, Any], operation: Mapping[str, Any]) -> None:
+    status = str(operation.get("default") or "PUBLIC").upper()
+    matched_terms: list[str] = []
+    for raw_rule in operation.get("rules") or []:
+        if not isinstance(raw_rule, Mapping):
+            continue
+        applies, matched = _matches_rule(row, raw_rule.get("when"), operation.get("fields"))
+        if applies:
+            status = str(raw_rule.get("status") or raw_rule.get("action") or status).upper()
+            matched_terms = matched
+            break
+    row["access_status"] = status if status in {"PUBLIC", "PAYWALLED", "ACCESS_LIMITED"} else "ACCESS_LIMITED"
+    row["access_evidence"] = {"matched_terms": matched_terms, "fields": operation.get("fields") or []}
+    if row["access_status"] != "PUBLIC":
+        for field in operation.get("redactFields") or operation.get("redact_fields") or []:
+            row[str(field)] = None
+
+
+_COLLECTION_OPERATION_TYPES = frozenset({"explode", "matrix_to_records", "unpivot", "expand_tiers", "select_effective_revision"})
+
+
+def apply_collection_operation(
+    records: list[dict[str, Any]], operation: dict[str, Any], context: ExecutionContext
+) -> list[dict[str, Any]]:
+    """Apply a declarative records-to-records transformation.
+
+    The helper deliberately knows only structural configuration.  It has no
+    source names, URLs or markup assumptions, so presets can safely use it for
+    tables, API payloads and parsed documents alike.
+    """
+
+    kind = str(operation.get("type") or "")
+    if kind == "explode":
+        source = str(operation.get("field") or operation.get("source") or "")
+        target = str(operation.get("target") or operation.get("to") or source)
+        result: list[dict[str, Any]] = []
+        for index, row in enumerate(records):
+            values = row.get(source)
+            values = values if isinstance(values, list) else ([] if values is None else [values])
+            for value_index, value in enumerate(values):
+                item = dict(row)
+                item[target] = value
+                _collection_provenance(item, kind, index, source, value_index)
+                result.append(item)
+        return result
+    if kind in {"matrix_to_records", "unpivot"}:
+        dimensions = operation.get("dimensionColumns") or operation.get("dimension_columns") or {}
+        selector = str(dimensions.get("selector") or "*")
+        header_target = str(dimensions.get("headerTarget") or dimensions.get("header_target") or "dimension_raw")
+        value_target = str(dimensions.get("valueTarget") or dimensions.get("value_target") or "value_raw")
+        id_fields = operation.get("idFields") or operation.get("id_fields") or []
+        skip_empty = bool(operation.get("skipEmpty", operation.get("skip_empty", False)))
+        result = []
+        for index, row in enumerate(records):
+            base = {field: row.get(field) for field in id_fields}
+            for column, value in row.items():
+                if not fnmatchcase(str(column), selector):
+                    continue
+                if skip_empty and value in (None, "", [], {}):
+                    continue
+                item = {**base, header_target: str(column).split(":", 1)[-1], value_target: value}
+                if isinstance(row.get("evidence"), dict):
+                    item["evidence"] = dict(row["evidence"])
+                _collection_provenance(item, kind, index, str(column))
+                result.append(item)
+        return result
+    if kind == "expand_tiers":
+        source = str(operation.get("field") or operation.get("source") or "tiers")
+        result = []
+        for index, row in enumerate(records):
+            tiers = row.get(source)
+            tiers = tiers if isinstance(tiers, list) else ([] if tiers is None else [tiers])
+            for tier_index, tier in enumerate(tiers):
+                item = {key: value for key, value in row.items() if key != source}
+                if isinstance(tier, dict):
+                    item.update(tier)
+                else:
+                    item[str(operation.get("target") or source)] = tier
+                _collection_provenance(item, kind, index, source, tier_index)
+                result.append(item)
+        return result
+    if kind == "select_effective_revision":
+        at = context.effective_run_clock or datetime.now(UTC)
+        from_field = str(operation.get("effectiveFromField") or operation.get("effective_from_field") or "effective_from")
+        to_field = str(operation.get("effectiveToField") or operation.get("effective_to_field") or "effective_to")
+        candidates = [row for row in records if _effective_candidate(row, from_field, to_field, at)]
+        if not candidates:
+            return records
+        selected = max(candidates, key=lambda item: _parse_effective_date(item.get(from_field)) or datetime.min.replace(tzinfo=UTC))
+        selected = dict(selected)
+        selected.setdefault("__provenance", {})["effective_revision"] = {
+            "operation": kind,
+            "effective_at": at.isoformat(),
+            "candidate_count": len(records),
+            "decision_rule": "current_then_latest_non_future",
+        }
+        return [selected]
+    return records
+
+
+def _collection_provenance(item: dict[str, Any], operation: str, source_row: int, source_column: str, item_index: int | None = None) -> None:
+    provenance = item.get("__provenance") if isinstance(item.get("__provenance"), dict) else {}
+    collection = {"operation": operation, "source_row": source_row, "source_column": source_column}
+    if item_index is not None:
+        collection["source_item"] = item_index
+    item["__provenance"] = {**provenance, "collection": collection}
+
+
+def _parse_effective_date(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def _effective_candidate(row: dict[str, Any], from_field: str, to_field: str, at: datetime) -> bool:
+    start, end = _parse_effective_date(row.get(from_field)), _parse_effective_date(row.get(to_field))
+    return (start is None or start <= at) and (end is None or at < end)
 
 
 def normalize_table_field_name(header: Any) -> str:

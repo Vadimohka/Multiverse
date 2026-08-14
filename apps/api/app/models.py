@@ -354,6 +354,7 @@ class RecordObservation(Base):
     )
     fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -369,6 +370,23 @@ class DatasetRun(Base):
     )
     observed_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class DatasetSourceMembership(Base, TimestampMixin):
+    """Expected source/workflow membership for a dataset coverage contract."""
+
+    __tablename__ = "dataset_source_memberships"
+    __table_args__ = (
+        UniqueConstraint("dataset_id", "source_key", name="uq_dataset_source_membership"),
+        Index("ix_dataset_source_membership_dataset_required", "dataset_id", "required"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id", ondelete="CASCADE"), index=True)
+    source_id: Mapped[str | None] = mapped_column(ForeignKey("sources.id", ondelete="SET NULL"), nullable=True, index=True)
+    workflow_id: Mapped[str | None] = mapped_column(ForeignKey("workflows.id", ondelete="SET NULL"), nullable=True, index=True)
+    source_preset_revision_id: Mapped[str | None] = mapped_column(ForeignKey("source_preset_revisions.id", ondelete="SET NULL"), nullable=True, index=True)
+    source_key: Mapped[str] = mapped_column(String(200))
+    required: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
 class ReviewTask(Base, TimestampMixin):

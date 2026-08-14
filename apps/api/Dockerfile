@@ -14,4 +14,11 @@ COPY alembic.ini .
 COPY migrations migrations
 COPY apps/api apps/api
 COPY packages packages
+# Declarative source presets/passports are runtime data for the no-code pack
+# installer and smoke command; keep them outside the Python package so users
+# can revise them without introducing site-specific engine branches.
+COPY presets presets
+COPY scripts scripts
+COPY tests/fixtures tests/fixtures
+COPY EPIC_MULTIVERSE_BELARUS_MARKET_DATA.md PASSPORT_UL_DEPOSITS.md PASSPORT_FL_DEPOSITS.md PASSPORT_MARKET_NEWS.md ./
 CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --app-dir apps/api --host 0.0.0.0 --port 8000"]

@@ -1,0 +1,20 @@
+[
+  {
+    "key": "indicator-nbrb-refinancing",
+    "name": "НБРБ / ставка рефинансирования",
+    "url": "https://www.nbrb.by/statistics/MonetaryPolicyInstruments/RefinancingRate",
+    "status": "DRAFT"
+  },
+  {
+    "key": "indicator-nbrb-daily-rates",
+    "name": "НБРБ / ежедневные ставки",
+    "url": "https://www.nbrb.by/statistics/rates/ratesDaily",
+    "status": "DRAFT"
+  },
+  {
+    "key": "indicator-nbrb-precious-metals",
+    "name": "НБРБ / банковские драгоценные металлы",
+    "url": "https://www.nbrb.by/statistics/valuables/bankingots",
+    "status": "DRAFT"
+  }
+]

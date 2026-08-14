@@ -23,6 +23,7 @@ from app.schemas import (
     BrowserProfileCreate,
     ConnectionCreate,
     ScheduleCreate,
+    ScheduleUpdate,
     SecretCreate,
 )
 from app.security import encrypt_secret, mask_secret
@@ -55,6 +56,20 @@ def create_schedule(payload: ScheduleCreate, db: Session = Depends(get_db), user
     require_project_object(db, user, Workflow, payload.workflow_id, label="Workflow")
     item = Schedule(**payload.model_dump()); db.add(item); db.flush(); audit(db, user.id, "CREATE", "schedule", item.id, after=payload.model_dump()); db.commit(); db.refresh(item)
     return {"id": item.id, **payload.model_dump()}
+
+
+@router.patch("/schedules/{schedule_id}")
+def update_schedule(schedule_id: str, payload: ScheduleUpdate, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> dict[str, Any]:
+    item = db.get(Schedule, schedule_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Расписание не найдено")
+    require_project_object(db, user, Workflow, item.workflow_id, label="Workflow")
+    changes = payload.model_dump(exclude_unset=True)
+    for field, value in changes.items():
+        setattr(item, field, value)
+    audit(db, user.id, "UPDATE", "schedule", item.id, after=changes)
+    db.commit(); db.refresh(item)
+    return {"id": item.id, "workflow_id": item.workflow_id, "name": item.name, "cron": item.cron, "timezone": item.timezone, "enabled": item.enabled}
 
 
 @router.delete("/schedules/{schedule_id}")

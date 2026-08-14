@@ -8,7 +8,16 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from app.database import SessionLocal
-from app.models import RawDocument, Record, RecordObservation, RecordVersion, Run, Workflow
+from app.models import (
+    DatasetSourceMembership,
+    RawDocument,
+    Record,
+    RecordObservation,
+    RecordVersion,
+    Run,
+    Source,
+    Workflow,
+)
 from app.routers.runs import run_events
 from app.routers.workflows import metadata_datetime, raw_document_for_item
 from sqlalchemy import select
@@ -114,6 +123,34 @@ def test_unchanged_record_is_present_in_latest_successful_run(client, auth):
     ).json()
     assert len(history["items"]) == 2
     assert len({item["record_version_id"] for item in history["items"]}) == 1
+
+
+def test_coverage_reports_expected_sources_and_evidence_is_opt_in(client, auth):
+    dataset, workflow, _, run = create_observed_dataset(
+        client, auth, source_published_at="2026-08-10T12:34:56Z"
+    )
+    project = client.get("/api/v1/projects", headers=auth).json()[0]
+    source = Source(project_id=project["id"], name="Coverage source", source_type="WEB_PAGE")
+    with SessionLocal() as db:
+        db.add(source)
+        db.flush()
+        db.add(DatasetSourceMembership(
+            dataset_id=dataset["id"], source_id=source.id, workflow_id=workflow["id"],
+            source_key="coverage-source", required=True,
+        ))
+        db.commit()
+
+    coverage = client.get(f"/api/v1/datasets/{dataset['slug']}/coverage", headers=auth)
+    compact = client.get(f"/api/v1/datasets/{dataset['slug']}/records", headers=auth)
+    detailed = client.get(f"/api/v1/datasets/{dataset['slug']}/records?include=evidence", headers=auth)
+
+    assert coverage.status_code == 200, coverage.text
+    assert coverage.json()["expected_sources"] == 1
+    assert coverage.json()["sources"][0]["run_id"] == run["id"]
+    assert compact.json()["items"][0]["evidence"] is None
+    assert detailed.json()["items"][0]["evidence"] == {
+        "text": "", "source_url": ""
+    }
 
 
 def test_source_publication_filter_uses_half_open_exact_second(client, auth):

@@ -768,6 +768,7 @@ def add_record_observation(
         source_modified_at=metadata_datetime(item.get("source_modified_at")),
         fetched_at=fetched_at,
         observed_at=utcnow(),
+        evidence=evidence_from_item(item),
     ))
 
 
@@ -884,7 +885,7 @@ def business_record(item: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
         for key, value in item.items()
-        if not key.startswith("__") and key not in {"raw_artifact", "raw_document_id"}
+        if not key.startswith("__") and key not in {"raw_artifact", "raw_document_id", "evidence"}
     }
 
 

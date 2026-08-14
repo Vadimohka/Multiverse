@@ -129,7 +129,7 @@ async def enrich_with_playwright(result: dict[str, Any], url: str, timeout: floa
                     "size": int(response.headers.get("content-length") or 0),
                     "preview_json": preview,
                     "query_params": {key: values[-1] if len(values) == 1 else values for key, values in parse_qs(urlsplit(response.url).query, keep_blank_values=True).items()},
-                    "request_body": request.post_data or "",
+                    "request_body": safe_request_body(request),
                     "headers": {key: value for key, value in request.headers.items() if key.lower() not in {"cookie", "authorization", "proxy-authorization"}},
                 })
 
@@ -153,6 +153,16 @@ async def enrich_with_playwright(result: dict[str, Any], url: str, timeout: floa
         result["rendered_text_length"] = None
         result["screenshot_available"] = False
         result["warnings"].append(f"Playwright-анализ недоступен: {str(exc)[:300]}")
+
+
+def safe_request_body(request: Any) -> str:
+    """Return public textual request data without letting binary payloads break profiling."""
+
+    try:
+        value = request.post_data
+    except (UnicodeDecodeError, ValueError):
+        return ""
+    return value if isinstance(value, str) else ""
 
 
 def detect_repeating_candidates(soup: BeautifulSoup) -> list[dict[str, Any]]:

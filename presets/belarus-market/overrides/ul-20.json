@@ -1,0 +1,25 @@
+{
+  "nodes": {
+    "extract": {
+      "strategies": {"allow": ["extract-table"], "prefer": ["extract-table"]},
+      "table": {"inputPath": "body", "selector": "table:not(.course-table)", "normalize_fields": false}
+    },
+    "process": {
+      "operations": [
+        {"type": "matrix_to_records", "idFields": ["Вид депозита", "Сумма / срок, дн."], "dimensionColumns": {"selector": "[0-9]*", "headerTarget": "term_raw", "valueTarget": "rate_raw"}, "skipEmpty": true},
+        {"type": "rename", "field": "Вид депозита", "to": "product_name"},
+        {"type": "rename", "field": "Сумма / срок, дн.", "to": "min_amount_raw"},
+        {"type": "number", "field": "min_amount_raw"},
+        {"type": "rename", "field": "min_amount_raw", "to": "min_amount"},
+        {"type": "term", "field": "term_raw"},
+        {"type": "rate", "field": "rate_raw"},
+        {"type": "rename", "field": "rate_value", "to": "rate_pct"},
+        {"type": "constant", "field": "institution_id", "value": "tcbank"},
+        {"type": "constant", "field": "institution_name", "value": "ТК Банк"},
+        {"type": "constant", "field": "segment", "value": "LEGAL_ENTITY"},
+        {"type": "constant", "field": "currency", "value": "BYN"},
+        {"type": "constant", "field": "source_url", "value": "https://www.tcbank.by/business/deposits/"}
+      ]
+    }
+  }
+}

@@ -18,6 +18,8 @@ from workflow_engine.strategies import (
     Strategy,
     StrategyRegistry,
     TraverseFacadeStrategy,
+    _Budget,
+    filter_date_boundary_records,
 )
 from workflow_engine.types import ExecutionContext
 
@@ -86,6 +88,30 @@ def test_historical_formula_clock():
     graph = {"nodes": [{"id": "f", "type": "formula", "config": {"input_path": "records", "target": "y", "expression": 'yesterday("Europe/Minsk")'}}], "edges": []}
     result = asyncio.run(WorkflowEngine().execute(graph, context(datetime.fromisoformat("2026-07-31T08:00:00+03:00")), {"records": [{}]}))
     assert result["result"]["records"][0]["y"] == "2026-07-30"
+
+
+def test_strategy_budget_enforces_declared_monotonic_deadline(monkeypatch):
+    clock = iter([100.0, 102.0])
+    monkeypatch.setattr("workflow_engine.strategies.monotonic", lambda: next(clock))
+    budget = _Budget.from_config({"budgets": {"deadlineSeconds": 1}})
+
+    with pytest.raises(ValueError, match="BUDGET_DEADLINE_EXCEEDED"):
+        budget.add_request()
+
+
+def test_date_boundary_is_half_open_and_never_early_stops_unordered_cards():
+    rows, diagnostics = filter_date_boundary_records(
+        [
+            {"published": "2026-08-11T23:00:00+03:00"},
+            {"published": "2026-08-12T12:00:00+03:00"},
+            {"published": "2026-08-13T00:00:00+03:00"},
+        ],
+        {"enabled": True, "field": "published", "lowerBound": "2026-08-12T00:00:00+03:00", "upperBound": "2026-08-13T00:00:00+03:00", "order": "UNORDERED", "stopWhenOlder": True},
+    )
+
+    assert rows == [{"published": "2026-08-12T12:00:00+03:00"}]
+    assert diagnostics["stop_reason"] is None
+    assert diagnostics["ordering_proven"] is False
 
 
 def test_incompatible_ports_are_rejected():

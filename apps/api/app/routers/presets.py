@@ -198,8 +198,8 @@ def instantiate_source_preset(
     user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER")),
 ) -> Workflow:
     preset = require_project_object(db, user, SourcePresetRevision, preset_id, label="Source preset")
-    if preset.status == "DEPRECATED":
-        raise HTTPException(status_code=422, detail="A deprecated source preset cannot be instantiated")
+    if preset.status in {"DEPRECATED", "BLOCKED"}:
+        raise HTTPException(status_code=422, detail="A blocked or deprecated source preset cannot be instantiated")
     blueprint = require_project_object(db, user, WorkflowBlueprintRevision, preset.blueprint_revision_id, label="Blueprint")
     try:
         result = compile_preset(blueprint.graph_json, preset.__dict__)

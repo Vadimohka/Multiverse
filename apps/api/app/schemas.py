@@ -215,6 +215,7 @@ class DataRecordItem(BaseModel):
     confidence: float
     review_status: str
     updated_at: datetime
+    evidence: dict[str, Any] | None = None
 
 
 class CursorPagination(BaseModel):
@@ -455,6 +456,13 @@ class ScheduleCreate(BaseModel):
     cron: str
     timezone: str = "Europe/Minsk"
     enabled: bool = True
+
+
+class ScheduleUpdate(BaseModel):
+    name: str | None = None
+    cron: str | None = None
+    timezone: str | None = None
+    enabled: bool | None = None
 
 
 class ConnectionCreate(BaseModel):
