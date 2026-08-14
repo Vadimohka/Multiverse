@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MarketIndicator v1", "type": "object",
+  "required": ["indicator_code", "effective_at", "value", "source_url"],
+  "properties": {"indicator_code": {"type": "string"}, "series_id": {"type": "string"}, "effective_at": {"type": "string", "format": "date-time"}, "value": {"type": "number"}, "unit": {"type": ["string", "null"]}, "currency": {"type": ["string", "null"]}, "dimensions": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean", "null"]}}, "evidence_ref": {"type": ["string", "null"]}, "source_url": {"type": "string", "format": "uri"}}
+}

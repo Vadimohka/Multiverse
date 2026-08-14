@@ -17,7 +17,7 @@ from workflow_engine.contracts import node_config, node_type
 from workflow_engine.strategies import DEFAULT_STRATEGIES
 
 PHASE_TYPES = {phase.lower(): node_kind for node_kind, phase in PUBLIC_PHASES.items()}
-ALLOWED_STATUSES = frozenset({"DRAFT", "VERIFIED", "DEPRECATED"})
+ALLOWED_STATUSES = frozenset({"DRAFT", "VERIFIED", "BLOCKED", "DEPRECATED"})
 FORBIDDEN_KEYS = frozenset({
     "python", "javascript", "script", "code", "callable", "encrypted_api_key",
     "encrypted_password", "encrypted_value", "storage_state",
@@ -37,7 +37,7 @@ class CompilationResult:
 def validate_status(status: str) -> str:
     normalized = str(status or "DRAFT").upper()
     if normalized not in ALLOWED_STATUSES:
-        raise PresetCompilationError("status must be DRAFT, VERIFIED, or DEPRECATED")
+        raise PresetCompilationError("status must be DRAFT, VERIFIED, BLOCKED, or DEPRECATED")
     return normalized
 
 

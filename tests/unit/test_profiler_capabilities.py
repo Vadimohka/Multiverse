@@ -1,7 +1,11 @@
 import json
 from pathlib import Path
 
-from app.services.source_profiler import analyze_html_capabilities, infer_json_schema_hints
+from app.services.source_profiler import (
+    analyze_html_capabilities,
+    infer_json_schema_hints,
+    safe_request_body,
+)
 from bs4 import BeautifulSoup
 from workflow_engine.nodes import extract_article_record
 
@@ -62,3 +66,12 @@ def test_profiled_jsonld_metadata_is_consumable_as_generic_detail_field():
     )
     assert record["source_published_at"] == "2026-08-10T09:34:56Z"
     assert record["source_modified_at"] == "2026-08-10T10:00:00Z"
+
+
+def test_profiler_drops_unreadable_binary_request_body_from_public_xhr_evidence():
+    class Request:
+        @property
+        def post_data(self):
+            raise UnicodeDecodeError("utf-8", b"\x80", 0, 1, "invalid")
+
+    assert safe_request_body(Request()) == ""

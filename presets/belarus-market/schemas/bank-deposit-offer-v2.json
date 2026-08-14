@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BankDepositOffer v2",
+  "type": "object",
+  "required": ["segment", "institution_id", "institution_name", "product_name", "currency", "rate_type", "source_url"],
+  "properties": {
+    "segment": {"enum": ["LEGAL_ENTITY", "INDIVIDUAL"]},
+    "institution_id": {"type": "string"}, "institution_name": {"type": "string"},
+    "product_id": {"type": ["string", "null"]}, "product_name": {"type": "string"},
+    "product_variant": {"type": ["string", "null"]}, "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+    "term_raw": {"type": ["string", "null"]}, "term_min_days": {"type": ["integer", "null"]}, "term_max_days": {"type": ["integer", "null"]},
+    "rate_type": {"enum": ["FIXED", "VARIABLE", "BENCHMARK_SPREAD", "TERM_TIERED", "AMOUNT_TIERED", "FORMULA", "INDIVIDUAL", "NOT_PUBLISHED"]},
+    "rate_raw": {"type": ["string", "null"]}, "rate_pct": {"type": ["number", "null"]},
+    "min_amount": {"type": ["number", "null"]}, "amount_currency": {"type": ["string", "null"]},
+    "revocability": {"enum": ["REVOCABLE", "IRREVOCABLE", "NOT_PUBLISHED", null]},
+    "replenishment_allowed": {"type": ["boolean", "null"]},
+    "partial_withdrawal_allowed": {"type": ["boolean", "null"]},
+    "capitalization": {"type": ["boolean", "null"]},
+    "interest_payment_frequency": {"type": ["string", "null"]},
+    "effective_from": {"type": ["string", "null"], "format": "date"},
+    "effective_to": {"type": ["string", "null"], "format": "date"},
+    "evidence_ref": {"type": ["string", "null"]},
+    "source_url": {"type": "string", "format": "uri"}, "canonical_url": {"type": ["string", "null"], "format": "uri"}
+  }
+}

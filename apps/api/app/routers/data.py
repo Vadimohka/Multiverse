@@ -24,6 +24,7 @@ from app.models import (
     DataSchema,
     Dataset,
     DatasetRun,
+    DatasetSourceMembership,
     Record,
     RecordObservation,
     RecordVersion,
@@ -231,6 +232,7 @@ def list_records(
     limit: int = 100,
     offset: int = 0,
     include_pending: bool = False,
+    include: str | None = None,
     db: Session = Depends(get_db),
     principal: DataPrincipal = Depends(get_data_principal),
 ) -> dict:
@@ -341,7 +343,8 @@ def list_records(
         if record_page.rows and record_page.has_more
         else None
     )
-    items = [record_api_item(*row) for row in record_page.rows]
+    include_evidence = "evidence" in {value.strip() for value in (include or "").split(",")}
+    items = [record_api_item(*row, include_evidence=include_evidence) for row in record_page.rows]
     return {
         "items": items,
         "pagination": {"limit": page_limit, "next_cursor": next_cursor},
@@ -445,9 +448,11 @@ def record_api_item(
     record: Record,
     version: RecordVersion | None,
     observation: RecordObservation | None,
+    *,
+    include_evidence: bool = False,
 ) -> dict:
     data = version.data_json if version else record.data_json
-    return {
+    item = {
         "id": record.id,
         "record_id": record.id,
         "record_version_id": version.id if version else None,
@@ -470,6 +475,88 @@ def record_api_item(
         "confidence": version.confidence if version else record.confidence,
         "review_status": version.review_status if version else record.review_status,
         "updated_at": iso_utc(record.updated_at),
+    }
+    if include_evidence:
+        item["evidence"] = observation.evidence if observation else {}
+    return item
+
+
+@router.get("/datasets/{dataset_id}/coverage")
+def dataset_coverage(
+    dataset_id: str,
+    from_: datetime | None = Query(default=None, alias="from"),
+    to: datetime | None = None,
+    db: Session = Depends(get_db),
+    principal: DataPrincipal = Depends(get_data_principal),
+) -> dict:
+    """Return source-level coverage without hardcoding a market/source list."""
+
+    dataset = resolve_dataset(db, dataset_id)
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset не найден")
+    authorize_dataset_read(principal, dataset.id)
+    if not has_project_access(db, principal.user, dataset.project_id):
+        raise HTTPException(status_code=404, detail="Dataset не найден")
+    from_, to = validate_time_range(from_, to, None)
+    memberships = list(db.scalars(
+        select(DatasetSourceMembership)
+        .where(DatasetSourceMembership.dataset_id == dataset.id)
+        .order_by(DatasetSourceMembership.source_key)
+    ).all())
+    sources: list[dict] = []
+    for membership in memberships:
+        stmt = (
+            select(Run, DatasetRun)
+            .join(DatasetRun, DatasetRun.run_id == Run.id)
+            .where(DatasetRun.dataset_id == dataset.id)
+        )
+        if membership.workflow_id:
+            stmt = stmt.where(Run.workflow_id == membership.workflow_id)
+        elif membership.source_id:
+            stmt = stmt.where(Run.source_id == membership.source_id)
+        if from_:
+            stmt = stmt.where(Run.finished_at >= from_)
+        if to:
+            stmt = stmt.where(Run.finished_at < to)
+        latest = db.execute(stmt.order_by(Run.finished_at.desc(), Run.created_at.desc()).limit(1)).first()
+        run, dataset_run = latest if latest else (None, None)
+        raw_assessment = (run.output_json.get("result", {}) if run and isinstance(run.output_json, dict) else {})
+        assessment = str(raw_assessment.get("assessment_status") or "")
+        if run is None:
+            status, codes = "MISSING", ["SOURCE_NOT_CHECKED"]
+        elif run.status in {"SUCCESS", "WAITING_FOR_REVIEW", "SUCCESS_EMPTY_ALLOWED"} and assessment != "PARTIAL":
+            status, codes = "PASS", list(raw_assessment.get("assessment_codes") or [])
+        elif run.status in SUCCESSFUL_RUN_STATUSES:
+            status, codes = "PARTIAL", list(raw_assessment.get("assessment_codes") or ["PARTIAL_RUN"])
+        else:
+            status, codes = "FAIL", [str(run.status)]
+        sources.append({
+            "source_id": membership.source_key,
+            "workflow_id": membership.workflow_id,
+            "run_id": run.id if run else None,
+            "source_preset_id": membership.source_preset_revision_id,
+            "status": status,
+            "record_count": dataset_run.observed_count if dataset_run else 0,
+            "empty_reason": "EMPTY_VALID_WINDOW" if "EMPTY_VALID_WINDOW" in codes else None,
+            "assessment_codes": codes,
+            "finished_at": iso_utc(run.finished_at) if run else None,
+            "observed_at": iso_utc(dataset_run.created_at) if dataset_run else None,
+            "required": membership.required,
+        })
+    required = [item for item in sources if item["required"]]
+    status_values = {item["status"] for item in required}
+    status = "PASS" if not required or status_values == {"PASS"} else "PARTIAL" if any(item["status"] == "PASS" for item in required) else "FAIL"
+    return {
+        "dataset_id": dataset.id,
+        "dataset_slug": dataset.slug,
+        "status": status,
+        "expected_sources": len(required),
+        "checked_sources": sum(item["status"] != "MISSING" for item in required),
+        "successful_sources": sum(item["status"] == "PASS" for item in required),
+        "partial_sources": sum(item["status"] == "PARTIAL" for item in required),
+        "failed_sources": sum(item["status"] in {"FAIL", "MISSING"} for item in required),
+        "window": {"from": iso_utc(from_), "to": iso_utc(to)},
+        "sources": sources,
     }
 
 

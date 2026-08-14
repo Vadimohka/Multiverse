@@ -543,7 +543,7 @@ def update_template(template_id: str, payload: WorkflowTemplateUpdate, db: Sessi
     return item
 
 
-@router.delete("/{template_id}", status_code=204)
+@router.delete("/{template_id}", status_code=204, response_model=None)
 def delete_template(template_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("ADMINISTRATOR", "DEVELOPER"))) -> None:
     item = require_project_object(db, user, WorkflowTemplate, template_id, label="Шаблон")
     if not item:

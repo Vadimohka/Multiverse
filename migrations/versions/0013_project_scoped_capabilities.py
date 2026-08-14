@@ -44,11 +44,24 @@ def upgrade() -> None:
             "ai_providers": "provider_name",
         }
         for table_name, name_column in unique_columns.items():
-            for constraint in inspector.get_unique_constraints(table_name):
+            target_name = f"uq_{table_name[:-1]}_project_name"
+            constraints = inspector.get_unique_constraints(table_name)
+            # ``Base.metadata.create_all`` is intentionally still used by the
+            # API lifespan for local/dev bootstrap.  In that mode the current
+            # model may already have created the intended composite constraint
+            # before Alembic reaches 0013.  Treat that exact shape/name as
+            # idempotently complete instead of issuing a duplicate ALTER.
+            if any(
+                constraint.get("name") == target_name
+                or constraint.get("column_names") == ["project_id", name_column]
+                for constraint in constraints
+            ):
+                continue
+            for constraint in constraints:
                 if constraint.get("column_names") == [name_column] and constraint.get("name"):
                     op.drop_constraint(constraint["name"], table_name, type_="unique")
             op.create_unique_constraint(
-                f"uq_{table_name[:-1]}_project_name",
+                target_name,
                 table_name,
                 ["project_id", name_column],
             )

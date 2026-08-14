@@ -7,6 +7,7 @@ import json
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from time import monotonic
 from typing import Any
 
 from .contracts import PUBLIC_PHASES, AdaptiveAttempt, ArtifactReference
@@ -866,6 +867,16 @@ class TraverseFacadeStrategy(Strategy):
             if not stop_reason or stop_reason == "PASS_THROUGH":
                 stop_reason = "DETAILS_COMPLETE" if not errors else "DETAILS_PARTIAL"
 
+        date_boundary = _mapping(config.get("dateBoundary") or config.get("date_boundary"))
+        date_diagnostics: dict[str, Any] = {"enabled": False, "stop_reason": None}
+        if date_boundary:
+            records, date_diagnostics = filter_date_boundary_records(
+                [item for item in records if isinstance(item, dict)], date_boundary
+            )
+            date_diagnostics["page_url"] = str(pages[-1].get("url") or source_url) if pages else source_url
+            if date_diagnostics.get("stop_reason"):
+                stop_reason = str(date_diagnostics["stop_reason"])
+
         reconciliation = {
             "discovered": len(discovered),
             "succeeded": len(records) if detail_enabled else len(pages),
@@ -900,7 +911,7 @@ class TraverseFacadeStrategy(Strategy):
             "count": len(records),
             "errors": errors,
             "partial": bool(errors),
-            "traversal": {"reconciliation": reconciliation, "checkpoint": checkpoint, "stop_reason": stop_reason},
+            "traversal": {"reconciliation": reconciliation, "checkpoint": checkpoint, "stop_reason": stop_reason, "date_boundary": date_diagnostics},
             "artifacts": list(context.artifacts),
             "_budget_counters": budget.counters(),
         }
@@ -913,16 +924,22 @@ class _Budget:
     limits: dict[str, int]
     requests: int = 0
     bytes: int = 0
+    started_at: float = 0.0
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> _Budget:
         raw = config.get("budgets") if isinstance(config.get("budgets"), Mapping) else {}
         limits: dict[str, int] = {}
-        for key in ("maxRequests", "maxBytes", "maxPages", "maxItems", "maxDepth"):
+        for key in ("maxRequests", "maxBytes", "maxPages", "maxItems", "maxDepth", "deadlineSeconds"):
             value = raw.get(key, config.get(key))
             if value not in (None, ""):
                 limits[key] = max(0, int(value))
-        return cls(limits)
+        return cls(limits, started_at=monotonic())
+
+    def _check_deadline(self) -> None:
+        deadline = self.limits.get("deadlineSeconds")
+        if deadline is not None and monotonic() - self.started_at > deadline:
+            raise ValueError("BUDGET_DEADLINE_EXCEEDED")
 
     def limit(self, name: str, fallback: Any) -> int:
         value = self.limits.get(name)
@@ -931,12 +948,14 @@ class _Budget:
         return value
 
     def add_request(self) -> None:
+        self._check_deadline()
         self.requests += 1
         limit = self.limits.get("maxRequests")
         if limit is not None and self.requests > limit:
             raise ValueError("BUDGET_MAX_REQUESTS_EXCEEDED")
 
     def add_bytes(self, size: int) -> None:
+        self._check_deadline()
         self.bytes += max(0, size)
         limit = self.limits.get("maxBytes")
         if limit is not None and self.bytes > limit:
@@ -948,6 +967,63 @@ class _Budget:
 
 def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def filter_date_boundary_records(
+    records: list[dict[str, Any]], date_boundary: Mapping[str, Any] | None
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Apply the declared ``[from, to)`` window without guessing ordering.
+
+    A preset may only use traversal early stop when it explicitly declares a
+    proven ascending or descending order.  This helper is shared by generic
+    list/detail transports and is intentionally neutral to field syntax.
+    """
+
+    boundary = _mapping(date_boundary)
+    if not boundary or not bool(boundary.get("enabled", True)):
+        return records, {"enabled": False, "stop_reason": None}
+    field = str(boundary.get("field") or "source_published_at")
+    lower = _boundary_datetime(boundary.get("lowerBound") or boundary.get("lower_bound"))
+    upper = _boundary_datetime(boundary.get("upperBound") or boundary.get("upper_bound"))
+    ordering = str(boundary.get("order") or "").upper()
+    ordering_proven = ordering in {"ASC", "DESC"}
+    selected: list[dict[str, Any]] = []
+    last_seen: str | None = None
+    stop_reason: str | None = None
+    for row in records:
+        parsed = _boundary_datetime(row.get(field))
+        if parsed:
+            last_seen = parsed.isoformat()
+        in_window = parsed is not None and (lower is None or parsed >= lower) and (upper is None or parsed < upper)
+        if in_window:
+            selected.append(row)
+        if ordering_proven and bool(boundary.get("stopWhenOlder", boundary.get("stop_when_older", False))) and parsed and lower:
+            older = parsed < lower if ordering == "DESC" else upper is not None and parsed >= upper
+            if older:
+                stop_reason = "DATE_BOUNDARY_REACHED"
+                break
+    return selected, {
+        "enabled": True,
+        "field": field,
+        "lower_bound": lower.isoformat() if lower else None,
+        "upper_bound": upper.isoformat() if upper else None,
+        "last_seen_source_timestamp": last_seen,
+        "ordering_assumption": ordering or None,
+        "ordering_proven": ordering_proven,
+        "stop_reason": stop_reason,
+    }
+
+
+def _boundary_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC) if parsed.tzinfo else None
 
 
 def _payload_size(value: Any) -> int:

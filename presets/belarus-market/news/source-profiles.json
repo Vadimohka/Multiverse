@@ -1,0 +1,61 @@
+{
+  "version": "news-passport-v1",
+  "common": {
+    "nodes": {
+      "acquire": {
+        "strategies": {"allow": ["acquire-http", "acquire-browser"], "prefer": ["acquire-http"], "fallbackPolicy": "ON_POSTCONDITION_FAILURE"}
+      },
+      "traverse": {
+        "strategies": {"allow": ["traverse-links"], "prefer": ["traverse-links"]},
+        "same_origin_only": true,
+        "detail": {
+          "enabled": true,
+          "maxItems": 500,
+          "fields": [
+            {"name": "title", "selector": "h1"},
+            {"name": "summary_raw", "selector": "meta[name='description']", "attribute": "content"},
+            {"name": "body_text", "selector": "article, [itemprop='articleBody'], main"},
+            {"name": "body_html", "selector": "article, [itemprop='articleBody'], main", "value": "html"},
+            {"name": "source_published_at", "source": "metadata", "metadata_key": "source_published_at", "timezone": "Europe/Minsk"},
+            {"name": "source_modified_at", "source": "metadata", "metadata_key": "source_modified_at", "timezone": "Europe/Minsk"}
+          ]
+        },
+        "dateBoundary": {"enabled": true, "field": "source_published_at", "lowerBound": "{{run.from}}", "upperBound": "{{run.to}}", "order": "DESC", "stopWhenOlder": true}
+      },
+      "process": {
+        "identity": ["canonical_url"],
+        "operations": [
+          {"type": "copy", "source": "url", "to": "canonical_url"},
+          {"type": "coalesce", "to": "external_id", "fields": ["external_id", "canonical_url"]},
+          {"type": "constant", "field": "access_status", "value": "PUBLIC"},
+          {"type": "classify_access", "fields": ["title", "summary_raw", "body_text"], "default": "PUBLIC", "rules": [
+            {"status": "PAYWALLED", "when": {"anyPatterns": ["Платный контент", "полный текст доступен по подписке", "subscribe to continue", "premium content", "subscription required"]}}
+          ], "redactFields": ["body_text", "body_html"]}
+        ]
+      },
+      "assure": {
+        "expectedScope": {"allowEmpty": true, "minRecords": 0},
+        "requiredFieldCoverage": {"source_id": 1.0, "canonical_url": 1.0, "title": 1.0, "access_status": 1.0},
+        "detailSuccessRatio": {"min": 0.95},
+        "dateWindow": {"field": "source_published_at", "from": "{{run.from}}", "to": "{{run.to}}", "forbidOutside": true}
+      }
+    }
+  },
+  "sources": {
+    "news-01": {"source_id": "bcse-releases", "source_section": "press-releases", "listingSelector": "a[href*='/solo/calendar']", "urlPattern": "/solo/calendar", "selection": {"default": {"action": "EXCLUDE", "ruleId": "bcse-release-topic-v1", "reason": "outside configured bond scope"}, "rules": [{"id": "bcse-release-topic-v1", "action": "INCLUDE", "reason": "bond topic in public detail", "when": {"anyPatterns": ["депозитарн", "биржев.*облигац", "облигац", "проспект", "услови.*выпуск"] , "regex": true}}]}},
+    "news-02": {"source_id": "bcse-news", "source_section": "news", "listingSelector": "a[href*='/solo/calendar']", "urlPattern": "/solo/calendar", "selection": {"default": {"action": "AMBIGUOUS", "ruleId": "bcse-economic-news-v1", "reason": "requires operator review of economic relevance"}, "rules": [{"id": "bcse-obvious-noneconomic-v1", "action": "EXCLUDE", "reason": "obvious non-economic notice", "when": {"anyPatterns": ["шахмат", "поздравлен", "праздник"]}}]}},
+    "news-04": {"source_id": "nbrb-press", "source_section": "press", "listingSelector": "a[href*='/news/']", "urlPattern": "/news/", "selection": {"default": {"action": "INCLUDE", "ruleId": "nbrb-press-all-v1", "reason": "all press releases in source section"}, "rules": []}},
+    "news-05": {"source_id": "nbrb-statistics", "source_section": "statistics", "listingSelector": "a[href*='/news/']", "urlPattern": "/news/", "selection": {"default": {"action": "EXCLUDE", "ruleId": "nbrb-statistics-series-v1", "reason": "outside exact statistical series"}, "rules": [{"id": "nbrb-statistics-series-v1", "action": "INCLUDE", "reason": "matches passport statistical series", "when": {"anyPatterns": ["Сведения о средних процентных ставках кредитно-депозитного рынка", "Показатели рынка корпоративных ценных бумаг"]}}]}},
+    "news-06": {"source_id": "ministry-economy", "source_section": "actual-information", "listingSelector": "main a[href$='.pdf'], main a[href$='.doc'], main a[href$='.docx'], main a[href$='.xls'], main a[href$='.xlsx'], main a[href]", "urlPattern": "/(ru/|uploads/)", "selection": {"default": {"action": "INCLUDE", "ruleId": "economy-actual-all-v1", "reason": "all public publications in configured section"}, "rules": []}},
+    "news-07": {"source_id": "minfin-news", "source_section": "news", "listingSelector": "div.list-item_news a.special-btn[href]", "urlPattern": "/ru/news/", "selection": {"default": {"action": "INCLUDE", "ruleId": "minfin-news-all-v1", "reason": "all public news in configured section"}, "rules": []}},
+    "news-08": {"source_id": "centraldepo-news", "source_section": "news", "listingSelector": "div.news-list__item .item-title a[href]", "urlPattern": "/news/.+", "pagination": {"enabled": true, "mode": "page", "urlTemplate": "https://www.centraldepo.by/news/?PAGEN_1={{page}}", "start": 1, "maxPages": 25}, "selection": {"default": {"action": "INCLUDE", "ruleId": "centraldepo-news-all-v1", "reason": "all public news in configured section"}, "rules": []}},
+    "news-09": {"source_id": "primepress-analysis", "source_section": "analysis", "listingSelector": "div.item a.title[href]", "urlPattern": "/news/analitika/", "pagination": {"enabled": true, "mode": "page", "urlTemplate": "https://primepress.by/analitika/?PAGEN_1={{page}}", "start": 1, "maxPages": 25}, "selection": {"default": {"action": "INCLUDE", "ruleId": "primepress-analysis-all-v1", "reason": "all analysis in configured section"}, "rules": []}},
+    "news-10": {"source_id": "primepress-finance", "source_section": "finance", "listingSelector": "a[href*='/news/finansi/']", "urlPattern": "/news/finansi/", "pagination": {"enabled": true, "mode": "page", "urlTemplate": "https://primepress.by/news/finansi/?PAGEN_1={{page}}", "start": 1, "maxPages": 25}, "selection": {"default": {"action": "AMBIGUOUS", "ruleId": "primepress-finance-context-v1", "reason": "requires review of finance-versus-bank scope"}, "rules": [{"id": "primepress-finance-market-context-v1", "action": "INCLUDE", "reason": "market context takes precedence over bank vocabulary", "when": {"anyPatterns": ["НБРБ", "БВФБ", "облигац", "валютн.*рын", "ценн.*бумаг"], "regex": true}}, {"id": "primepress-finance-bank-exclusion-v1", "action": "EXCLUDE", "reason": "bank-only topic", "when": {"anyPatterns": ["банковск.*вклад", "депозитн.*продукт", "кредитн.*продукт"], "regex": true}}]}},
+    "news-11": {"source_id": "myfin-securities", "source_section": "securities", "listingSelector": "main a[href*='/article/']", "urlPattern": "/article/", "selection": {"default": {"action": "INCLUDE", "ruleId": "myfin-securities-all-v1", "reason": "all articles in scoped category feed"}, "rules": []}},
+    "news-12": {"source_id": "myfin-precious-metals", "source_section": "precious-metals", "listingSelector": "main a[href*='/article/']", "urlPattern": "/article/", "selection": {"default": {"action": "INCLUDE", "ruleId": "myfin-metals-all-v1", "reason": "all articles in scoped category feed"}, "rules": []}},
+    "news-13": {"source_id": "myfin-analysis", "source_section": "analysis", "listingSelector": "main a[href*='/article/']", "urlPattern": "/article/", "selection": {"default": {"action": "INCLUDE", "ruleId": "myfin-analysis-all-v1", "reason": "all articles in scoped category feed"}, "rules": []}},
+    "news-14": {"source_id": "phoenix-refining", "source_section": "blog", "listingSelector": "main a[href*='/blog/']", "urlPattern": "/blog/", "pagination": {"enabled": true, "mode": "page", "urlTemplate": "https://www.phoenixrefining.com/blog?page={{page}}", "start": 1, "maxPages": 25}, "selection": {"default": {"action": "EXCLUDE", "ruleId": "phoenix-precious-metals-v1", "reason": "outside gold/silver/platinum scope"}, "rules": [{"id": "phoenix-precious-metals-v1", "action": "INCLUDE", "reason": "configured precious-metal topic", "when": {"anyPatterns": ["gold", "silver", "platinum"]}}]}},
+    "news-15": {"source_id": "business-times-precious-metals", "source_section": "precious-metals", "listingSelector": "main a[href*='/companies-markets/']", "urlPattern": "/companies-markets/", "selection": {"default": {"action": "AMBIGUOUS", "ruleId": "business-times-gold-v1", "reason": "precious-metals page requires gold relevance check"}, "rules": [{"id": "business-times-gold-v1", "action": "INCLUDE", "reason": "gold relevance in public material", "when": {"anyPatterns": ["gold"]}}]}},
+    "news-16": {"source_id": "texmetals-news", "source_section": "news", "listingSelector": "main a[href*='/news/']", "urlPattern": "/news/", "pagination": {"enabled": true, "mode": "page", "urlTemplate": "https://texmetals.com/news?page={{page}}", "start": 1, "maxPages": 25}, "selection": {"default": {"action": "INCLUDE", "ruleId": "texmetals-news-all-v1", "reason": "all public news in configured section"}, "rules": []}}
+  }
+}

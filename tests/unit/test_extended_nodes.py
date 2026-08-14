@@ -13,6 +13,8 @@ from workflow_engine.nodes import (
     MappingNode,
     ParseDocumentNode,
     ParseTableNode,
+    TransformNode,
+    ValidateNode,
     collect_paginated_html,
     dedupe_extracted_records,
     extract_article_record,
@@ -35,6 +37,92 @@ async def test_parse_table_with_headers():
         {"Банк": "А", "Ставка": "12,5%"},
         {"Банк": "Б", "Ставка": "10%"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_process_unpivots_a_generic_matrix_and_keeps_cell_evidence():
+    result = await TransformNode().execute(
+        context(),
+        {"records": [{
+            "product_name": "Product A",
+            "currency": "BYN",
+            "term:32-61": "6.0%",
+            "term:62-91": "7.0%",
+            "evidence": {"term:32-61": {"text": "6.0%"}},
+        }]},
+        {"operations": [{
+            "type": "matrix_to_records",
+            "idFields": ["product_name", "currency"],
+            "dimensionColumns": {"selector": "term:*", "headerTarget": "term_raw", "valueTarget": "rate_raw"},
+            "skipEmpty": True,
+        }]},
+    )
+
+    assert result["records"] == [
+        {"product_name": "Product A", "currency": "BYN", "term_raw": "32-61", "rate_raw": "6.0%", "evidence": {"term:32-61": {"text": "6.0%"}}, "__provenance": {"collection": {"operation": "matrix_to_records", "source_row": 0, "source_column": "term:32-61"}, "process": {"transform_revision": "process@2"}}},
+        {"product_name": "Product A", "currency": "BYN", "term_raw": "62-91", "rate_raw": "7.0%", "evidence": {"term:32-61": {"text": "6.0%"}}, "__provenance": {"collection": {"operation": "matrix_to_records", "source_row": 0, "source_column": "term:62-91"}, "process": {"transform_revision": "process@2"}}},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_process_applies_declarative_selection_and_paywall_rules_without_source_logic():
+    result = await TransformNode().execute(
+        context(),
+        {"records": [
+            {"title": "Gold market update", "body_text": "Public preview. Paid content: Y", "canonical_url": "https://example.test/gold"},
+            {"title": "Bank deposit promotion", "body_text": "Retail product", "canonical_url": "https://example.test/bank"},
+        ]},
+        {"operations": [
+            {
+                "type": "select_by_rules",
+                "fields": ["title", "body_text"],
+                "default": {"action": "INCLUDE", "ruleId": "default-v1", "reason": "within configured scope"},
+                "rules": [{
+                    "id": "bank-exclusion-v1", "action": "EXCLUDE", "reason": "bank-only topic",
+                    "when": {"allPatterns": ["bank", "deposit"]},
+                }],
+            },
+            {
+                "type": "classify_access",
+                "fields": ["body_text"],
+                "default": "PUBLIC",
+                "rules": [{"status": "PAYWALLED", "when": {"anyPatterns": ["paid content"]}}],
+                "redactFields": ["body_text"],
+            },
+        ]},
+    )
+
+    public_preview, excluded = result["records"]
+    assert public_preview["candidate_status"] == "INCLUDE"
+    assert public_preview["access_status"] == "PAYWALLED"
+    assert public_preview["body_text"] is None
+    assert public_preview["selection_rule_id"] == "default-v1"
+    assert excluded["candidate_status"] == "EXCLUDE"
+    assert excluded["selection_reason"] == "bank-only topic"
+
+
+@pytest.mark.asyncio
+async def test_assure_reports_field_coverage_source_role_and_valid_empty_window():
+    result = await ValidateNode().execute(
+        context(),
+        {"records": [], "source_role": "LEGAL_ENTITY", "source_checked": True},
+        {"requiredFieldCoverage": {"product_name": 1.0}, "sourceRole": {"expected": "LEGAL_ENTITY"}, "expectedScope": {"allowEmpty": True}},
+    )
+
+    assert result["assessment_status"] == "PASS"
+    assert result["assessment_codes"] == ["EMPTY_VALID_WINDOW"]
+
+
+@pytest.mark.asyncio
+async def test_assure_checks_declared_states_and_date_window_without_source_specific_logic():
+    result = await ValidateNode().execute(
+        context(),
+        {"records": [{"source_published_at": "2026-08-13T00:00:00+03:00"}], "visited_states": ["BYN"]},
+        {"fail_on_error": False, "expectedStates": {"mode": "ALL", "states": ["BYN", "USD"]}, "dateWindow": {"field": "source_published_at", "from": "2026-08-12T00:00:00+03:00", "to": "2026-08-13T00:00:00+03:00", "forbidOutside": True}},
+    )
+
+    assert result["assessment_status"] == "PARTIAL"
+    assert {item["code"] for item in result["errors"]} == {"EXPECTED_STATE_MISSING", "DATE_WINDOW_VIOLATION"}
 
 
 @pytest.mark.asyncio
