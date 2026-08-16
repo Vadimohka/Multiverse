@@ -569,6 +569,42 @@ def build_source_template(source: Source, template: str) -> dict[str, Any]:
     return graph
 
 
+_ROW_IDENTITY_FIELDS = ("page_url", "table_id", "row_index")
+
+
+def _record_natural_key(item: dict[str, Any], key_fields: list[str]) -> str | None:
+    """Resolve a record's natural key with the structural row fallback.
+
+    When declared identity fields have no value on the record, the key is
+    completed from the row identity emitted by table/card extraction
+    (``page_url``, ``table_id``, ``row_index``) plus any declared fields that
+    are present.  Distinct rows therefore never collapse into one key, while
+    fully mapped records keep their business identity (and dedupe) intact.
+    """
+
+    present = [key for key in key_fields if item.get(key) not in (None, "")]
+    if len(present) == len(key_fields):
+        return "|".join(str(item.get(key, "")) for key in key_fields)
+    fallback = [str(item.get(key)) for key in _ROW_IDENTITY_FIELDS if item.get(key) not in (None, "")]
+    if not fallback:
+        return None
+    return "|".join([str(item.get(key)) for key in present] + fallback)
+
+
+def _natural_key_rows(payload: list[Any], key_fields: list[str]) -> list[tuple[dict[str, Any], str, list[str]]]:
+    rows: list[tuple[dict[str, Any], str, list[str]]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        natural_key = _record_natural_key(item, key_fields)
+        if natural_key is None:
+            missing = [key for key in key_fields if item.get(key) in (None, "")]
+        else:
+            missing = []
+        rows.append((item, natural_key or "", missing))
+    return rows
+
+
 def persist_result(db: Session, workflow: Workflow, run: Run, result: dict[str, Any]) -> dict[str, Any]:
     graph = active_graph(db, workflow, run.workflow_version)
     graph_settings = graph.get("settings", {})
@@ -601,16 +637,13 @@ def persist_result(db: Session, workflow: Workflow, run: Run, result: dict[str, 
     if not key_fields:
         return {"enabled": True, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0,
                 "blocked": True, "warning": "Natural key обязателен перед сохранением и review"}
-    missing_keys = [{"row": index, "missing": [key for key in key_fields if item.get(key) in (None, "")]}
-                    for index, item in enumerate(payload) if isinstance(item, dict) and any(item.get(key) in (None, "") for key in key_fields)]
+    missing_keys = [{"row": index, "missing": missing}
+                    for index, (_row, _key, missing) in enumerate(_natural_key_rows(payload, key_fields)) if missing]
     if missing_keys:
         return {"enabled": True, "created": 0, "updated": 0, "unchanged": 0, "review_tasks": 0,
                 "blocked": True, "validation_errors": missing_keys}
     natural_key_rows: dict[str, list[int]] = {}
-    for index, item in enumerate(payload):
-        if not isinstance(item, dict):
-            continue
-        natural_key = "|".join(str(item.get(key, "")) for key in key_fields)
+    for index, (_row, natural_key, _missing) in enumerate(_natural_key_rows(payload, key_fields)):
         natural_key_rows.setdefault(natural_key, []).append(index)
     duplicate_keys = [
         {"code": "DUPLICATE_NATURAL_KEY", "natural_key": natural_key, "rows": rows}
@@ -657,7 +690,7 @@ def persist_result(db: Session, workflow: Workflow, run: Run, result: dict[str, 
         if not isinstance(item, dict):
             continue
         business_item = business_record(item)
-        natural_key = "|".join(str(item.get(key, "")) for key in key_fields) if key_fields else hashlib.sha256(json.dumps(item, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
+        natural_key = _record_natural_key(item, key_fields) if key_fields else hashlib.sha256(json.dumps(item, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
         data_hash = stable_record_hash(business_item)
         confidence = float(business_item.get("confidence", 1.0) or 0)
         record = db.scalar(
@@ -1079,6 +1112,11 @@ async def execute_run(run_id: str) -> None:
             status=determine_run_status(graph, result, persistence),
             output_json=output_json,
             error_json=error_json,
+            record_counts={
+                "created": int(persistence.get("created") or 0),
+                "updated": int(persistence.get("updated") or 0),
+                "unchanged": int(persistence.get("unchanged") or 0),
+            },
         ):
             # The competing cancellation transition wins.  Rolling back also
             # prevents a half-completed persistence transaction from escaping.

@@ -101,4 +101,6 @@ def test_parse_table_normalization_is_structural_not_financial():
         "валюта": "BYN",
         "процентная_ставка": "12,5%",
         "срок": "3 месяца",
+        "row_index": 0,
+        "table_id": "table:0",
     }]

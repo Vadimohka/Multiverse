@@ -94,6 +94,7 @@ def finalize_owned_run(
     status: str,
     output_json: dict[str, Any] | None = None,
     error_json: dict[str, Any] | None = None,
+    record_counts: dict[str, int] | None = None,
     now: datetime | None = None,
 ) -> bool:
     """Write a terminal status only if cancellation has not won the race."""
@@ -110,6 +111,12 @@ def finalize_owned_run(
         values["output_json"] = output_json
     if error_json is not None:
         values["error_json"] = error_json
+    if record_counts:
+        # Denormalised counters keep the Runs list response light without a
+        # per-row ``output_json`` parse on every poll.
+        values["records_created"] = int(record_counts.get("created") or 0)
+        values["records_updated"] = int(record_counts.get("updated") or 0)
+        values["records_unchanged"] = int(record_counts.get("unchanged") or 0)
     result = db.execute(
         update(Run)
         .where(Run.id == run_id, Run.status == "RUNNING", Run.lease_token == lease_token)
@@ -135,16 +142,32 @@ def mark_cancelled_if_owned(db: Session, run_id: str, lease_token: str, *, now: 
 
 
 def reconcile_stale_runs(db: Session, *, now: datetime | None = None) -> int:
-    """Turn abandoned leases and exhausted deadlines into explicit terminal runs."""
+    """Turn abandoned leases and exhausted deadlines into explicit terminal runs.
+
+    A run is only declared abandoned when both the lease expired and the
+    heartbeat went quiet for another full lease window.  Under many parallel
+    runs a live worker's renewal can be delayed past the lease boundary; the
+    double margin keeps ``RUN_LEASE_EXPIRED`` from firing while the worker is
+    still breathing.
+    """
 
     now = now or now_utc()
     stale_error = {
         "code": "RUN_LEASE_EXPIRED",
         "message": "Worker heartbeat expired before the run completed",
     }
+    heartbeat_grace = lease_duration()
     stale = db.execute(
         update(Run)
-        .where(Run.status == "RUNNING", Run.lease_expires_at.is_not(None), Run.lease_expires_at < now)
+        .where(
+            Run.status == "RUNNING",
+            Run.lease_expires_at.is_not(None),
+            Run.lease_expires_at < now,
+            or_(
+                Run.heartbeat_at.is_(None),
+                Run.heartbeat_at < now - heartbeat_grace,
+            ),
+        )
         .values(
             status="FAILED",
             error_json=stale_error,

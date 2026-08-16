@@ -407,6 +407,29 @@ class RunOut(ORMModel):
     executable_plan_json: dict[str, Any] = {}
 
 
+class RunSummaryOut(ORMModel):
+    """Light run row for lists: no ``output_json``/plan payloads.
+
+    The Runs page polls this endpoint every few seconds; shipping full run
+    payloads (raw HTML bodies live inside ``output_json``) made the list
+    response grow past 100 MB and froze the page.  Counts and the error code
+    are denormalised; the full payload stays on ``GET /runs/{id}``.
+    """
+
+    id: str
+    workflow_id: str
+    workflow_version: int
+    source_id: str | None
+    status: str
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    error_code: str | None = None
+    records_created: int = 0
+    records_updated: int = 0
+    records_unchanged: int = 0
+
+
 class PromptCreate(BaseModel):
     project_id: str
     name: str

@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Токен-платформа</title>
+  <script src="/assets/runtime-4f2a91.js"></script>
+  <style>
+    .app-loader { display: flex; justify-content: center; padding: 4rem 0; }
+    .app-loader__spinner { width: 48px; height: 48px; border-radius: 50%; }
+  </style>
+</head>
+<body>
+  <div id="root"><div class="app-loader"><div class="app-loader__spinner"></div></div></div>
+  <script>
+    window.__I18N_RU__ = {
+      "offers.title": "Текущие предложения",
+      "offers.subtitle": "Цифровые токены, доступные для покупки через личный кабинет",
+      "offers.card.buy": "Купить",
+      "offers.card.details": "Подробнее",
+      "offers.card.rate": "Доходность",
+      "offers.card.term": "Срок обращения",
+      "offers.card.issuer": "Эмитент",
+      "offers.card.volume": "Объём выпуска",
+      "offers.card.min": "Минимальная сумма",
+      "offers.filters.currency": "Валюта",
+      "offers.filters.sort": "Сортировка",
+      "offers.filters.sort.rate": "По доходности",
+      "offers.filters.sort.volume": "По объёму выпуска",
+      "offers.filters.sort.date": "По дате погашения",
+      "auth.login": "Вход",
+      "auth.register": "Регистрация",
+      "auth.wallet": "Кошелёк",
+      "auth.profile": "Личный кабинет",
+      "auth.documents": "Документы",
+      "auth.statements": "Отчёты",
+      "auth.tax": "Налоговая справка",
+      "faq.title": "Частые вопросы",
+      "faq.risk": "Инвестиции в цифровые токены связаны с риском потери капитала",
+      "faq.regulator": "Выпуски зарегистрированы в реестре цифровых токенов",
+      "faq.custody": "Хранение обеспечено независимым депозитарием",
+      "faq.secondary": "Вторичная торговля доступна на внутреннем рынке",
+      "footer.about": "О платформе",
+      "footer.contacts": "Контакты",
+      "footer.terms": "Условия использования",
+      "footer.privacy": "Политика конфиденциальности"
+    };
+    window.__PLATFORM_STATE__ = {"offers": [], "locale": "ru", "currencies": ["BYN", "USD", "EUR"], "session": null, "features": {"secondaryMarket": true, "autoInvest": false, "taxReports": true}};
+    window.platformBootstrap("root");
+  </script>
+</body>
+</html>

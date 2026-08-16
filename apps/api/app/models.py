@@ -253,6 +253,11 @@ class Run(Base):
     input_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     output_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     error_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # Denormalised persistence counters so the Runs list stays light: the
+    # full ``output_json`` is only served by the single-run detail endpoint.
+    records_created: Mapped[int] = mapped_column(Integer, default=0)
+    records_updated: Mapped[int] = mapped_column(Integer, default=0)
+    records_unchanged: Mapped[int] = mapped_column(Integer, default=0)
     created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

@@ -380,11 +380,11 @@ async def test_extract_adapters_delegate_to_generic_dom_json_and_table_nodes():
         executor, None, context(), {"body": html}, {"table": {"selector": "#rates"}},
     )
 
-    assert dom["records"] == [{"rate": "10", "evidence": {"rate": {"css_selector": ".card .rate", "text": "10"}}}]
+    assert dom["records"] == [{"rate": "10", "evidence": {"rate": {"css_selector": ".card .rate", "text": "10"}}, "row_index": 0}]
     assert dom["business_records"] is True
     assert json_output["records"] == [{"code": "USD"}]
     assert json_output["business_records"] is True
-    assert table["records"] == [{"Code": "USD", "Rate": "3.1"}]
+    assert table["records"] == [{"Code": "USD", "Rate": "3.1", "row_index": 0, "table_id": "#rates:0"}]
     assert table["business_records"] is True
 
 
@@ -410,8 +410,8 @@ async def test_extract_adapters_flatten_all_traversed_listing_pages():
         {"index": 2, "url": "https://example.test/page=2", "count": 1},
     ]
     assert result["records"] == [
-        {"title": "One", "url": "https://example.test/page=1", "evidence": {"title": {"css_selector": ".card h2", "text": "One"}}, "__provenance": {"page": {"url": "https://example.test/page=1", "index": 1, "state": "acquire"}}},
-        {"title": "Two", "url": "https://example.test/page=2", "evidence": {"title": {"css_selector": ".card h2", "text": "Two"}}, "__provenance": {"page": {"url": "https://example.test/page=2", "index": 2, "state": "page:2"}}},
+        {"title": "One", "url": "https://example.test/page=1", "evidence": {"title": {"css_selector": ".card h2", "text": "One"}}, "row_index": 0, "page_url": "https://example.test/page=1", "__provenance": {"page": {"url": "https://example.test/page=1", "index": 1, "state": "acquire"}}},
+        {"title": "Two", "url": "https://example.test/page=2", "evidence": {"title": {"css_selector": ".card h2", "text": "Two"}}, "row_index": 1, "page_url": "https://example.test/page=2", "__provenance": {"page": {"url": "https://example.test/page=2", "index": 2, "state": "page:2"}}},
     ]
 
 

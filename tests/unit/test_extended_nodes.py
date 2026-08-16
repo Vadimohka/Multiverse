@@ -34,8 +34,8 @@ async def test_parse_table_with_headers():
     """
     result = await ParseTableNode().execute(context(), {"html": html}, {"selector": "#rates"})
     assert result["records"] == [
-        {"Банк": "А", "Ставка": "12,5%"},
-        {"Банк": "Б", "Ставка": "10%"},
+        {"Банк": "А", "Ставка": "12,5%", "row_index": 0, "table_id": "#rates:0"},
+        {"Банк": "Б", "Ставка": "10%", "row_index": 1, "table_id": "#rates:0"},
     ]
 
 

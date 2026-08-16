@@ -67,11 +67,26 @@ def _phase_config(
     }
 
 
+def _override_phase(base: dict[str, Any], override: dict[str, Any] | None) -> dict[str, Any]:
+    if not override:
+        return base
+    merged = {**base}
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = {**merged[key], **value}
+        else:
+            merged[key] = value
+    return merged
+
+
 def _universal_graph(
     *,
     acquire: dict[str, Any],
     traverse: dict[str, Any],
     extract: dict[str, Any],
+    process: dict[str, Any] | None = None,
+    assure: dict[str, Any] | None = None,
+    output: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a seven-phase, source-agnostic template graph.
 
@@ -88,42 +103,59 @@ def _universal_graph(
     nodes["acquire"]["config"] = acquire
     nodes["traverse"]["config"] = traverse
     nodes["extract"]["config"] = extract
-    nodes["process"]["config"] = _phase_config(
-        ["process-operations"],
-        goal="Нормализовать и дедуплицировать записи",
-        input_path="records",
-        operations=[],
-        identityFields=[],
+    nodes["process"]["config"] = _override_phase(
+        _phase_config(
+            ["process-operations"],
+            goal="Нормализовать и дедуплицировать записи",
+            input_path="records",
+            operations=[],
+            identityFields=[],
+        ),
+        process,
     )
-    nodes["assure"]["config"] = _phase_config(
-        ["assure-validation"],
-        goal="Не публиковать пустой или частичный результат как полный",
-        input_path="records",
-        required=[],
-        schema={},
-        fail_on_error=False,
-        expectedScope={"allowEmpty": False, "requireComplete": False},
+    nodes["assure"]["config"] = _override_phase(
+        _phase_config(
+            ["assure-validation"],
+            goal="Не публиковать пустой или частичный результат как полный",
+            input_path="records",
+            required=[],
+            schema={},
+            fail_on_error=False,
+            expectedScope={"allowEmpty": False, "requireComplete": False},
+        ),
+        assure,
     )
-    nodes["output"]["config"] = _phase_config(
-        ["output-dataset"],
-        goal="Сохранить явно извлечённые записи в выбранный dataset",
-        input_path="records",
-        natural_key_fields=["url"],
-        minimum_expected_records=0,
-        on_empty="warning",
-        name="records",
+    nodes["output"]["config"] = _override_phase(
+        _phase_config(
+            ["output-dataset"],
+            goal="Сохранить явно извлечённые записи в выбранный dataset",
+            input_path="records",
+            natural_key_fields=["url"],
+            minimum_expected_records=0,
+            on_empty="warning",
+            name="records",
+        ),
+        output,
     )
     return graph
 
 
-def _web_acquire(*, browser_only: bool = False, feed: bool = False) -> dict[str, Any]:
+def _web_acquire(*, browser_only: bool = False, feed: bool = False, shell_aware: bool = False) -> dict[str, Any]:
     if browser_only:
         allow, prefer, goal = ["acquire-browser"], ["acquire-browser"], "Получить публичную JavaScript-страницу"
     elif feed:
         allow, prefer, goal = ["acquire-feed"], ["acquire-feed"], "Получить публичную RSS или XML-ленту"
     else:
         allow, prefer, goal = ["acquire-http", "acquire-browser"], ["acquire-http"], "Получить публичное HTML-представление"
-    return _phase_config(allow, prefer=prefer, goal=goal, url="{{source.url}}", method="GET", timeout=45)
+    config = _phase_config(allow, prefer=prefer, goal=goal, url="{{source.url}}", method="GET", timeout=45)
+    if shell_aware:
+        # A JavaScript application shell passes the naive "body exists" check,
+        # so the visible-text criterion is what lets AUTO fall through to the
+        # browser representation — declared policy, no hidden fallback.
+        config["successCriteria"] = [
+            {"path": "body_text_len", "operator": "gte", "value": 1000, "name": "rendered_text_present"}
+        ]
+    return config
 
 
 def _http_traverse(*, detail: bool = False) -> dict[str, Any]:
@@ -300,6 +332,242 @@ SYSTEM_TEMPLATES: list[dict[str, Any]] = [
             ),
         ),
     },
+    {
+        "id": "system-universal-rate-matrix",
+        "name": "Публичная матрица ставок/тарифов (таблица → записи)",
+        "description": "Для серий ставок, котировок и тарифных матриц. Строки получают сквозную идентичность (page_url + table_id + row_index), поэтому повторные запуски дедуплицируются без ручного natural key. Для матричных таблиц добавьте в Process операцию matrix_to_records/unpivot, а business-идентичность (period/currency/product) — в identity поля.",
+        "tags": ["universal", "public", "table", "rates", "matrix", "identity"],
+        "is_system": True,
+        "graph_json": _universal_graph(
+            acquire=_web_acquire(),
+            traverse=_http_traverse(),
+            extract=_phase_config(
+                ["extract-table"],
+                goal="Извлечь строки матрицы ставок/тарифов",
+                table={"inputPath": "body", "selector": "table", "header_row": 0, "normalize_fields": True},
+            ),
+            process={
+                "operations": [
+                    {"type": "add_context", "fields": ["source_id", "source_name", "fetched_at", "page_url"]},
+                ],
+            },
+            assure={"expectedScope": {"allowEmpty": False, "requireComplete": False, "minRecords": 1}},
+            output={"natural_key_fields": ["page_url", "table_id", "row_index"]},
+        ),
+    },
+    {
+        "id": "system-universal-product-cards",
+        "name": "Публичные карточки продуктов/предложений",
+        "description": "Для карточек депозитов, тарифов, токенов и каталогов. Пустой itemSelector включает структурную авто-кластеризацию карточек (выбранный селектор виден в попытках стратегии и закрепляется в один клик); для ставок/сроков добавьте в Process операции number/rate/regex.",
+        "tags": ["universal", "public", "cards", "products", "auto-cluster", "offers"],
+        "is_system": True,
+        "graph_json": _universal_graph(
+            acquire=_web_acquire(),
+            traverse=_http_traverse(),
+            extract=_phase_config(
+                ["extract-dom"],
+                goal="Извлечь карточки продуктов/предложений",
+                dom={"inputPath": "body", "itemSelector": "", "fields": []},
+            ),
+            process={
+                "operations": [
+                    {"type": "add_context", "fields": ["source_id", "source_name", "fetched_at", "page_url"]},
+                ],
+            },
+            output={"natural_key_fields": ["url"]},
+        ),
+    },
+    {
+        "id": "system-universal-news-window",
+        "name": "Публичные новости: лента + detail + окно дат",
+        "description": "Для новостных лент, где нужны полный текст материала и окно публикации. Задайте detail-ссылки и поля (title/body_text/published_at/url); окно дат настраивается в Traverse (dateBoundary: lowerBound/upperBound/order/stopWhenOlder) — пустой результат внутри окна легитимен (EMPTY_VALID_WINDOW), сломанный листинг — нет.",
+        "tags": ["universal", "public", "news", "list-detail", "date-window", "full-text"],
+        "is_system": True,
+        "graph_json": _universal_graph(
+            acquire=_web_acquire(),
+            traverse=_phase_config(
+                ["traverse-links"],
+                goal="Обойти ленту и собрать полные detail-страницы в окне дат",
+                pagination={"enabled": False, "mode": "next", "maxPages": 25},
+                detail={
+                    "enabled": True,
+                    "selector": "",
+                    "itemsPath": "",
+                    "urlPath": "url",
+                    "maxItems": 100,
+                    "fields": [
+                        {"name": "title", "selector": "", "attribute": ""},
+                        {"name": "body_text", "selector": "", "attribute": ""},
+                        {"name": "published_at", "selector": "", "attribute": ""},
+                        {"name": "url", "selector": "", "attribute": ""},
+                    ],
+                },
+                dateBoundary={
+                    "enabled": False,
+                    "field": "source_published_at",
+                    "order": "DESC",
+                    "stopWhenOlder": False,
+                    "lowerBound": "",
+                    "upperBound": "",
+                },
+                drop_query_params=[],
+            ),
+            extract=_phase_config(
+                ["extract-mapping"],
+                goal="Сформировать записи из listing и detail-полей",
+                input_path="records",
+                fields=[],
+            ),
+            process={
+                "operations": [
+                    {"type": "add_context", "fields": ["source_id", "source_name", "fetched_at", "page_url"]},
+                ],
+            },
+            assure={"expectedScope": {"allowEmpty": True, "requireComplete": False}},
+            output={"natural_key_fields": ["url"]},
+        ),
+    },
+    {
+        "id": "system-universal-browser-cards-detail",
+        "name": "Публичный browser: карточки → detail (полный)",
+        "description": "Для SPA-каталогов (токен-платформы, биржи): browser Acquire с критерием body_text_len (JS-оболочка не проходит постусловие), declarative states (валютные закладки), loadMore/scroll и полный detail. Поддерживает и карточки без ссылок (кнопочные офферы): отключите detail и задайте itemSelector + поля карточки. Никакого JavaScript — только CSS/actions.",
+        "tags": ["universal", "public", "browser", "spa", "cards", "detail", "states", "button-cards"],
+        "is_system": True,
+        "graph_json": _universal_graph(
+            acquire=_override_phase(
+                _web_acquire(browser_only=True),
+                {"successCriteria": [{"path": "body_text_len", "operator": "gte", "value": 1000, "name": "rendered_text_present"}]},
+            ),
+            traverse=_phase_config(
+                ["traverse-browser"],
+                goal="Обойти публичные tabs/filters/pages и собрать полные detail-карточки",
+                browserTraversal={
+                    "listing": {"itemSelector": "", "linkSelector": "a[href]", "fields": []},
+                    "states": [],
+                    "pagination": {"enabled": False, "maxPages": 25},
+                    "loadMore": {"selector": "", "times": 0},
+                    "scroll": {"times": 0},
+                    "detail": {
+                        "enabled": True,
+                        "maxItems": 100,
+                        "includeListingFields": True,
+                        "fields": [
+                            {"name": "title", "selector": "", "attribute": ""},
+                            {"name": "body_text", "selector": "", "attribute": ""},
+                            {"name": "published_at", "selector": "", "attribute": ""},
+                        ],
+                    },
+                },
+            ),
+            extract=_phase_config(
+                ["extract-mapping"],
+                goal="Сформировать записи из карточек и detail-полей",
+                input_path="records",
+                fields=[],
+            ),
+            process={
+                "operations": [
+                    {"type": "add_context", "fields": ["source_id", "source_name", "fetched_at", "page_url", "state"]},
+                ],
+            },
+            output={"natural_key_fields": ["url", "state"]},
+        ),
+    },
+    {
+        "id": "system-universal-cards-shell-aware",
+        "name": "Публичные карточки: HTTP → browser (JS-оболочка)",
+        "description": "Для карточек предложений на сайтах, где часть страниц рендерится JavaScript. Сначала обычный HTTP; если тело — JS-оболочка (мало видимого текста, критерий body_text_len), AUTO сам переходит на browser render, после чего работает авто-кластеризация карточек. Не зависит от настроек источника.",
+        "tags": ["universal", "public", "cards", "javascript", "auto-fallback", "shell-aware"],
+        "is_system": True,
+        "graph_json": _universal_graph(
+            acquire=_web_acquire(shell_aware=True),
+            traverse=_http_traverse(),
+            extract=_phase_config(
+                ["extract-dom"],
+                goal="Извлечь карточки из статического или отрендеренного представления",
+                dom={"inputPath": "body", "itemSelector": "", "fields": []},
+            ),
+            process={
+                "operations": [
+                    {"type": "add_context", "fields": ["source_id", "source_name", "fetched_at", "page_url"]},
+                ],
+            },
+            output={"natural_key_fields": ["url"]},
+        ),
+    },
+    {
+        "id": "system-universal-tables-shell-aware",
+        "name": "Публичные таблицы: HTTP → browser (JS-оболочка)",
+        "description": "Для ставок/тарифов/котировок на JavaScript-страницах (таблицы появляются только после рендера). HTTP-представление с малым видимым текстом проваливает постусловие — движок сам берёт browser render и парсит таблицы из него. Строки несут сквозную идентичность page_url + table_id + row_index.",
+        "tags": ["universal", "public", "table", "rates", "javascript", "auto-fallback", "shell-aware"],
+        "is_system": True,
+        "graph_json": _universal_graph(
+            acquire=_web_acquire(shell_aware=True),
+            traverse=_http_traverse(),
+            extract=_phase_config(
+                ["extract-table"],
+                goal="Извлечь строки таблицы из статического или отрендеренного представления",
+                table={"inputPath": "body", "selector": "table", "header_row": 0, "normalize_fields": True},
+            ),
+            process={
+                "operations": [
+                    {"type": "add_context", "fields": ["source_id", "source_name", "fetched_at", "page_url"]},
+                ],
+            },
+            assure={"expectedScope": {"allowEmpty": False, "requireComplete": False, "minRecords": 1}},
+            output={"natural_key_fields": ["page_url", "table_id", "row_index"]},
+        ),
+    },
+    {
+        "id": "system-universal-news-shell-aware",
+        "name": "Публичные новости: HTTP → browser (JS-оболочка) + detail",
+        "description": "Для новостных лент на JavaScript: если статическое тело — оболочка, AUTO переходит на browser render списка, затем работает detail-обход с полными текстами и окном дат (как в шаблоне «Публичные новости»). Задайте detail-ссылки и поля (title/body_text/published_at/url) в копии.",
+        "tags": ["universal", "public", "news", "list-detail", "javascript", "auto-fallback", "shell-aware", "date-window"],
+        "is_system": True,
+        "graph_json": _universal_graph(
+            acquire=_web_acquire(shell_aware=True),
+            traverse=_phase_config(
+                ["traverse-links"],
+                goal="Обойти ленту (статическую или отрендеренную) и собрать полные detail-страницы",
+                pagination={"enabled": False, "mode": "next", "maxPages": 25},
+                detail={
+                    "enabled": True,
+                    "selector": "",
+                    "itemsPath": "",
+                    "urlPath": "url",
+                    "maxItems": 100,
+                    "fields": [
+                        {"name": "title", "selector": "", "attribute": ""},
+                        {"name": "body_text", "selector": "", "attribute": ""},
+                        {"name": "published_at", "selector": "", "attribute": ""},
+                        {"name": "url", "selector": "", "attribute": ""},
+                    ],
+                },
+                dateBoundary={
+                    "enabled": False,
+                    "field": "source_published_at",
+                    "order": "DESC",
+                    "stopWhenOlder": False,
+                    "lowerBound": "",
+                    "upperBound": "",
+                },
+                drop_query_params=[],
+            ),
+            extract=_phase_config(
+                ["extract-mapping"],
+                goal="Сформировать записи из listing и detail-полей",
+                input_path="records",
+                fields=[],
+            ),
+            process={
+                "operations": [
+                    {"type": "add_context", "fields": ["source_id", "source_name", "fetched_at", "page_url"]},
+                ],
+            },
+            assure={"expectedScope": {"allowEmpty": True, "requireComplete": False}},
+            output={"natural_key_fields": ["url"]},
+        ),
+    },
 ]
 
 
@@ -402,8 +670,12 @@ def _clean_graph(graph: dict[str, Any], *, reset_v2_source_config: bool = True) 
         config.pop("source_id", None)
         config.pop("dataset_id", None)
         is_v2 = str(config.get("contractVersion") or result.get("contractVersion") or settings.get("contractVersion") or "") == "2"
-        if is_v2 and reset_v2_source_config:
-            _clean_v2_source_config(node_type, config)
+        if is_v2:
+            # With reset requested, the v2 cleaner above is the whole story;
+            # without it (template instantiation) the pre-wired v2 defaults
+            # survive verbatim — including pinned natural keys and criteria.
+            if reset_v2_source_config:
+                _clean_v2_source_config(node_type, config)
             continue
         if node_type in {"http_request", "browser_open", "download_file"} and "url" in config:
             config["url"] = "{{source.url}}"
