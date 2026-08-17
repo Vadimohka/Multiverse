@@ -42,23 +42,6 @@ BCSE_NEWS_SCHEMA = {
 }
 
 
-MARKET_INDICATOR_SCHEMA = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "MarketIndicator v1",
-    "type": "object",
-    "required": ["indicator_code", "effective_at", "value", "source_url"],
-    "properties": {
-        "indicator_code": {"type": "string"},
-        "series_id": {"type": "string"},
-        "effective_at": {"type": "string", "format": "date-time"},
-        "value": {"type": "number"},
-        "unit": {"type": ["string", "null"]},
-        "currency": {"type": ["string", "null"]},
-        "source_url": {"type": "string", "format": "uri"},
-    },
-}
-
-
 def bcse_news_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
     mapping_fields = [
         {"target": "news_id", "source_path": "record_id"},
@@ -227,16 +210,16 @@ def bcse_market_news_category_graph(source_id: str, dataset_id: str, *, incremen
     return graph
 
 
-def bcse_home_market_indicators_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
-    """Extract the two live market widgets shown on the BCSE home page.
+def bcse_home_market_news_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
+    """Collect BCSE currency and BYN REPO widgets into ``Новости рынка``.
 
     The page renders four currency instruments and nine BYN repo tenors in
-    separate JS widgets.  A single repeating-list selector intentionally
-    combines both widget row types while field selectors use alternatives for
-    the common label/value/date columns.
+    separate JS widgets. Each reading is persisted as a structured market-news
+    record (not an article) so it stays in the dataset required by NEWS-03.
     """
     crawl_config = {
         "url": "https://www.bcse.by/",
+        "supplemental_urls": [{"url": "https://www.bcse.by/markets/currency/results", "label": "currency-results"}],
         "wait_until": "networkidle",
         "timeout": 60,
         "capture_network": False,
@@ -245,18 +228,26 @@ def bcse_home_market_indicators_graph(source_id: str, dataset_id: str, *, increm
     }
     extract_config = {
         "input_path": "html",
-        "container_selector": "#currency .inf-instrument, #repo-body .inf-wrap",
+        "container_selector": "#repo-body .inf-wrap, [data-browser-supplement='currency-results'] table tbody tr",
         "fields": [
-            {"name": "label", "selector": "a.text-asfalt, .inf-name"},
-            {"name": "value_raw", "selector": ".w-60p .text-asfalt, .inf-repo-percent"},
-            {"name": "observed_source", "selector": ".inf-date, .inf-repo-date"},
-            {"name": "change_percent_raw", "selector": ".w-50p > .text-right:first-child"},
+            {"name": "label", "selector": ".inf-name, td:nth-of-type(1)"},
+            {"name": "value_raw", "selector": ".inf-repo-percent, td:nth-of-type(5)"},
+            {"name": "observed_source", "selector": ".inf-repo-date, td:nth-of-type(12)"},
+            {"name": "change_percent_raw", "selector": ".w-50p > .text-right:first-child, td:nth-of-type(8)"},
             {"name": "change_absolute_raw", "selector": ".w-50p span"},
+            {"name": "market_mode", "selector": "td:nth-of-type(2)"},
+            {"name": "min_raw", "selector": "td:nth-of-type(3)"},
+            {"name": "max_raw", "selector": "td:nth-of-type(4)"},
+            {"name": "open_raw", "selector": "td:nth-of-type(6)"},
+            {"name": "close_raw", "selector": "td:nth-of-type(7)"},
+            {"name": "volume_raw", "selector": "td:nth-of-type(9)"},
+            {"name": "turnover_raw", "selector": "td:nth-of-type(10)"},
+            {"name": "trades_count_raw", "selector": "td:nth-of-type(11)"},
         ],
     }
     operations = [
         {"type": "add_context", "fields": ["effective_at", "observed_at"]},
-        {"type": "constant", "field": "source_key", "value": "indicator-bcse-home"},
+        {"type": "constant", "field": "source_key", "value": "news-03"},
         {"type": "copy", "to": "indicator_code", "source": "label"},
         {"type": "copy", "to": "series_id", "source": "label"},
         {"type": "copy", "to": "instrument", "source": "label"},
@@ -281,33 +272,77 @@ def bcse_home_market_indicators_graph(source_id: str, dataset_id: str, *, increm
         }},
         {"type": "copy", "to": "unit", "source": "indicator_type"},
         {"type": "map", "field": "unit", "mapping": {"FX_RATE": "BYN per currency unit", "REPO_RATE": "percent per annum"}},
+        {"type": "copy", "to": "record_source_url", "source": "label"},
+        {"type": "map", "field": "record_source_url", "mapping": {
+            "USD/BYN_TOD": "https://www.bcse.by/markets/currency/results", "EUR/BYN_TOD": "https://www.bcse.by/markets/currency/results", "RUB/BYN_TOD": "https://www.bcse.by/markets/currency/results", "CNY/BYN_TOD": "https://www.bcse.by/markets/currency/results",
+            "1-3 дней": "https://www.bcse.by/", "6-8 дней": "https://www.bcse.by/", "9-14 дней": "https://www.bcse.by/", "15-30 дней": "https://www.bcse.by/", "31-60 дней": "https://www.bcse.by/", "61-90 дней": "https://www.bcse.by/", "91-180 дней": "https://www.bcse.by/", "181-360 дней": "https://www.bcse.by/", "более 360 дней": "https://www.bcse.by/",
+        }},
+        {"type": "copy", "to": "min_value", "source": "min_raw"},
+        {"type": "number", "field": "min_value"},
+        {"type": "copy", "to": "max_value", "source": "max_raw"},
+        {"type": "number", "field": "max_value"},
+        {"type": "copy", "to": "open_value", "source": "open_raw"},
+        {"type": "number", "field": "open_value"},
+        {"type": "copy", "to": "close_value", "source": "close_raw"},
+        {"type": "number", "field": "close_value"},
+        {"type": "copy", "to": "volume", "source": "volume_raw"},
+        {"type": "number", "field": "volume"},
+        {"type": "copy", "to": "turnover", "source": "turnover_raw"},
+        {"type": "number", "field": "turnover"},
+        {"type": "copy", "to": "trades_count", "source": "trades_count_raw"},
+        {"type": "integer", "field": "trades_count"},
+        {"type": "copy", "to": "title", "source": "label"},
+        {"type": "concat", "field": "identity_key", "fields": ["label", "effective_at"], "separator": "|"},
+        {"type": "copy", "to": "external_id", "source": "identity_key"},
+        {"type": "concat", "field": "summary_raw", "fields": ["label", "value_raw", "unit", "observed_source"], "separator": " | "},
+        {"type": "concat", "field": "body_text", "fields": ["indicator_type", "label", "value_raw", "unit", "observed_source", "change_percent_raw", "change_absolute_raw"], "separator": " | "},
     ]
     mapping_fields = [
+        {"target": "source_id", "constant": "bcse-currency-repo-news"},
+        {"target": "source_name", "constant": "БВФБ / валютные и REPO показатели"},
+        {"target": "source_section", "constant": "home-market-widgets"},
+        {"target": "source_authority", "constant": "PRIMARY"},
+        {"target": "external_id", "source_path": "external_id"},
+        {"target": "identity_key", "source_path": "identity_key"},
+        {"target": "canonical_url", "source_path": "record_source_url"},
+        {"target": "title", "source_path": "title"},
+        {"target": "summary_raw", "source_path": "summary_raw"},
+        {"target": "body_text", "source_path": "body_text"},
+        {"target": "source_published_at", "source_path": "effective_at"},
+        {"target": "candidate_status", "constant": "INCLUDE"},
+        {"target": "access_status", "constant": "PUBLIC"},
+        {"target": "selection_rule_id", "constant": "bcse-currency-and-byn-repo-v1"},
+        {"target": "selection_rule_version", "constant": "news-passport-v2"},
+        {"target": "selection_reason", "constant": "official BCSE currency widget and BYN REPO widget on the home page"},
+        {"target": "selection_evidence", "constant": {"homepage": "https://www.bcse.by/", "currency_results": "https://www.bcse.by/markets/currency/results", "repo_currency": "BYN"}},
+        {"target": "language", "constant": "ru"},
+        {"target": "fetched_at", "source_path": "observed_at"},
+        {"target": "observed_at", "source_path": "observed_at"},
         {"target": "indicator_code", "source_path": "indicator_code"},
         {"target": "series_id", "source_path": "series_id"},
         {"target": "effective_at", "source_path": "effective_at"},
         {"target": "value", "source_path": "value"},
         {"target": "unit", "source_path": "unit"},
         {"target": "currency", "source_path": "currency"},
-        {"target": "source_url", "constant": "https://www.bcse.by/"},
-        {"target": "source_id", "constant": "bcse-home-indicators"},
-        {"target": "source_name", "constant": "БВФБ / курсы и ставки РЕПО"},
-        {"target": "source_section", "constant": "home-market-widgets"},
-        {"target": "source_authority", "constant": "PRIMARY"},
         {"target": "indicator_type", "source_path": "indicator_type"},
         {"target": "instrument", "source_path": "instrument"},
         {"target": "value_raw", "source_path": "value_raw"},
         {"target": "last_trade_at", "source_path": "last_trade_at"},
         {"target": "change_percent", "source_path": "change_percent"},
         {"target": "change_absolute", "source_path": "change_absolute"},
-        {"target": "selection_rule_id", "constant": "bcse-home-currency-repo-v1"},
-        {"target": "selection_rule_version", "constant": "market-indicators-v1"},
-        {"target": "selection_reason", "constant": "official BCSE home-page currency and BYN repo widgets"},
-        {"target": "fetched_at", "source_path": "observed_at"},
+        {"target": "currency_results_url", "constant": "https://www.bcse.by/markets/currency/results"},
+        {"target": "market_mode", "source_path": "market_mode"},
+        {"target": "min_value", "source_path": "min_value"},
+        {"target": "max_value", "source_path": "max_value"},
+        {"target": "open_value", "source_path": "open_value"},
+        {"target": "close_value", "source_path": "close_value"},
+        {"target": "volume", "source_path": "volume"},
+        {"target": "turnover", "source_path": "turnover"},
+        {"target": "trades_count", "source_path": "trades_count"},
     ]
     graph = {
         "version": 1,
-        "settings": {"source_id": source_id, "dataset_id": dataset_id, "natural_key_fields": ["series_id", "effective_at", "source_url"], "review_policy": {"new": False, "changed": True, "confidence_below": 0.8}},
+        "settings": {"source_id": source_id, "dataset_id": dataset_id, "natural_key_fields": ["source_id", "identity_key"], "review_policy": {"new": False, "changed": True, "confidence_below": 0.8}},
         "nodes": [
             {"id": "trigger", "type": "manual_trigger", "position": {"x": 30, "y": 180}, "config": {}},
             {"id": "browser", "type": "browser_open", "position": {"x": 260, "y": 180}, "config": crawl_config},
@@ -315,8 +350,8 @@ def bcse_home_market_indicators_graph(source_id: str, dataset_id: str, *, increm
             {"id": "extract", "type": "extract_repeating_list", "position": {"x": 700, "y": 180}, "config": extract_config},
             {"id": "transform", "type": "transform", "position": {"x": 940, "y": 180}, "config": {"input_path": "records", "operations": operations, "identity": ["series_id"]}},
             {"id": "mapping", "type": "mapping", "position": {"x": 1180, "y": 180}, "config": {"input_path": "records", "fields": mapping_fields}},
-            {"id": "validate", "type": "validate", "position": {"x": 1420, "y": 180}, "config": {"input_path": "records", "required": ["indicator_code", "effective_at", "value", "source_url"], "schema": MARKET_INDICATOR_SCHEMA, "fail_on_error": True}},
-            {"id": "output", "type": "output", "position": {"x": 1660, "y": 180}, "config": {"input_path": "records", "name": "market_indicators"}},
+            {"id": "validate", "type": "validate", "position": {"x": 1420, "y": 180}, "config": {"input_path": "records", "required": ["source_id", "source_name", "canonical_url", "title", "candidate_status", "access_status"], "fail_on_error": True}},
+            {"id": "output", "type": "output", "position": {"x": 1660, "y": 180}, "config": {"input_path": "records", "name": "market_news"}},
         ],
         "edges": [
             {"id": "e1", "source": "trigger", "target": "browser"},
