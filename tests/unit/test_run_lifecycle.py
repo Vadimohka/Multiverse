@@ -69,6 +69,29 @@ def test_stale_worker_and_deadline_are_reconciled(db_session):
     assert db_session.get(Run, expired.id).status == "TIMED_OUT"
 
 
+def test_expired_lease_with_live_heartbeat_survives_reconcile(db_session):
+    # A long crawl under parallel load can push the lease boundary past the
+    # last renewal; while the heartbeat is fresh the run is still alive and
+    # must not be failed with RUN_LEASE_EXPIRED.
+    now = datetime.now(UTC)
+    slow_crawl = make_run("RUNNING")
+    slow_crawl.lease_expires_at = now - timedelta(seconds=30)
+    slow_crawl.heartbeat_at = now - timedelta(seconds=5)
+    db_session.add(slow_crawl)
+    db_session.commit()
+
+    assert reconcile_stale_runs(db_session) == 0
+    assert db_session.get(Run, slow_crawl.id).status == "RUNNING"
+
+    # Once the heartbeat itself goes quiet for a full lease window, the run is
+    # genuinely abandoned and becomes FAILED.
+    quiet = db_session.get(Run, slow_crawl.id)
+    quiet.heartbeat_at = now - timedelta(seconds=600)
+    db_session.commit()
+    assert reconcile_stale_runs(db_session) == 1
+    assert db_session.get(Run, slow_crawl.id).status == "FAILED"
+
+
 def test_duplicate_schedule_tick_has_one_durable_occurrence(db_session):
     schedule = Schedule(workflow_id="workflow", name="daily", cron="* * * * *")
     db_session.add(schedule)

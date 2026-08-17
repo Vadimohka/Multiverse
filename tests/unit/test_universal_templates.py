@@ -140,3 +140,100 @@ def test_article_contract_has_body_fallback_for_short_detail_pages():
     assert record["title"] == "Notice"
     assert record["body_text"]
     assert record["body_html"]
+
+
+def _template(template_id: str) -> dict:
+    return next(item for item in SYSTEM_TEMPLATES if item["id"] == template_id)
+
+
+def _node(graph: dict, node_id: str) -> dict:
+    return next(node for node in graph["nodes"] if node["id"] == node_id)["config"]
+
+
+def test_rate_matrix_template_pins_row_identity_and_context():
+    template = _template("system-universal-rate-matrix")
+    graph = template["graph_json"]
+    output = _node(graph, "output")
+    assert output["natural_key_fields"] == ["page_url", "table_id", "row_index"]
+    process = _node(graph, "process")
+    assert process["operations"] == [
+        {"type": "add_context", "fields": ["source_id", "source_name", "fetched_at", "page_url"]},
+    ]
+    assert _node(graph, "assure")["expectedScope"]["minRecords"] == 1
+    assert _node(graph, "extract")["table"]["normalize_fields"] is True
+
+
+def test_product_cards_template_enables_auto_clustering():
+    template = _template("system-universal-product-cards")
+    extract = _node(template["graph_json"], "extract")
+    assert extract["strategies"]["allow"] == ["extract-dom"]
+    assert extract["dom"]["itemSelector"] == ""
+    assert extract["dom"]["fields"] == []
+    assert _node(template["graph_json"], "output")["natural_key_fields"] == ["url"]
+
+
+def test_news_window_template_carries_detail_fields_and_date_boundary():
+    template = _template("system-universal-news-window")
+    traverse = _node(template["graph_json"], "traverse")
+    assert traverse["detail"]["enabled"] is True
+    assert [field["name"] for field in traverse["detail"]["fields"]] == [
+        "title", "body_text", "published_at", "url",
+    ]
+    assert traverse["dateBoundary"]["field"] == "source_published_at"
+    # An empty result inside a legitimate date window must not fail the run.
+    assert _node(template["graph_json"], "assure")["expectedScope"]["allowEmpty"] is True
+
+
+def test_browser_cards_detail_template_wires_shell_criterion():
+    template = _template("system-universal-browser-cards-detail")
+    graph = template["graph_json"]
+    acquire = _node(graph, "acquire")
+    assert acquire["strategies"]["allow"] == ["acquire-browser"]
+    assert acquire["successCriteria"] == [
+        {"path": "body_text_len", "operator": "gte", "value": 1000, "name": "rendered_text_present"},
+    ]
+    traversal = _node(graph, "traverse")["browserTraversal"]
+    assert traversal["detail"]["enabled"] is True
+    assert _node(graph, "output")["natural_key_fields"] == ["url", "state"]
+    operations = _node(graph, "process")["operations"]
+    assert {"type": "add_context", "fields": ["source_id", "source_name", "fetched_at", "page_url", "state"]} in operations
+
+
+def test_new_templates_survive_instantiation_cleaning():
+    from app.routers.workflow_templates import _clean_graph
+
+    for template_id in (
+        "system-universal-rate-matrix",
+        "system-universal-product-cards",
+        "system-universal-news-window",
+        "system-universal-browser-cards-detail",
+    ):
+        cleaned = _clean_graph(_template(template_id)["graph_json"], reset_v2_source_config=False)
+        assert _template_issues(cleaned) == []
+        assert validate_dag(cleaned) == []
+
+
+def test_shell_aware_templates_wire_rendered_text_criterion():
+    for template_id, allow in (
+        ("system-universal-cards-shell-aware", ["acquire-http", "acquire-browser"]),
+        ("system-universal-tables-shell-aware", ["acquire-http", "acquire-browser"]),
+        ("system-universal-news-shell-aware", ["acquire-http", "acquire-browser"]),
+    ):
+        graph = _template(template_id)["graph_json"]
+        acquire = _node(graph, "acquire")
+        assert acquire["strategies"]["allow"] == allow
+        assert acquire["strategies"]["prefer"] == ["acquire-http"]
+        assert acquire["successCriteria"] == [
+            {"path": "body_text_len", "operator": "gte", "value": 1000, "name": "rendered_text_present"}
+        ]
+        assert _template_issues(graph) == []
+
+
+def test_shell_aware_variants_keep_base_template_output_contracts():
+    cards = _node(_template("system-universal-cards-shell-aware")["graph_json"], "output")
+    tables = _node(_template("system-universal-tables-shell-aware")["graph_json"], "output")
+    news = _node(_template("system-universal-news-shell-aware")["graph_json"], "output")
+    assert cards["natural_key_fields"] == ["url"]
+    assert tables["natural_key_fields"] == ["page_url", "table_id", "row_index"]
+    assert news["natural_key_fields"] == ["url"]
+    assert _node(_template("system-universal-news-shell-aware")["graph_json"], "traverse")["detail"]["enabled"] is True

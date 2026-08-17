@@ -1,7 +1,8 @@
-from app.services.belarus_market_smoke import summarize_profile
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
+
+from app.services.belarus_market_smoke import summarize_profile
 
 
 def test_smoke_summary_reports_a_meaningful_public_representation_without_verifying_it():

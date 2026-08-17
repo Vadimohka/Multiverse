@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import operator as operator_module
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -70,6 +72,7 @@ class HttpAcquireStrategy(Strategy):
                 "artifact": output.get("artifact"),
                 "redirect_chain": output.get("redirect_chain", []),
             }],
+            "_transport_diagnostics": _transport_diagnostics(output),
             "_budget_counters": {"requests": 1, "bytes": _response_size(output)},
         }
 
@@ -143,6 +146,7 @@ class BrowserAcquireStrategy(Strategy):
                 "artifact": item,
                 "redirect_chain": output.get("redirect_chain", []),
             } for item in output.get("artifacts", []) if isinstance(item, Mapping)],
+            "_transport_diagnostics": _transport_diagnostics(output),
             "_budget_counters": {"requests": 1, "bytes": _response_size(output)},
         }
 
@@ -316,9 +320,14 @@ class BrowserTraverseStrategy(Strategy):
                 link = container if link_selector.strip() in {":scope", "."} else container.select_one(link_selector)
                 href = link.get("href") if link else None
                 if not href:
-                    continue
+                    # Button-driven offer panels carry no anchor at all.  A
+                    # card without a link is still a record when fields are
+                    # mapped onto the container; it only breaks the listing
+                    # when a detail fan-out needs somewhere to navigate.
+                    if detail.get("enabled", False) or not item_selector:
+                        continue
                 row: dict[str, Any] = {
-                    "url": canonical_url(urljoin(page_url, str(href)), list(config.get("drop_query_params") or [])),
+                    "url": canonical_url(urljoin(page_url, str(href)), list(config.get("drop_query_params") or [])) if href else None,
                     "state": state_name,
                 }
                 for field in fields:
@@ -491,10 +500,52 @@ class DelegatedExtractStrategy(Strategy):
         delegate = NODE_REGISTRY[self.delegate_type]
         nested = _mapping(config.get(self.section))
         effective = {**config, **nested}
+        selection: dict[str, Any] | None = None
         if self.section == "dom":
             effective.setdefault("input_path", nested.get("inputPath", "body"))
             effective.setdefault("container_selector", nested.get("itemSelector") or nested.get("containerSelector"))
             effective.setdefault("fields", nested.get("fields", []))
+            if not effective.get("container_selector"):
+                # An empty itemSelector delegates to structural clustering:
+                # score repeating containers by sibling similarity, text and
+                # link/price/date density, then pin the best cluster.  The
+                # chosen selector is reported back so the operator can accept
+                # or override it in one click.
+                from .nodes import card_cluster_passes, detect_card_clusters, find_value
+
+                html = find_value(inputs, str(effective.get("input_path") or "body"))
+                if html is None and isinstance(inputs.get("pages"), list) and inputs["pages"]:
+                    first_page = next((item for item in inputs["pages"] if isinstance(item, Mapping) and item.get("body")), None)
+                    html = first_page.get("body") if first_page else None
+                candidates = detect_card_clusters(html)
+                passing = [item for item in candidates if card_cluster_passes(item)]
+                if not passing:
+                    top = ", ".join(str(item.get("selector")) for item in candidates[:3]) or "—"
+                    raise ValueError(
+                        "DOM auto-detection: card cluster not found; pin itemSelector in the DOM config "
+                        f"(top structural candidates: {top})"
+                    )
+                chosen = passing[0]
+                effective["container_selector"] = chosen["selector"]
+                selection = {
+                    "mode": "auto-cluster",
+                    "selector": chosen["selector"],
+                    "count": chosen.get("count"),
+                    "score": chosen.get("score"),
+                    "candidates": [
+                        {"selector": item.get("selector"), "count": item.get("count"), "score": item.get("score")}
+                        for item in candidates[:3]
+                    ],
+                }
+            if not effective.get("fields"):
+                # Field draft for a freshly detected (or pinned) card cluster:
+                # link, its text and the container text.  The operator refines
+                # this in the mapping UI instead of starting from nothing.
+                effective["fields"] = [
+                    {"name": "url", "selector": "a[href]", "attribute": "href"},
+                    {"name": "title", "selector": "a"},
+                    {"name": "text", "selector": "."},
+                ]
         elif self.section == "json":
             effective.setdefault("input_path", nested.get("inputPath", "body"))
             effective.setdefault("path", nested.get("path", "$.items[*]"))
@@ -549,6 +600,7 @@ class DelegatedExtractStrategy(Strategy):
         if self.section in {"dom", "json", "table"} and isinstance(pages, list) and pages:
             records: list[dict[str, Any]] = []
             page_results: list[dict[str, Any]] = []
+            row_index = 0
             for index, page in enumerate(pages, start=1):
                 if not isinstance(page, Mapping) or "body" not in page:
                     continue
@@ -561,24 +613,92 @@ class DelegatedExtractStrategy(Strategy):
                 for row in parsed.get("records") or []:
                     record = dict(row) if isinstance(row, Mapping) else {"value": row}
                     record.setdefault("url", page.get("url"))
+                    if self.section == "dom":
+                        # Same structural row identity the table parser emits:
+                        # cards without a usable link still get a unique,
+                        # re-run-stable natural-key fallback.
+                        record.setdefault("row_index", row_index)
+                        record.setdefault("page_url", str(page.get("url") or ""))
+                        row_index += 1
+                        _drop_placeholder_link(record)
                     provenance = record.get("__provenance") if isinstance(record.get("__provenance"), Mapping) else {}
                     record["__provenance"] = {
                         **dict(provenance),
                         "page": {"url": page.get("url"), "index": index, "state": page.get("state", page.get("origin"))},
                     }
                     records.append(record)
-            return {
+            if self.section == "dom":
+                records = _dedupe_identical_cards(records)
+            result = {
                 "type": "PAGE_COLLECTION",
                 "pages": page_results,
                 "records": records,
                 "count": len(records),
                 "business_records": True,
             }
+            if selection is not None:
+                result["selection"] = selection
+            return result
         output = await executor(delegate, context, inputs, effective)
         # Extract is the public v2 Mapping facade. Choosing a DOM/JSON/table
         # or document configuration is an explicit operator mapping decision,
         # so the normalised rows are eligible for Output/dataset preflight.
-        return {**output, "business_records": True}
+        result = {**output, "business_records": True}
+        if self.section == "dom":
+            from .nodes import _resolved_page_url
+
+            page_url = _resolved_page_url(inputs)
+            for row_index, record in enumerate(result.get("records") or []):
+                if not isinstance(record, Mapping):
+                    continue
+                record.setdefault("row_index", row_index)
+                if page_url:
+                    record.setdefault("page_url", page_url)
+                _drop_placeholder_link(record)
+            result["records"] = _dedupe_identical_cards(result["records"])
+            result["count"] = len(result["records"])
+        if selection is not None:
+            result["selection"] = selection
+        return result
+
+
+def _drop_placeholder_link(record: dict[str, Any]) -> None:
+    """A fragment-only or script href is not an identifying link.
+
+    ``href="#"`` / ``javascript:...`` anchors are universal HTML placeholders
+    for in-page actions.  Keeping them as the ``url`` value collapses every
+    card onto one natural key, so they are treated as absent and the row
+    identity fallback takes over.
+    """
+
+    if "url" not in record:
+        return
+    value = str(record.get("url") or "").strip()
+    if value in {"#", ""} or value.startswith(("javascript:", "void(")):
+        record["url"] = None
+
+
+def _dedupe_identical_cards(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop rows repeating an earlier card's entire visible content.
+
+    Nested repeating containers (a grid wrapper and its cells can share one
+    class signature) emit the same card twice; identical visible content is
+    one record, never two.
+    """
+
+    seen: set[tuple[str, str, str]] = set()
+    result: list[dict[str, Any]] = []
+    for record in records:
+        identity = (
+            str(record.get("url") or ""),
+            str(record.get("title") or ""),
+            str(record.get("text") or ""),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(record)
+    return result
 
 
 class MappingExtractStrategy(DelegatedExtractStrategy):
@@ -1133,6 +1253,38 @@ for _strategy in (
     DEFAULT_STRATEGIES.register(_strategy)
 
 
+_FETCH_MODE_PREFERRED_STRATEGY = {
+    "HTTP": "acquire-http",
+    "PLAYWRIGHT": "acquire-browser",
+    "XHR_JSON": "acquire-browser-xhr",
+    "DOCUMENT": "acquire-file",
+}
+
+
+def _seed_source_transport_preference(config: Mapping[str, Any], context: ExecutionContext) -> dict[str, Any]:
+    """Let the declared ``source.fetch_mode`` order AUTO acquire candidates.
+
+    The source binding already declares how a site must be fetched.  In AUTO
+    the mapped transport is tried first unless the node itself pins a
+    transport or an allow-list that excludes it.  This is configuration
+    precedence, not a hidden fallback: the adaptive policy still governs what
+    happens when a strategy fails its postconditions.
+    """
+
+    if str(config.get("transport") or config.get("fetch_mode") or "").strip():
+        return config
+    strategies = config.get("strategies") if isinstance(config.get("strategies"), Mapping) else {}
+    variables = context.variables if isinstance(context.variables, Mapping) else {}
+    source = variables.get("source") if isinstance(variables.get("source"), Mapping) else {}
+    preferred = _FETCH_MODE_PREFERRED_STRATEGY.get(str(source.get("fetch_mode") or "").upper())
+    if not preferred:
+        return config
+    allowed = _strings(strategies.get("allow"))
+    if allowed and preferred not in allowed:
+        return config
+    return {**config, "strategies": {**strategies, "prefer": [preferred]}}
+
+
 async def execute_adaptive(
     registry: StrategyRegistry,
     *,
@@ -1145,6 +1297,8 @@ async def execute_adaptive(
 ) -> tuple[dict[str, Any], list[AdaptiveAttempt]]:
     """Try only permitted strategies; fallback follows a failed assertion."""
 
+    if node_type == "http_request":
+        config = _seed_source_transport_preference(config, context)
     candidates = registry.candidates(node_type, config)
     mode = str(config.get("mode", "AUTO")).upper()
     selected = str(config.get("selectedStrategy", ""))
@@ -1225,6 +1379,52 @@ async def execute_adaptive(
     raise StrategyError(f"No {PUBLIC_PHASES[node_type]} strategy passed its postconditions", attempts)
 
 
+_COMPARATOR_OPERATORS = {
+    "gt": operator_module.gt,
+    "gte": operator_module.ge,
+    "lt": operator_module.lt,
+    "lte": operator_module.le,
+    "eq": operator_module.eq,
+    "ne": operator_module.ne,
+}
+_DERIVED_METRIC_PATHS = {"body_text_len", "shell_score"}
+_INERT_MARKUP_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.I | re.S)
+_TAG_RE = re.compile(r"<[^>]+>")
+_COLLAPSED_WS_RE = re.compile(r"\s+")
+
+
+def _derived_metric(output: Mapping[str, Any], name: str) -> Any:
+    """Compute read-only transport diagnostics used by shell-aware criteria.
+
+    ``body_text_len`` is the visible text length of the acquired body after
+    removing markup and script/style payloads; ``shell_score`` is the share of
+    body bytes locked inside script/style.  A JavaScript application shell has
+    a long body but almost no text and a high shell score.
+    """
+
+    body = output.get("body")
+    if body is None:
+        return 0
+    text = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False, default=str)
+    if name == "shell_score":
+        inert = sum(len(match.group(0)) for match in _INERT_MARKUP_RE.finditer(text))
+        return round(inert / max(len(text), 1), 3)
+    stripped = _TAG_RE.sub(" ", _INERT_MARKUP_RE.sub(" ", text))
+    return len(_COLLAPSED_WS_RE.sub(" ", stripped).strip())
+
+
+def _transport_diagnostics(output: Mapping[str, Any]) -> dict[str, Any]:
+    """Read-only shell diagnostics attached to acquire strategy outputs."""
+
+    try:
+        return {
+            "body_text_len": _derived_metric(output, "body_text_len"),
+            "shell_score": _derived_metric(output, "shell_score"),
+        }
+    except Exception:
+        return {}
+
+
 def evaluate_postconditions(output: Mapping[str, Any], criteria: Any) -> tuple[dict[str, Any], ...]:
     """A deliberately small, deterministic assertion language for v2 plans."""
 
@@ -1235,8 +1435,11 @@ def evaluate_postconditions(output: Mapping[str, Any], criteria: Any) -> tuple[d
         if not isinstance(raw, Mapping):
             continue
         path = str(raw.get("path", ""))
-        value = _find(output, path)
-        if "equals" in raw:
+        value = _derived_metric(output, path) if path in _DERIVED_METRIC_PATHS else _find(output, path)
+        comparator = _COMPARATOR_OPERATORS.get(str(raw.get("operator") or "").lower())
+        if comparator is not None and "value" in raw:
+            passed = isinstance(value, (int, float)) and not isinstance(value, bool) and comparator(value, raw["value"])
+        elif "equals" in raw:
             passed = value == raw["equals"]
         elif "minItems" in raw:
             passed = isinstance(value, list) and len(value) >= int(raw["minItems"])
@@ -1266,6 +1469,7 @@ def _attempt(
     request_ref = hashlib.sha256(
         json.dumps({"node": node_type, "config": _safe_config_ref(config)}, sort_keys=True).encode()
     ).hexdigest()
+    selection = dict(output["selection"]) if isinstance(output.get("selection"), Mapping) else None
     artifact_refs = tuple(
         ArtifactReference(
             sha256=str(item.get("sha256", "")),
@@ -1289,6 +1493,7 @@ def _attempt(
         artifact_refs=artifact_refs,
         error=error,
         request_ref=request_ref,
+        selection=selection,
         budget_counters={
             "duration_ms": int((finished - started).total_seconds() * 1000),
             **{

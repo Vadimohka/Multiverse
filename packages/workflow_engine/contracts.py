@@ -73,6 +73,7 @@ class AdaptiveAttempt:
     artifact_refs: tuple[ArtifactReference, ...] = ()
     error: dict[str, Any] | None = None
     request_ref: str = ""
+    selection: dict[str, Any] | None = None
     budget_counters: dict[str, int | float] | None = None
 
     def as_dict(self) -> dict[str, Any]:

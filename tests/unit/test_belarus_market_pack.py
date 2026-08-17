@@ -1,5 +1,16 @@
+from pathlib import Path
+
+import pytest
 from app.database import SessionLocal
-from app.models import DatasetSourceMembership, Project, Schedule, SourcePresetRevision, User, Workflow
+from app.models import (
+    DatasetSourceMembership,
+    Project,
+    Schedule,
+    Source,
+    SourcePresetRevision,
+    User,
+    Workflow,
+)
 from app.services.belarus_market_pack import (
     _preset_config,
     install_belarus_market_pack,
@@ -8,8 +19,6 @@ from app.services.belarus_market_pack import (
 from sqlalchemy import func, select
 from workflow_engine.nodes import ParseTableNode, TransformNode
 from workflow_engine.types import ExecutionContext
-from pathlib import Path
-import pytest
 
 
 @pytest.mark.asyncio
@@ -97,3 +106,34 @@ def test_pack_installer_is_idempotent_and_creates_per_source_workflows(client):
     assert sum(item.cron == "0 8 * * 1" for item in schedules) == 45
     assert sum(item.cron == "0 8 * * 1-5" for item in schedules) == 15
     assert sum(item.enabled for item in schedules) == 1
+
+
+def test_pack_workflows_pair_with_their_own_segment_source(client):
+    """UL workflows must point at business URLs, FL workflows at retail URLs.
+
+    Regression for the JSON-path source lookup that silently failed on
+    PostgreSQL JSON columns, leaving UL workflows paired with stray retail
+    source rows and UL sources orphaned.
+    """
+
+    with SessionLocal() as db:
+        admin = db.scalar(select(User).order_by(User.created_at))
+        install_belarus_market_pack(db, admin)
+        sources = {
+            (source.settings or {}).get("source_key"): source
+            for source in db.scalars(select(Source).where(Source.project_id.is_not(None))).all()
+            if source.settings
+        }
+        workflows = db.scalars(
+            select(Workflow).where(Workflow.name.like("ul-%") | Workflow.name.like("fl-%"))
+        ).all()
+        assert len(workflows) == 41
+        for workflow in workflows:
+            source_key = workflow.name.split(":", 1)[0]
+            bound_id = (workflow.graph_json or {}).get("settings", {}).get("source_id")
+            expected = sources.get(source_key)
+            assert expected is not None, f"no source row for {source_key}"
+            assert bound_id == expected.id, f"{source_key} workflow bound to wrong source"
+        for key, source_row in sources.items():
+            if key and (key.startswith("ul-") or key.startswith("fl-")):
+                assert (source_row.settings or {}).get("source_key") == key

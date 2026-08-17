@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
@@ -14,27 +15,36 @@ from app.dependencies import get_current_user, require_roles
 from app.enums import TERMINAL_RUN_STATUSES
 from app.models import NodeRun, RawDocument, Run, User, Workflow
 from app.routers.workflows import execute_run
-from app.schemas import RunOut
+from app.schemas import RunOut, RunSummaryOut
 from app.services.artifact_storage import ArtifactStorage
 from app.services.authorization import require_project_object, scope_to_projects
 
 router = APIRouter(prefix="/runs", tags=["Запуски"])
 
 
-@router.get("", response_model=list[RunOut])
+@router.get("", response_model=list[RunSummaryOut])
 def list_runs(
     workflow_id: str | None = None,
     status: str | None = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
-) -> list[Run]:
+) -> list[dict[str, Any]]:
     stmt = select(Run).join(Workflow, Workflow.id == Run.workflow_id).order_by(Run.created_at.desc()).limit(200)
     if workflow_id:
         workflow = require_project_object(db, user, Workflow, workflow_id, label="Workflow")
         stmt = stmt.where(Run.workflow_id == workflow.id)
     if status:
         stmt = stmt.where(Run.status == status)
-    return list(db.scalars(scope_to_projects(stmt, Workflow.project_id, db, user)).all())
+    runs = db.scalars(scope_to_projects(stmt, Workflow.project_id, db, user)).all()
+    # Keep the list payload light: raw HTML bodies inside ``output_json`` once
+    # made this response exceed 100 MB.  Only counts and the error code are
+    # denormalised here; the full payload is served by GET /runs/{run_id}.
+    summaries: list[dict[str, Any]] = []
+    for run in runs:
+        summary = RunSummaryOut.model_validate(run)
+        summary.error_code = str((run.error_json or {}).get("code") or "") or None
+        summaries.append(summary.model_dump(mode="json"))
+    return summaries
 
 
 @router.get("/artifacts/{artifact_id}/download")

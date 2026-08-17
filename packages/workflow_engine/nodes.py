@@ -1269,9 +1269,18 @@ class ParseTableNode:
     async def execute(self, context: ExecutionContext, inputs: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         html = find_value(inputs, str(config.get("input_path", "html"))) or find_value(inputs, "body")
         soup = BeautifulSoup(str(html), "lxml")
-        table = soup.select_one(str(config.get("selector", "table")))
-        if not table:
+        selector = str(config.get("selector", "table"))
+        matches = soup.select(selector)
+        if not matches:
             raise ValueError("Таблица не найдена")
+        # ``table_index`` picks which occurrence of the selector to parse; the
+        # chosen occurrence becomes part of the row identity so two tables on
+        # one page can never collapse into the same natural key.
+        table_index = max(int(config.get("table_index", 0) or 0), 0)
+        if table_index >= len(matches):
+            table_index = 0
+        table = matches[table_index]
+        table_id = f"{selector}:{table_index}"
         matrix: list[list[str]] = []
         rowspans: dict[int, tuple[str, int]] = {}
         for tr in table.select("tr"):
@@ -1308,7 +1317,116 @@ class ParseTableNode:
                     normalized = normalize_table_field_name(header)
                     if normalized and normalized not in record:
                         record[normalized] = value
-        return {"records": records, "count": len(records), "headers": headers, "table": matrix}
+        # Every row carries a structural identity (page/table/row) so distinct
+        # rows survive the Output natural-key check even when no business
+        # identity column is mapped yet.  ``setdefault`` keeps a real column
+        # that happens to share the name.
+        page_url = _resolved_page_url(inputs)
+        for row_index, record in enumerate(records):
+            record.setdefault("row_index", row_index)
+            record.setdefault("table_id", table_id)
+            if page_url:
+                record.setdefault("page_url", page_url)
+        columns = [
+            {"index": index, "header": header, "sample": str(records[0].get(header, ""))[:120] if records else ""}
+            for index, header in enumerate(headers)
+        ]
+        mapping_draft = [
+            {"header": header, "field": normalize_table_field_name(header) or f"column_{index}"}
+            for index, header in enumerate(headers)
+            if str(header).strip()
+        ]
+        return {
+            "records": records,
+            "count": len(records),
+            "headers": headers,
+            "table": matrix,
+            "columns": columns,
+            "mapping_draft": mapping_draft,
+        }
+
+
+def _resolved_page_url(inputs: dict[str, Any]) -> str:
+    bundle = inputs.get("source_bundle") if isinstance(inputs.get("source_bundle"), Mapping) else {}
+    value = inputs.get("url") or bundle.get("final_url") or inputs.get("final_url") or bundle.get("seed_url")
+    return str(value) if value else ""
+
+
+_DATE_LIKE_RE = re.compile(r"\b\d{2}[./-]\d{2}[./-]\d{2,4}\b|\b\d{4}-\d{2}-\d{2}\b")
+_RATE_LIKE_RE = re.compile(r"\d+[.,]?\d*\s*%|\b\d+[.,]\d{2,}\b|\b(?:BYN|RUB|USD|EUR|PLN|BYR)\b", re.I)
+_CLASS_TOKEN_RE = re.compile(r"^[A-Za-z_][\w-]*$")
+
+
+def _card_selector(element: Any) -> str | None:
+    """Build a stable CSS signature for a repeating container candidate."""
+
+    classes = sorted({str(item) for item in (element.get("class") or []) if _CLASS_TOKEN_RE.match(str(item))})
+    if not classes:
+        return None
+    return f"{element.name}." + ".".join(classes)
+
+
+def detect_card_clusters(html: Any, *, limit: int = 8) -> list[dict[str, Any]]:
+    """Detect repeating card containers in any public markup.
+
+    Scoring is purely structural: candidate containers are grouped by a
+    tag+class signature, then ranked by text density and link/price/date
+    signal density.  Navigation menus and one-off blocks lose to real card
+    grids because their per-item text is short and signal-free.  No domain,
+    URL or site-specific branch is involved.
+    """
+
+    soup = BeautifulSoup(str(html), "lxml")
+    groups: dict[str, list[Any]] = {}
+    for element in soup.find_all(True):
+        signature = _card_selector(element)
+        if signature:
+            groups.setdefault(signature, []).append(element)
+    candidates: list[dict[str, Any]] = []
+    for selector, items in groups.items():
+        count = len(items)
+        if not 3 <= count <= 500:
+            continue
+        probe = items[:20]
+        texts = [item.get_text(" ", strip=True) for item in probe]
+        avg_text = sum(len(text) for text in texts) / len(texts)
+        if avg_text < 25:
+            continue
+        link_fraction = sum(1 for item in probe if item.select_one("a[href]")) / len(probe)
+        signal_fraction = sum(1 for text in texts if _DATE_LIKE_RE.search(text) or _RATE_LIKE_RE.search(text)) / len(texts)
+        descendant_count = sum(len(item.find_all()) for item in items[:5]) / min(count, 5)
+        score = (round(signal_fraction, 3), round(link_fraction, 3), min(round(avg_text), 2000), count)
+        candidates.append({
+            "selector": selector,
+            "count": count,
+            "avg_text_length": round(avg_text, 1),
+            "link_fraction": round(link_fraction, 3),
+            "signal_fraction": round(signal_fraction, 3),
+            "descendant_count": round(descendant_count, 1),
+            "score": list(score),
+            "sample_text": texts[0][:200],
+        })
+    candidates.sort(key=lambda item: tuple(item["score"]), reverse=True)
+    return candidates[:limit]
+
+
+def card_cluster_passes(candidate: Mapping[str, Any]) -> bool:
+    """Minimal structural bar a cluster must clear to be auto-selected.
+
+    Two equally legitimate public shapes pass: card grids built from links
+    (classic listings, deposits, news), and link-less offer panels whose only
+    hooks are price/term/date signals (button-driven offers, MUI-style
+    catalog grids).  Navigation noise fails both bars: short, signal-free
+    text.
+    """
+
+    avg_text = float(candidate.get("avg_text_length") or 0)
+    link_fraction = float(candidate.get("link_fraction") or 0)
+    signal_fraction = float(candidate.get("signal_fraction") or 0)
+    return (
+        (avg_text >= 40 and link_fraction >= 0.2)
+        or (avg_text >= 60 and signal_fraction >= 0.3)
+    )
 
 
 class JSONPathNode:
@@ -1405,7 +1523,7 @@ class TransformNode:
                 transformed = apply_collection_operation(transformed, operation, context)
             else:
                 for row in transformed:
-                    apply_operation(row, operation)
+                    apply_operation(row, operation, context=context)
         for row in transformed:
             original = dict(row)
             include, reason = deterministic_filter_decision(row, config.get("filters") or [])
@@ -2676,13 +2794,15 @@ def filename_from_response(response: httpx.Response) -> str:
     return name or "document.bin"
 
 
-def apply_operation(row: dict[str, Any], operation: dict[str, Any]) -> None:
+def apply_operation(row: dict[str, Any], operation: dict[str, Any], *, context: ExecutionContext | None = None) -> None:
     field = operation.get("field")
     kind = operation.get("type")
     if kind == "rename":
         row[operation["to"]] = row.pop(field, None)
     elif kind == "constant":
         row[field] = operation.get("value")
+    elif kind == "add_context":
+        _apply_context_fields(row, operation, context)
     elif kind == "copy":
         target = str(operation.get("to") or field or "")
         if target:
@@ -2723,6 +2843,43 @@ def apply_operation(row: dict[str, Any], operation: dict[str, Any]) -> None:
         _apply_selection_rules(row, operation)
     elif kind == "classify_access":
         _apply_access_rules(row, operation)
+
+
+def _apply_context_fields(row: dict[str, Any], operation: Mapping[str, Any], context: ExecutionContext | None) -> None:
+    """Inject run-context values into every record (universal ``add_context``).
+
+    Values come from the execution context (source binding, run clock) and the
+    record's own transport provenance.  Existing non-empty values always win,
+    so an explicit mapping is never silently overwritten.
+    """
+
+    fields = operation.get("fields") or ["source_id", "source_name", "fetched_at", "page_url", "state"]
+    if isinstance(fields, str):
+        fields = [item.strip() for item in fields.split(",") if item.strip()]
+    variables = context.variables if context is not None and isinstance(context.variables, Mapping) else {}
+    source = variables.get("source") if isinstance(variables.get("source"), Mapping) else {}
+    provenance = row.get("__provenance") if isinstance(row.get("__provenance"), Mapping) else {}
+    page_provenance = provenance.get("page") if isinstance(provenance.get("page"), Mapping) else {}
+    for name in fields:
+        name = str(name)
+        if name in row and row[name] not in (None, ""):
+            continue
+        if name == "source_id":
+            value = source.get("id")
+        elif name == "source_name":
+            value = source.get("name")
+        elif name == "fetched_at":
+            value = (context.effective_run_clock if context is not None else None) or datetime.now(UTC)
+        elif name == "page_url":
+            value = row.get("url") or row.get("page_url")
+        elif name == "state":
+            value = row.get("state") or page_provenance.get("state") or provenance.get("state")
+        else:
+            value = source.get(name) or variables.get(name)
+        if isinstance(value, datetime):
+            value = value.isoformat()
+        if value not in (None, ""):
+            row[name] = value
 
 
 def _rule_text(row: Mapping[str, Any], fields: Any) -> str:

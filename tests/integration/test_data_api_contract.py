@@ -615,7 +615,7 @@ def test_every_universal_template_binds_source_and_dataset_without_site_configur
     dataset = client.get(f"/api/v1/datasets?project_id={project['id']}", headers=auth).json()[0]
     templates = client.get("/api/v1/workflow-templates", headers=auth).json()
     system_templates = [item for item in templates if item.get("is_system")]
-    assert len(system_templates) == 8
+    assert len(system_templates) == 15
     assert all("site-preset" not in item.get("tags", []) for item in system_templates)
 
     for template in system_templates:

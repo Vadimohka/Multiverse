@@ -30,7 +30,10 @@ class Settings(BaseSettings):
     refresh_token_days: int = 7
     run_default_deadline_seconds: int = 900
     run_max_deadline_seconds: int = 3600
-    run_lease_seconds: int = 60
+    # Long crawls under parallel load can delay the ~5s heartbeat slices well
+    # past a 60s lease; a wider margin keeps live runs from being reconciled
+    # away mid-crawl (RUN_LEASE_EXPIRED).
+    run_lease_seconds: int = 300
     run_heartbeat_interval_seconds: int = 5
 
     @property

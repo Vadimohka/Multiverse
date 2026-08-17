@@ -118,7 +118,10 @@ async def test_html_table_fixture():
         {"html": fixture("table.html")},
         {"selector": "#measurements"},
     )
-    assert result["records"] == [{"Code": "A", "Value": "10"}, {"Code": "B", "Value": "20"}]
+    assert result["records"] == [
+        {"Code": "A", "Value": "10", "row_index": 0, "table_id": "#measurements:0"},
+        {"Code": "B", "Value": "20", "row_index": 1, "table_id": "#measurements:0"},
+    ]
 
 
 @pytest.mark.asyncio

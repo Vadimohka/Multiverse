@@ -189,6 +189,22 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+def _find_pack_source(db: Session, project_id: str, key: str) -> Source | None:
+    """Find a pack source by its ``source_key`` setting, portably.
+
+    ``Source.settings`` is a JSON (not JSONB) column: on PostgreSQL a JSON-path
+    comparison like ``settings['source_key'].as_string() == key`` matches the
+    quoted JSON literal and silently fails, orphaning pack sources on every
+    re-import.  Filtering in Python keeps the pairing identical on SQLite and
+    PostgreSQL.
+    """
+
+    for source in db.scalars(select(Source).where(Source.project_id == project_id)).all():
+        if (source.settings or {}).get("source_key") == key:
+            return source
+    return None
+
+
 def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
     """Install or update only changed immutable preset revisions.
 
@@ -240,10 +256,15 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
             if not (ROOT / reference).is_file():
                 raise ValueError(f"Fixture reference for {descriptor.key} does not exist: {reference}")
         dataset = datasets[descriptor.dataset_group]
-        source = db.scalar(select(Source).where(Source.project_id == project.id, Source.settings["source_key"].as_string() == descriptor.key))
+        source = _find_pack_source(db, project.id, descriptor.key)
         if source is None:
             source = Source(project_id=project.id, name=descriptor.name, source_type="WEB_PAGE", entry_url=descriptor.url, base_url=descriptor.url, fetch_mode="HTTP", settings={"source_key": descriptor.key, "authority": "SECONDARY" if "tg-" in descriptor.key else "PRIMARY", "access": "PUBLIC"})
             db.add(source); db.flush()
+        elif source.entry_url != descriptor.url:
+            # The passports (and their URL overrides) are the pack's canonical
+            # entry points; keep an existing source row in sync on re-import.
+            source.entry_url = descriptor.url
+            source.base_url = descriptor.url
         config = _preset_config(descriptor)
         config_hash = _hash(config)
         latest = db.scalar(select(SourcePresetRevision).where(SourcePresetRevision.project_id == project.id, SourcePresetRevision.slug == descriptor.key).order_by(SourcePresetRevision.revision.desc()))
@@ -262,6 +283,12 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
             db.add(workflow); db.flush()
             workflow.graph_json["settings"]["compiledPlanDigest"] = compile_executable_plan(graph, project_id=project.id, workflow_id=workflow.id, workflow_version=workflow.version, source_id=source.id, revision_refs={"sourcePresetRevisionId": preset.id}).digest
             counters["workflows"] += 1
+        elif (workflow.graph_json or {}).get("settings", {}).get("source_id") != source.id:
+            # Repair a workflow paired with the wrong segment's source (the
+            # JSON-path lookup failure could bind UL workflows to stray rows).
+            # Assignment replaces the JSON column value so SQLAlchemy notices.
+            settings = {**((workflow.graph_json or {}).get("settings") or {}), "source_id": source.id, "dataset_id": dataset.id}
+            workflow.graph_json = {**(workflow.graph_json or {}), "settings": settings}
         cron, timezone = _schedule_defaults(descriptor)
         schedule_name = f"{descriptor.key}: {descriptor.name}"
         schedule = db.scalar(select(Schedule).where(Schedule.workflow_id == workflow.id, Schedule.name == schedule_name))
