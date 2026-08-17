@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from app.database import SessionLocal
 from app.models import (
+    Dataset,
     DatasetSourceMembership,
     Project,
     Schedule,
@@ -11,12 +12,15 @@ from app.models import (
     SourcePresetRevision,
     User,
     Workflow,
+    WorkflowBlueprintRevision,
 )
+from app.services import belarus_market_pack
 from app.services.belarus_market_pack import (
     _preset_config,
     install_belarus_market_pack,
     passport_sources,
 )
+from app.services.preset_compiler import compile_preset
 from sqlalchemy import func, select
 from workflow_engine.nodes import ParseTableNode, TransformNode
 from workflow_engine.types import ExecutionContext
@@ -99,6 +103,175 @@ def test_every_market_news_source_has_a_shared_dataset_binding():
     assert all(config["bindings"]["dataset"] == "market-news" for config in profiles.values())
 
 
+def test_installed_market_news_workflows_match_the_fixture_profile_contract(client):
+    """Replacing a compiled official graph with a seed graph must fail this contract."""
+
+    expected_keys = {
+        "news-01", "news-02", "news-04", "news-05", "news-06",
+        "news-07", "news-08", "news-09", "news-10", "news-11",
+        "news-12", "news-13", "news-14", "news-15", "news-16",
+    }
+    descriptors = {item.key: item for item in passport_sources()}
+    with SessionLocal() as db:
+        admin = db.scalar(select(User).order_by(User.created_at))
+        assert admin is not None
+        install_belarus_market_pack(db, admin)
+        dataset = db.scalar(select(Dataset).where(Dataset.slug == "market-news"))
+        assert dataset is not None
+        memberships = db.scalars(
+            select(DatasetSourceMembership).where(
+                DatasetSourceMembership.dataset_id == dataset.id,
+                DatasetSourceMembership.source_key.in_(expected_keys),
+            )
+        ).all()
+
+        assert {item.source_key for item in memberships} == expected_keys
+        for membership in memberships:
+            preset = db.get(SourcePresetRevision, membership.source_preset_revision_id)
+            workflow = db.get(Workflow, membership.workflow_id)
+            assert preset is not None
+            assert workflow is not None
+            blueprint = db.get(WorkflowBlueprintRevision, preset.blueprint_revision_id)
+            assert blueprint is not None
+            assert preset.config_json == _preset_config(descriptors[membership.source_key])
+
+            expected = compile_preset(blueprint.graph_json, preset.__dict__).graph
+            assert workflow.graph_json["nodes"] == expected["nodes"], membership.source_key
+            assert workflow.graph_json["edges"] == expected["edges"], membership.source_key
+            assert workflow.graph_json["contractVersion"] == 2, membership.source_key
+
+
+def test_special_official_transport_and_document_contracts_compile_from_profiles():
+    """Dropping a profile node override must not restore installer-only behavior."""
+
+    sources = {item.key: item for item in passport_sources()}
+    news_01 = _preset_config(sources["news-01"])["nodes"]
+    news_02 = _preset_config(sources["news-02"])["nodes"]
+    news_05 = _preset_config(sources["news-05"])["nodes"]
+    news_06 = _preset_config(sources["news-06"])["nodes"]
+
+    assert news_01["acquire"]["transport"] == "PLAYWRIGHT"
+    assert news_01["traverse"]["detail_request"]["url"] == "https://www.bcse.by/solo/calendar"
+    assert news_01["traverse"]["pagination"]["nextSelector"].startswith("#pc-0 ")
+    assert news_02["acquire"]["transport"] == "PLAYWRIGHT"
+    assert news_02["traverse"]["detail_request"]["url"] == "https://www.bcse.by/solo/calendar"
+    assert news_02["traverse"]["pagination"]["nextSelector"].startswith("#pc-nws-")
+    assert news_05["acquire"]["transport"] == "PLAYWRIGHT"
+    assert news_05["traverse"]["frontier_title_patterns"] == [
+        "Сведения о средних процентных ставках кредитно-депозитного рынка",
+        "Показатели рынка корпоративных ценных бумаг",
+    ]
+    assert news_05["traverse"]["attachment_documents"]["enabled"] is True
+    assert news_05["traverse"]["related_json_resources"][0]["url"] == (
+        "https://api.nbrb.by/AvgIntRatesDyn"
+    )
+    assert news_06["traverse"]["direct_document_record"] is True
+    assert news_06["traverse"]["attachment_documents"]["enabled"] is True
+
+
+@pytest.mark.parametrize(
+    "live_smoke",
+    [
+        None,
+        {"checked_at": "2026-08-14T00:00:00+03:00", "transport": "HTTP", "result": "FAIL"},
+    ],
+)
+def test_verified_source_requires_recorded_successful_live_smoke(
+    client, monkeypatch, tmp_path, live_smoke
+):
+    """Missing or failed operator smoke evidence must reject VERIFIED input."""
+
+    registry = json.loads(
+        belarus_market_pack.VERIFICATION_REGISTRY.read_text(encoding="utf-8")
+    )
+    if live_smoke is None:
+        registry["ul-20"].pop("live_smoke", None)
+    else:
+        registry["ul-20"]["live_smoke"] = live_smoke
+    registry_path = tmp_path / "verification.json"
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    monkeypatch.setattr(belarus_market_pack, "VERIFICATION_REGISTRY", registry_path)
+
+    with SessionLocal() as db:
+        admin = db.scalar(select(User).order_by(User.created_at))
+        assert admin is not None
+        with pytest.raises(
+            ValueError,
+            match="VERIFIED source ul-20 requires a successful recorded live smoke",
+        ):
+            install_belarus_market_pack(db, admin)
+
+
+def test_imported_verified_schedule_starts_disabled(client):
+    """A valid VERIFIED manifest must never opt an imported schedule into execution."""
+
+    with SessionLocal() as db:
+        dataset = db.scalar(select(Dataset).where(Dataset.slug == "deposit-offers-legal"))
+        assert dataset is not None
+        membership = db.scalar(
+            select(DatasetSourceMembership).where(
+                DatasetSourceMembership.dataset_id == dataset.id,
+                DatasetSourceMembership.source_key == "ul-20",
+            )
+        )
+        assert membership is not None
+        schedule = db.scalar(select(Schedule).where(Schedule.workflow_id == membership.workflow_id))
+
+    assert schedule is not None
+    assert schedule.enabled is False
+
+
+def test_reimport_preserves_user_workflow_revision_and_operator_schedule_state(client):
+    """Profile reimport must not overwrite a user's workflow revision or enablement choice."""
+
+    with SessionLocal() as db:
+        admin = db.scalar(select(User).order_by(User.created_at))
+        assert admin is not None
+        news_membership = db.scalar(
+            select(DatasetSourceMembership).where(
+                DatasetSourceMembership.source_key == "news-01"
+            )
+        )
+        verified_membership = db.scalar(
+            select(DatasetSourceMembership).where(
+                DatasetSourceMembership.source_key == "ul-20"
+            )
+        )
+        assert news_membership is not None
+        assert verified_membership is not None
+        workflow = db.get(Workflow, news_membership.workflow_id)
+        schedule = db.scalar(
+            select(Schedule).where(Schedule.workflow_id == verified_membership.workflow_id)
+        )
+        assert workflow is not None
+        assert schedule is not None
+        original_graph = workflow.graph_json
+        original_version = workflow.version
+        original_enabled = schedule.enabled
+        workflow.graph_json = {
+            **workflow.graph_json,
+            "settings": {**workflow.graph_json["settings"], "user_revision_marker": "keep"},
+        }
+        workflow.version = original_version + 7
+        schedule.enabled = True
+        db.commit()
+        workflow_id = workflow.id
+
+        try:
+            install_belarus_market_pack(db, admin)
+            db.refresh(workflow)
+            db.refresh(schedule)
+            assert workflow.id == workflow_id
+            assert workflow.version == original_version + 7
+            assert workflow.graph_json["settings"]["user_revision_marker"] == "keep"
+            assert schedule.enabled is True
+        finally:
+            workflow.graph_json = original_graph
+            workflow.version = original_version
+            schedule.enabled = original_enabled
+            db.commit()
+
+
 def test_bcse_releases_profile_includes_every_article_in_the_configured_section():
     profile = json.loads((Path(__file__).resolve().parents[2] / "presets" / "belarus-market" / "news" / "source-profiles.json").read_text(encoding="utf-8"))
     selection = profile["sources"]["news-01"]["selection"]
@@ -134,7 +307,7 @@ def test_pack_installer_is_idempotent_and_creates_per_source_workflows(client):
     assert sum(item.cron == "0 8 * * 1" for item in schedules) == 44
     assert sum(item.cron == "0 8 * * 1-5" for item in schedules) == 15
     assert sum(item.cron == "*/30 9-18 * * 1-5" for item in schedules) == 1
-    assert sum(item.enabled for item in schedules) == 1
+    assert sum(item.enabled for item in schedules) == 0
 
 
 def test_pack_workflows_pair_with_their_own_segment_source(client):

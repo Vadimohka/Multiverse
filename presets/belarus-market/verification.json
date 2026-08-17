@@ -5,7 +5,8 @@
     "live_smoke": {
       "checked_at": "2026-08-14T00:00:00+03:00",
       "transport": "HTTP",
-      "result": "PUBLIC_TABLE_WITH_LEGAL_ENTITY_RATES"
+      "result": "PASS",
+      "reason": "PUBLIC_TABLE_WITH_LEGAL_ENTITY_RATES"
     }
   },
   "news-01": {"status": "DRAFT", "fixture_refs": ["tests/fixtures/belarus-market/news/news-01-list.html", "tests/fixtures/belarus-market/news/news-01-detail.html"], "live_smoke": {"result": "PENDING_OPERATOR_SMOKE", "reason": "anonymous_public_calendar_and_detail_capture_retained; installed_workflow_not_operator_run"}},
