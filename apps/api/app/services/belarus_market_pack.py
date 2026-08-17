@@ -240,11 +240,9 @@ def _initial_workflow_graph(
 
 
 def _schedule_defaults(source: PassportSource) -> tuple[str, str]:
-    """Return editable pack defaults; users can change them in the Schedule UI."""
+    """Return the zero-touch hourly schedule used by the installed market pack."""
 
-    if source.key == "news-03":
-        return ("*/30 9-18 * * 1-5", "Europe/Minsk")
-    return ("0 8 * * 1-5", "Europe/Minsk") if source.dataset_group == "news" else ("0 8 * * 1", "Europe/Minsk")
+    return ("0 * * * *", "Europe/Minsk")
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -412,19 +410,23 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
             )
         )
         if schedule is None:
-            # Every imported schedule is visible and editable in no-code UI,
-            # but execution remains an explicit operator action even after the
-            # preset has complete fixture and live-smoke evidence.
-            schedule = Schedule(workflow_id=workflow.id, name=schedule_name, cron=cron, timezone=timezone, enabled=False)
+            schedule = Schedule(
+                workflow_id=workflow.id,
+                name=schedule_name,
+                cron=cron,
+                timezone=timezone,
+                enabled=True,
+            )
             db.add(schedule)
             counters["schedules"] += 1
         elif schedule.name == legacy_workflow_name and schedule_name != legacy_workflow_name:
             schedule.name = schedule_name
-        if descriptor.key == "news-03" and schedule.cron != cron:
-            # NEWS-03 is an intraday market snapshot, not a once-weekly news
-            # feed. Upgrade the legacy schedule to the reviewed default.
+        if (schedule.cron, schedule.timezone, schedule.enabled) != (cron, timezone, True):
+            # Pack-owned schedules are reconciled at startup so a deployment
+            # never needs an operator to activate or repair the digest.
             schedule.cron = cron
             schedule.timezone = timezone
+            schedule.enabled = True
         membership = db.scalar(select(DatasetSourceMembership).where(DatasetSourceMembership.dataset_id == dataset.id, DatasetSourceMembership.source_key == descriptor.key))
         if membership is None:
             db.add(DatasetSourceMembership(dataset_id=dataset.id, source_id=source.id, workflow_id=workflow.id, source_preset_revision_id=preset.id, source_key=descriptor.key, required=descriptor.status != "BLOCKED"))

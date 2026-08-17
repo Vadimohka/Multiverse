@@ -228,8 +228,8 @@ def test_verified_source_requires_recorded_successful_live_smoke(
             install_belarus_market_pack(db, admin)
 
 
-def test_imported_verified_schedule_starts_disabled(client):
-    """A valid VERIFIED manifest must never opt an imported schedule into execution."""
+def test_imported_verified_schedule_starts_enabled_hourly(client):
+    """A packaged source is runnable immediately after application startup."""
 
     with SessionLocal() as db:
         dataset = db.scalar(select(Dataset).where(Dataset.slug == "deposit-offers-legal"))
@@ -244,11 +244,15 @@ def test_imported_verified_schedule_starts_disabled(client):
         schedule = db.scalar(select(Schedule).where(Schedule.workflow_id == membership.workflow_id))
 
     assert schedule is not None
-    assert schedule.enabled is False
+    assert (schedule.cron, schedule.timezone, schedule.enabled) == (
+        "0 * * * *",
+        "Europe/Minsk",
+        True,
+    )
 
 
 def test_reimport_preserves_user_workflow_revision_and_operator_schedule_state(client):
-    """Profile reimport must not overwrite a user's workflow revision or enablement choice."""
+    """Only the named package schedule is reconciled; operator schedules stay intact."""
 
     with SessionLocal() as db:
         admin = db.scalar(select(User).order_by(User.created_at))
@@ -273,13 +277,23 @@ def test_reimport_preserves_user_workflow_revision_and_operator_schedule_state(c
         assert schedule is not None
         original_graph = workflow.graph_json
         original_version = workflow.version
-        original_enabled = schedule.enabled
+        original_schedule = (schedule.cron, schedule.timezone, schedule.enabled)
+        operator_schedule = Schedule(
+            workflow_id=schedule.workflow_id,
+            name="Операторский ночной запуск",
+            cron="30 23 * * *",
+            timezone="UTC",
+            enabled=False,
+        )
         workflow.graph_json = {
             **workflow.graph_json,
             "settings": {**workflow.graph_json["settings"], "user_revision_marker": "keep"},
         }
         workflow.version = original_version + 7
-        schedule.enabled = True
+        schedule.cron = "0 8 * * 1-5"
+        schedule.timezone = "UTC"
+        schedule.enabled = False
+        db.add(operator_schedule)
         db.commit()
         workflow_id = workflow.id
 
@@ -287,14 +301,25 @@ def test_reimport_preserves_user_workflow_revision_and_operator_schedule_state(c
             install_belarus_market_pack(db, admin)
             db.refresh(workflow)
             db.refresh(schedule)
+            db.refresh(operator_schedule)
             assert workflow.id == workflow_id
             assert workflow.version == original_version + 7
             assert workflow.graph_json["settings"]["user_revision_marker"] == "keep"
-            assert schedule.enabled is True
+            assert (schedule.cron, schedule.timezone, schedule.enabled) == (
+                "0 * * * *",
+                "Europe/Minsk",
+                True,
+            )
+            assert (operator_schedule.cron, operator_schedule.timezone, operator_schedule.enabled) == (
+                "30 23 * * *",
+                "UTC",
+                False,
+            )
         finally:
             workflow.graph_json = original_graph
             workflow.version = original_version
-            schedule.enabled = original_enabled
+            schedule.cron, schedule.timezone, schedule.enabled = original_schedule
+            db.delete(operator_schedule)
             db.commit()
 
 
@@ -319,6 +344,15 @@ def test_pack_installer_is_idempotent_and_creates_per_source_workflows(client):
         market_project = db.scalar(select(Project).where(Project.slug == "belarus-market-data"))
         assert market_project is not None
         schedules = db.scalars(select(Schedule).join(Workflow).where(Workflow.project_id == market_project.id).order_by(Schedule.name)).all()
+        news_dataset = db.scalar(select(Dataset).where(Dataset.slug == "market-news"))
+        assert news_dataset is not None
+        news_source_keys = set(
+            db.scalars(
+                select(DatasetSourceMembership.source_key).where(
+                    DatasetSourceMembership.dataset_id == news_dataset.id
+                )
+            )
+        )
 
     assert first["sources"] == 60
     # The application bootstrap installs the source pack on a clean server.
@@ -330,10 +364,14 @@ def test_pack_installer_is_idempotent_and_creates_per_source_workflows(client):
     assert presets >= 57
     assert len(schedules) == 60
     assert {item.timezone for item in schedules} == {"Europe/Minsk"}
-    assert sum(item.cron == "0 8 * * 1" for item in schedules) == 44
-    assert sum(item.cron == "0 8 * * 1-5" for item in schedules) == 15
-    assert sum(item.cron == "*/30 9-18 * * 1-5" for item in schedules) == 1
-    assert sum(item.enabled for item in schedules) == 0
+    assert {item.cron for item in schedules} == {"0 * * * *"}
+    assert all(item.enabled for item in schedules)
+    assert news_source_keys >= {
+        "news-01", "news-02", "news-04", "news-05", "news-06", "news-07",
+        "news-08", "news-09", "news-10", "news-11", "news-12", "news-13",
+        "news-14", "news-15", "news-16",
+    }
+    assert not any(key.startswith("news-tg-") for key in news_source_keys)
 
 
 def test_pack_workflows_pair_with_their_own_segment_source(client):
