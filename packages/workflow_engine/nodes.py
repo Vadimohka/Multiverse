@@ -144,30 +144,6 @@ class BrowserOpenNode:
                 screenshot = await page.screenshot(full_page=bool(config.get("full_page", True)), type="png")
                 title = await page.title()
                 final_url = page.url
-                # Some public dashboards split the requested scope between a
-                # homepage widget and a linked results table.  Optional
-                # supplemental URLs keep one BrowserOpen artifact while
-                # retaining the primary page as the canonical source URL.
-                supplemental_pages: list[str] = []
-                for supplemental in config.get("supplemental_urls", []) or []:
-                    if isinstance(supplemental, str):
-                        supplemental_url = render_template(supplemental, context, inputs)
-                        supplemental_label = supplemental_url
-                    else:
-                        supplemental_url = render_template(str(supplemental.get("url") or ""), context, inputs)
-                        supplemental_label = str(supplemental.get("label") or supplemental_url)
-                    if not supplemental_url:
-                        continue
-                    egress_policy.validate_url(supplemental_url, resolver=resolver)
-                    await page.goto(supplemental_url, wait_until=str(config.get("wait_until", "networkidle")), timeout=timeout_ms)
-                    egress_guard.assert_safe()
-                    supplemental_html = await collect_paginated_html(page, config, timeout_ms, start_url=page.url, egress_guard=egress_guard)
-                    supplemental_soup = BeautifulSoup(supplemental_html, "lxml")
-                    supplemental_main = supplemental_soup.select_one("main")
-                    supplemental_content = "".join(str(child) for child in (supplemental_main.contents if supplemental_main else supplemental_soup.contents))
-                    supplemental_pages.append(f'<main data-browser-supplement="{escape(supplemental_label)}">{supplemental_content}</main>')
-                if supplemental_pages:
-                    rendered_html = merge_rendered_sections([rendered_html, *supplemental_pages])
                 final_target = egress_policy.validate_url(final_url, resolver=resolver)
                 egress_guard.assert_safe()
                 await browser_context.close()

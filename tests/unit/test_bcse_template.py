@@ -197,7 +197,7 @@ def test_bcse_home_market_news_graph_targets_only_currency_and_repo_widgets():
     browser = nodes["browser"]["config"]
     extract = nodes["extract"]["config"]
     assert browser["url"] == "https://www.bcse.by/"
-    assert extract["container_selector"] == "#repo-body .inf-wrap, [data-browser-supplement='currency-results'] table tbody tr"
+    assert extract["container_selector"] == "#currency .inf-instrument, #repo-body .inf-wrap"
     fields = {field["target"]: field for field in nodes["mapping"]["config"]["fields"]}
     assert fields["source_id"]["constant"] == "bcse-currency-repo-news"
     assert fields["selection_rule_id"]["constant"] == "bcse-currency-and-byn-repo-v1"
@@ -214,17 +214,19 @@ def test_bcse_home_repo_widget_extracts_typed_row():
     result = asyncio.run(ExtractRepeatingListNode().execute(
         ExecutionContext(run_id="run", project_id="p", workflow_version_id="v"),
         {"html": html},
-        {"input_path": "html", "container_selector": "#repo-body .inf-wrap", "fields": [
-            {"name": "label", "selector": ".inf-name"},
-            {"name": "value_raw", "selector": ".inf-repo-percent"},
-            {"name": "observed_source", "selector": ".inf-repo-date"},
+        {"input_path": "html", "container_selector": "#currency .inf-instrument, #repo-body .inf-wrap", "fields": [
+            {"name": "label", "selector": "a.text-asfalt, .inf-name"},
+            {"name": "value_raw", "selector": ".w-60p .text-asfalt, .inf-repo-percent"},
+            {"name": "observed_source", "selector": ".inf-date, .inf-repo-date"},
             {"name": "change_percent_raw", "selector": ".w-50p > .text-right:first-child"},
             {"name": "change_absolute_raw", "selector": ".w-50p span"},
         ]},
     ))
-    assert result["count"] == 1
-    assert result["records"][0]["label"] == "1-3 дней"
-    assert result["records"][0]["value_raw"] == "4%"
+    assert result["count"] == 2
+    assert result["records"][0]["label"] == "USD/BYN_TOD"
+    assert result["records"][0]["value_raw"] == "3.0131"
+    assert result["records"][1]["label"] == "1-3 дней"
+    assert result["records"][1]["value_raw"] == "4%"
 
 
 def test_crawler_date_query_parameter_names_are_fully_configurable(monkeypatch):

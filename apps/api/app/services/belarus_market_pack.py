@@ -448,8 +448,7 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
             or not any(node.get("id") == "parse" and node.get("type") == "parse_html" for node in (workflow.graph_json or {}).get("nodes", []))
             or "https://www.bcse.by/" not in str(next((node.get("config", {}).get("url", "") for node in (workflow.graph_json or {}).get("nodes", []) if node.get("id") == "browser"), ""))
             or "#repo-body .inf-wrap" not in str(next((node.get("config", {}).get("container_selector", "") for node in (workflow.graph_json or {}).get("nodes", []) if node.get("id") == "extract"), ""))
-            or "data-browser-supplement='currency-results'" not in str(next((node.get("config", {}).get("container_selector", "") for node in (workflow.graph_json or {}).get("nodes", []) if node.get("id") == "extract"), ""))
-            or "markets/currency/results" not in str(next((node.get("config", {}).get("supplemental_urls", []) for node in (workflow.graph_json or {}).get("nodes", []) if node.get("id") == "browser"), ""))
+            or "#currency .inf-instrument" not in str(next((node.get("config", {}).get("container_selector", "") for node in (workflow.graph_json or {}).get("nodes", []) if node.get("id") == "extract"), ""))
             or "bcse-currency-and-byn-repo-v1" not in str((workflow.graph_json or {}).get("nodes", []))
         ):
             # Keep an existing source and membership stable while upgrading a
