@@ -121,93 +121,23 @@ def bcse_news_graph(source_id: str, dataset_id: str, *, incremental: bool = Fals
 
 
 def bcse_market_news_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
-    """BCSE press-release crawler mapped into the shared market-news schema.
+    """Compile the BCSE press-release graph from its editable source profile."""
 
-    The public releases page is an HTML shell; its cards are rendered by the
-    browser and the full publication is returned by ``/solo/calendar``.  Keep
-    that source-specific configuration in this bootstrap preset while the
-    execution engine remains generic.
-    """
-    graph = bcse_news_graph(source_id, dataset_id, incremental=incremental)
-    crawl = next(node for node in graph["nodes"] if node["id"] == "crawl")["config"]
-    for field in crawl.get("detail_fields", []):
-        if field.get("name") == "attachments_json":
-            field["name"] = "attachments"
-    mapping_fields = [
-        {"target": "source_id", "constant": "bcse-releases"},
-        {"target": "source_name", "constant": "БВФБ / пресс-релизы"},
-        {"target": "source_section", "constant": "press-releases"},
-        {"target": "source_authority", "constant": "PRIMARY"},
-        {"target": "external_id", "source_path": "record_id"},
-        {"target": "identity_key", "source_path": "record_id"},
-        {"target": "canonical_url", "source_path": "url"},
-        {"target": "title", "source_path": "title"},
-        {"target": "body_text", "source_path": "body_text"},
-        {"target": "body_html", "source_path": "body_html"},
-        {"target": "source_published_at", "source_path": "source_published_at"},
-        {"target": "candidate_status", "constant": "INCLUDE"},
-        {"target": "access_status", "constant": "PUBLIC"},
-        {"target": "selection_rule_id", "constant": "bcse-releases-all-v1"},
-        {"target": "selection_rule_version", "constant": "news-passport-v2"},
-        {"target": "selection_reason", "constant": "all publications in the configured press-releases section"},
-        {"target": "selection_evidence", "constant": {"section": "press-releases"}},
-        {"target": "attachments", "source_path": "attachments"},
-        {"target": "language", "source_path": "language"},
-        {"target": "fetched_at", "source_path": "fetched_at"},
-    ]
-    mapping = next(node for node in graph["nodes"] if node["id"] == "mapping")
-    mapping["config"] = {"input_path": "records", "fields": mapping_fields}
-    validate = next(node for node in graph["nodes"] if node["id"] == "validate")
-    validate["config"] = {
-        "input_path": "records",
-        "required": ["source_id", "source_name", "canonical_url", "title", "candidate_status", "access_status"],
-        "fail_on_error": True,
-    }
-    output = next(node for node in graph["nodes"] if node["id"] == "output")
-    output["config"] = {"input_path": "records", "name": "market_news"}
-    graph["settings"]["natural_key_fields"] = ["source_id", "identity_key"]
-    return graph
+    from app.services.news_profile_graph import load_news_profile_graph
+
+    return load_news_profile_graph(
+        "news-01", source_id=source_id, dataset_id=dataset_id
+    )
 
 
 def bcse_market_news_category_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
-    """BCSE ``Новости`` category graph sharing the NEWS-01 transport contract.
+    """Compile the BCSE news-category graph from its editable source profile."""
 
-    The BCSE calendar endpoint returns a mixed stream (all publications,
-    releases and news).  NEWS-02 deliberately uses the rendered ``Новости``
-    tab and a strict ``/press-center/news/`` frontier, so press releases and
-    other press-centre categories can never enter this workflow.
-    """
-    graph = bcse_market_news_graph(source_id, dataset_id, incremental=incremental)
-    crawl = next(node for node in graph["nodes"] if node["id"] == "crawl")["config"]
-    crawl["link_selector"] = "#pc-nws-1c a.text-pc[href*='/press-center/news/']"
-    crawl["pagination_next_selector"] = "#pc-nws-1 li.paginationjs-next:not(.disabled) a"
-    crawl["url_pattern"] = r"/press-center/news/(?P<record_id>n[^/?#]+)/(?P<publication_time>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})$"
+    from app.services.news_profile_graph import load_news_profile_graph
 
-    mapping = next(node for node in graph["nodes"] if node["id"] == "mapping")
-    mapping["config"] = {"input_path": "records", "fields": [
-        {"target": "source_id", "constant": "bcse-news"},
-        {"target": "source_name", "constant": "БВФБ / новости"},
-        {"target": "source_section", "constant": "news"},
-        {"target": "source_authority", "constant": "PRIMARY"},
-        {"target": "external_id", "source_path": "record_id"},
-        {"target": "identity_key", "source_path": "record_id"},
-        {"target": "canonical_url", "source_path": "url"},
-        {"target": "title", "source_path": "title"},
-        {"target": "body_text", "source_path": "body_text"},
-        {"target": "body_html", "source_path": "body_html"},
-        {"target": "source_published_at", "source_path": "source_published_at"},
-        {"target": "candidate_status", "constant": "INCLUDE"},
-        {"target": "access_status", "constant": "PUBLIC"},
-        {"target": "selection_rule_id", "constant": "bcse-news-category-v1"},
-        {"target": "selection_rule_version", "constant": "news-passport-v2"},
-        {"target": "selection_reason", "constant": "all publications in the configured news category"},
-        {"target": "selection_evidence", "constant": {"section": "news", "url_prefix": "/press-center/news/"}},
-        {"target": "attachments", "source_path": "attachments"},
-        {"target": "language", "source_path": "language"},
-        {"target": "fetched_at", "source_path": "fetched_at"},
-    ]}
-    graph["settings"]["natural_key_fields"] = ["source_id", "identity_key"]
-    return graph
+    return load_news_profile_graph(
+        "news-02", source_id=source_id, dataset_id=dataset_id
+    )
 
 
 def bcse_home_market_news_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
@@ -330,238 +260,33 @@ def bcse_home_market_news_graph(source_id: str, dataset_id: str, *, incremental:
 
 
 def economy_actual_information_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
-    """Collect every article and direct file linked from MinEconomy's section."""
-    crawl_config = {
-        "listing_url": "https://economy.gov.by/ru/aktualnaya-informatsiya-ru/",
-        "base_url": "https://economy.gov.by/",
-        "listing_fetch_mode": "HTTP",
-        "link_selector": "main article a[href]",
-        "url_pattern": r"/(?:ru/[^?#]+|uploads/files/[^?#]+)$",
-        "same_origin_only": True, "max_items": 5000, "max_pages": 5000,
-        "concurrency": 4, "delay_ms": 100, "request_retries": 2,
-        "request_timeout": 45, "timeout": 900, "detail_fetch_mode": "HTTP",
-        "direct_document_record": True,
-        "attachment_documents": {"enabled": True, "max_files": 50, "extensions": [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".zip"]},
-        "language": "ru", "source_name": "Министерство экономики", "save_artifacts": True,
-    }
-    mapping_fields = [
-        {"target": "source_id", "constant": "ministry-economy"}, {"target": "source_name", "constant": "Министерство экономики"},
-        {"target": "source_section", "constant": "actual-information"}, {"target": "source_authority", "constant": "PRIMARY"},
-        {"target": "external_id", "source_path": "record_id"}, {"target": "identity_key", "source_path": "record_id"},
-        {"target": "canonical_url", "source_path": "url"}, {"target": "title", "source_path": "title"},
-        {"target": "body_text", "source_path": "body_text"}, {"target": "body_html", "source_path": "body_html"},
-        {"target": "candidate_status", "constant": "INCLUDE"}, {"target": "access_status", "constant": "PUBLIC"},
-        {"target": "selection_rule_id", "constant": "economy-actual-all-v1"}, {"target": "selection_rule_version", "constant": "news-passport-v2"},
-        {"target": "selection_reason", "constant": "all public articles and linked files in the configured actual-information section"},
-        {"target": "selection_evidence", "constant": {"section_url": "https://economy.gov.by/ru/aktualnaya-informatsiya-ru/", "selector": "main article a[href]"}},
-        {"target": "attachments", "source_path": "attachments"}, {"target": "language", "source_path": "language"},
-        {"target": "fetched_at", "source_path": "fetched_at"}, {"target": "observed_at", "source_path": "observed_at"},
-    ]
-    return {
-        "version": 1,
-        "settings": {"source_id": source_id, "dataset_id": dataset_id, "natural_key_fields": ["source_id", "identity_key"], "review_policy": {"new": False, "changed": False, "confidence_below": 0.8}},
-        "nodes": [
-            {"id": "trigger", "type": "manual_trigger", "position": {"x": 30, "y": 180}, "config": {}},
-            {"id": "crawl", "type": "crawl_links", "position": {"x": 280, "y": 180}, "config": crawl_config},
-            {"id": "mapping", "type": "mapping", "position": {"x": 590, "y": 180}, "config": {"input_path": "records", "fields": mapping_fields}},
-            {"id": "validate", "type": "validate", "position": {"x": 850, "y": 180}, "config": {"input_path": "records", "required": ["source_id", "source_name", "canonical_url", "title", "candidate_status", "access_status"], "fail_on_error": True}},
-            {"id": "output", "type": "output", "position": {"x": 1120, "y": 180}, "config": {"input_path": "records", "name": "market_news"}},
-        ],
-        "edges": [{"id": "e1", "source": "trigger", "target": "crawl"}, {"id": "e2", "source": "crawl", "target": "mapping"}, {"id": "e3", "source": "mapping", "target": "validate"}, {"id": "e4", "source": "validate", "target": "output"}],
-    }
+    """Compile the MinEconomy graph from its editable source profile."""
+
+    from app.services.news_profile_graph import load_news_profile_graph
+
+    return load_news_profile_graph(
+        "news-06", source_id=source_id, dataset_id=dataset_id
+    )
 
 
 def nbrb_market_press_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
-    """NBRB press-release graph for the shared market-news dataset.
+    """Compile the NBRB press graph from its editable source profile."""
 
-    The operator-facing source is ``/news/press``.  NBRB exposes the same
-    category through its official RSS endpoint, which is more complete and
-    stable than scraping the archive shell; every item is still fetched from
-    its full public ``/press/<id>`` detail page.
-    """
-    crawl_config = {
-        "listing_url": "https://www.nbrb.by/rss/",
-        "listing_query": {"p": "press"},
-        "source_entry_url": "https://www.nbrb.by/news/press",
-        "base_url": "https://www.nbrb.by/",
-        "listing_fetch_mode": "HTTP",
-        "listing_wait_until": "networkidle",
-        "link_selector": "",
-        "pagination_enabled": False,
-        "tabs_enabled": False,
-        "detail_fetch_mode": "HTTP",
-        "url_path": "url",
-        "url_pattern": r"/press/(?P<record_id>[^/?#]+)",
-        "max_items": 5000,
-        "concurrency": 6,
-        "delay_ms": 150,
-        "request_retries": 2,
-        "request_timeout": 45,
-        "timeout": 900,
-        "headers": {"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5"},
-        "detail_fields": [
-            {"name": "title", "selector": "h1"},
-            {"name": "source_published_at", "selector": ".usercontent-wrap > .flex-row:first-child > div:first-child", "timezone": "Europe/Minsk", "format": "DD.MM.YYYY"},
-            {"name": "body_text", "selector": ".news-content", "value": "text"},
-            {"name": "body_html", "selector": ".news-content", "value": "html"},
-            {"name": "category", "selector": ".usercontent-wrap > .flex-row:first-child > div:nth-child(2)"},
-            {"name": "attachments", "selector": ".news-content a[href$='.pdf'], .news-content a[href$='.doc'], .news-content a[href$='.docx'], .news-content a[href$='.xls'], .news-content a[href$='.xlsx'], .news-content a[href$='.zip']", "multiple": True, "value": "links"},
-        ],
-        "detail_constants": {"language": "ru", "source_name": "НБРБ"},
-        "drop_query_params": ["utm_source", "utm_medium", "utm_campaign"],
-        "save_artifacts": True,
-    }
-    mapping_fields = [
-        {"target": "source_id", "constant": "nbrb-press"},
-        {"target": "source_name", "constant": "НБРБ / пресс-релизы"},
-        {"target": "source_section", "constant": "press"},
-        {"target": "source_authority", "constant": "PRIMARY"},
-        {"target": "external_id", "source_path": "record_id"},
-        {"target": "identity_key", "source_path": "record_id"},
-        {"target": "canonical_url", "source_path": "url"},
-        {"target": "title", "source_path": "title"},
-        {"target": "body_text", "source_path": "body_text"},
-        {"target": "body_html", "source_path": "body_html"},
-        {"target": "source_published_at", "source_path": "source_published_at"},
-        {"target": "category", "source_path": "category"},
-        {"target": "candidate_status", "constant": "INCLUDE"},
-        {"target": "access_status", "constant": "PUBLIC"},
-        {"target": "selection_rule_id", "constant": "nbrb-press-all-v1"},
-        {"target": "selection_rule_version", "constant": "news-passport-v2"},
-        {"target": "selection_reason", "constant": "all publications in the official NBRB press-release RSS category"},
-        {"target": "selection_evidence", "constant": {"section": "press", "feed": "/rss/?p=press", "entry_url": "/news/press", "url_prefix": "/press/"}},
-        {"target": "attachments", "source_path": "attachments"},
-        {"target": "language", "source_path": "language"},
-        {"target": "fetched_at", "source_path": "fetched_at"},
-    ]
-    graph = {
-        "version": 1,
-        "settings": {"source_id": source_id, "dataset_id": dataset_id, "natural_key_fields": ["source_id", "identity_key"], "review_policy": {"new": False, "changed": True, "confidence_below": 0.8}},
-        "nodes": [
-            {"id": "trigger", "type": "manual_trigger", "position": {"x": 30, "y": 180}, "config": {}},
-            {"id": "crawl", "type": "crawl_links", "position": {"x": 280, "y": 180}, "config": crawl_config},
-            {"id": "mapping", "type": "mapping", "position": {"x": 590, "y": 180}, "config": {"input_path": "records", "fields": mapping_fields}},
-            {"id": "validate", "type": "validate", "position": {"x": 850, "y": 180}, "config": {"input_path": "records", "required": ["source_id", "source_name", "canonical_url", "title", "candidate_status", "access_status"], "fail_on_error": True}},
-            {"id": "output", "type": "output", "position": {"x": 1120, "y": 180}, "config": {"input_path": "records", "name": "market_news"}},
-        ],
-        "edges": [
-            {"id": "e1", "source": "trigger", "target": "crawl"},
-            {"id": "e2", "source": "crawl", "target": "mapping"},
-            {"id": "e3", "source": "mapping", "target": "validate"},
-            {"id": "e4", "source": "validate", "target": "output"},
-        ],
-    }
-    return graph
+    from app.services.news_profile_graph import load_news_profile_graph
+
+    return load_news_profile_graph(
+        "news-04", source_id=source_id, dataset_id=dataset_id
+    )
 
 
 def nbrb_market_statistics_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
-    """NBRB statistical-publications graph for the shared market-news dataset.
+    """Compile the NBRB statistics graph from its editable source profile."""
 
-    The statistics landing page contains a mixed publication stream.  Keep
-    the frontier restricted to the two passport series before opening detail
-    pages; the title rule remains as a second, auditable guard against route
-    drift or unrelated cards entering the dataset.
-    """
-    crawl_config = {
-        "listing_url": "https://www.nbrb.by/news/statistics",
-        "source_entry_url": "https://www.nbrb.by/news/statistics",
-        "base_url": "https://www.nbrb.by/",
-        "listing_fetch_mode": "PLAYWRIGHT",
-        "listing_wait_until": "networkidle",
-        "link_selector": "#newsData article.n-article .pub__descr a[href]",
-        # Filter directly on the dynamic listing-card title before crawling
-        # details or documents.  This keeps raw artifacts as scoped as the
-        # output dataset, rather than downloading unrelated NBRB sections.
-        "frontier_title_patterns": [
-            "Сведения о средних процентных ставках кредитно-депозитного рынка",
-            "Показатели рынка корпоративных ценных бумаг",
-        ],
-        "pagination_enabled": True,
-        "pagination_max_pages": 100,
-        "pagination_next_selector": "#newsData a[rel='next'], #newsData .pagination a.next, #newsData li.next a",
-        "pagination_wait_ms": 750,
-        "tabs_enabled": True,
-        "tabs_wait_ms": 500,
-        "tabs_max_depth": 2,
-        "detail_fetch_mode": "HTTP",
-        "url_path": "url",
-        # Keep the whole statistics publication frontier.  Category
-        # membership is decided from the material title below, because NBRB
-        # has used several URLs for the same series over time.
-        "url_pattern": r"/statistics/[^/?#]+(?:/[^/?#]+)*(?:$|[/?#])",
-        "max_items": 5000,
-        "concurrency": 6,
-        "delay_ms": 150,
-        "request_retries": 2,
-        "request_timeout": 45,
-        "timeout": 900,
-        "headers": {"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5"},
-        "detail_fields": [
-            {"name": "title", "selector": "main h1, h1"},
-            {"name": "source_published_at", "selector": "main .pub-date, main time, meta[property='article:published_time']", "attribute": "content", "timezone": "Europe/Minsk"},
-            {"name": "body_text", "selector": "main.l-main.usercontent, main.usercontent, main", "value": "text"},
-            {"name": "body_html", "selector": "main.l-main.usercontent, main.usercontent, main", "value": "html"},
-            {"name": "tables", "selector": "main table", "multiple": True, "value": "structured_tables"},
-            {"name": "attachments", "selector": "main a[href$='.pdf'], main a[href$='.doc'], main a[href$='.docx'], main a[href$='.xls'], main a[href$='.xlsx'], main a[href$='.zip']", "multiple": True, "value": "links"},
-        ],
-        "detail_constants": {"language": "ru", "source_name": "НБРБ"},
-        "attachment_base_url": "https://www.nbrb.by/",
-        "attachment_documents": {"enabled": True, "max_files": 25, "extensions": [".xlsx", ".xls", ".csv", ".pdf", ".docx"]},
-        "related_json_resources": [{"name": "official_api", "target": "official_api", "url": "https://api.nbrb.by/AvgIntRatesDyn", "title_patterns": ["Сведения о средних процентных ставках кредитно-депозитного рынка"]}],
-        "drop_query_params": ["utm_source", "utm_medium", "utm_campaign"],
-        "save_artifacts": True,
-    }
-    selection_rules = {
-        "fields": ["title"],
-        "default": {"action": "EXCLUDE", "ruleId": "nbrb-statistics-series-v1", "reason": "outside the two configured NBRB statistical series"},
-        "rules": [
-            {"id": "nbrb-statistics-credit-deposit-v2", "action": "INCLUDE", "reason": "материал о средних процентных ставках кредитно-депозитного рынка", "when": {"anyPatterns": ["Сведения о средних процентных ставках кредитно-депозитного рынка"]}},
-            {"id": "nbrb-statistics-corporate-securities-v1", "action": "INCLUDE", "reason": "материал о показателях рынка корпоративных ценных бумаг", "when": {"anyPatterns": ["Показатели рынка корпоративных ценных бумаг"]}},
-        ],
-    }
-    mapping_fields = [
-        {"target": "source_id", "constant": "nbrb-statistics"},
-        {"target": "source_name", "constant": "НБРБ / статистика"},
-        {"target": "source_section", "constant": "statistics"},
-        {"target": "source_authority", "constant": "PRIMARY"},
-        {"target": "external_id", "source_path": "record_id"},
-        {"target": "identity_key", "source_path": "record_id"},
-        {"target": "canonical_url", "source_path": "url"},
-        {"target": "title", "source_path": "title"},
-        {"target": "body_text", "source_path": "body_text"},
-        {"target": "body_html", "source_path": "body_html"},
-        {"target": "tables", "source_path": "tables"},
-        {"target": "source_published_at", "source_path": "source_published_at"},
-        {"target": "candidate_status", "source_path": "candidate_status"},
-        {"target": "access_status", "constant": "PUBLIC"},
-        {"target": "selection_rule_id", "source_path": "selection_rule_id"},
-        {"target": "selection_rule_version", "constant": "news-passport-v2"},
-        {"target": "selection_reason", "source_path": "selection_reason"},
-        {"target": "selection_evidence", "source_path": "selection_evidence"},
-        {"target": "attachments", "source_path": "attachments"},
-        {"target": "official_api", "source_path": "official_api"},
-        {"target": "language", "source_path": "language"},
-        {"target": "fetched_at", "source_path": "fetched_at"},
-    ]
-    return {
-        "version": 1,
-        "settings": {"source_id": source_id, "dataset_id": dataset_id, "natural_key_fields": ["source_id", "identity_key"], "review_policy": {"new": False, "changed": False, "confidence_below": 0.8}},
-        "nodes": [
-            {"id": "trigger", "type": "manual_trigger", "position": {"x": 30, "y": 180}, "config": {}},
-            {"id": "crawl", "type": "crawl_links", "position": {"x": 280, "y": 180}, "config": crawl_config},
-            {"id": "select", "type": "transform", "position": {"x": 540, "y": 180}, "config": {"input_path": "records", "operations": [{"type": "select_by_rules", **selection_rules}], "filters": [{"field": "candidate_status", "operator": "equals", "value": "INCLUDE", "action": "include_only", "reason": "only exact NBRB statistical series"}], "identity": ["url"]}},
-            {"id": "mapping", "type": "mapping", "position": {"x": 780, "y": 180}, "config": {"input_path": "records", "fields": mapping_fields}},
-            {"id": "validate", "type": "validate", "position": {"x": 1030, "y": 180}, "config": {"input_path": "records", "required": ["source_id", "source_name", "canonical_url", "title", "body_text", "candidate_status", "access_status", "selection_rule_id"], "fail_on_error": True}},
-            {"id": "output", "type": "output", "position": {"x": 1270, "y": 180}, "config": {"input_path": "records", "name": "market_news"}},
-        ],
-        "edges": [
-            {"id": "e1", "source": "trigger", "target": "crawl"},
-            {"id": "e2", "source": "crawl", "target": "select"},
-            {"id": "e3", "source": "select", "target": "mapping"},
-            {"id": "e4", "source": "mapping", "target": "validate"},
-            {"id": "e5", "source": "validate", "target": "output"},
-        ],
-    }
+    from app.services.news_profile_graph import load_news_profile_graph
+
+    return load_news_profile_graph(
+        "news-05", source_id=source_id, dataset_id=dataset_id
+    )
 
 
 # Compatibility alias for callers that use the generic market-news naming.

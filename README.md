@@ -100,6 +100,25 @@ grep '^DEFAULT_ADMIN_' .env
 
 Never commit `.env` or reuse its development credentials in a public deployment.
 
+### Belarus market digest without setup
+
+The first API startup automatically installs the Belarus market pack. Telegram
+is not imported. The packaged website-news and market-indicator workflows are
+enabled at `0 * * * *` in `Europe/Minsk`; Celery Beat and the worker services
+in Compose collect them every hour without creating sources, workflows or
+schedules in the UI. Deposit templates remain disabled.
+
+For a `destiny.by` deployment, set these values in the server's `.env` before
+starting Compose:
+
+```dotenv
+PUBLIC_APP_URL=https://destiny.by
+CORS_ORIGINS=https://destiny.by
+```
+
+Use the [Destiny market-news API guide](docs/belarus_market/DESTINY_API_GUIDE.md)
+to create a scoped read token and retrieve news from a specific date.
+
 For low-resource servers (1 vCPU, 1 GiB RAM), see [the minimal Compose deployment guide](README.MIN.md).
 
 ## First workflow

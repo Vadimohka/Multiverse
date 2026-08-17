@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from app.database import SessionLocal
 from app.models import (
+    Dataset,
     DatasetSourceMembership,
     Project,
     Schedule,
@@ -11,12 +12,17 @@ from app.models import (
     SourcePresetRevision,
     User,
     Workflow,
+    WorkflowBlueprintRevision,
 )
+from app.services import belarus_market_pack
 from app.services.belarus_market_pack import (
+    NEWS_PROFILE_REGISTRY,
     _preset_config,
     install_belarus_market_pack,
     passport_sources,
 )
+from app.services.news_profile_graph import compile_news_profile_graph
+from app.services.preset_compiler import compile_preset
 from sqlalchemy import func, select
 from workflow_engine.nodes import ParseTableNode, TransformNode
 from workflow_engine.types import ExecutionContext
@@ -83,6 +89,256 @@ def test_every_news_site_has_a_declarative_list_detail_and_selection_profile():
         assert {operation["type"] for operation in operations} >= {"copy", "coalesce", "classify_access", "select_by_rules"}
 
 
+def test_every_market_news_source_has_a_shared_dataset_binding():
+    expected = {
+        "news-01", "news-02", "news-04", "news-05", "news-06",
+        "news-07", "news-08", "news-09", "news-10", "news-11",
+        "news-12", "news-13", "news-14", "news-15", "news-16",
+    }
+    profiles = {
+        source.key: _preset_config(source)
+        for source in passport_sources()
+        if source.key in expected
+    }
+
+    assert set(profiles) == expected
+    assert all(config["bindings"]["dataset"] == "market-news" for config in profiles.values())
+
+
+def test_installed_market_news_workflows_match_the_fixture_profile_contract(client):
+    """Replacing a compiled official graph with a seed graph must fail this contract."""
+
+    expected_keys = {
+        "news-01", "news-02", "news-04", "news-05", "news-06",
+        "news-07", "news-08", "news-09", "news-10", "news-11",
+        "news-12", "news-13", "news-14", "news-15", "news-16",
+    }
+    descriptors = {item.key: item for item in passport_sources()}
+    with SessionLocal() as db:
+        admin = db.scalar(select(User).order_by(User.created_at))
+        assert admin is not None
+        install_belarus_market_pack(db, admin)
+        dataset = db.scalar(select(Dataset).where(Dataset.slug == "market-news"))
+        assert dataset is not None
+        memberships = db.scalars(
+            select(DatasetSourceMembership).where(
+                DatasetSourceMembership.dataset_id == dataset.id,
+                DatasetSourceMembership.source_key.in_(expected_keys),
+            )
+        ).all()
+
+        assert {item.source_key for item in memberships} == expected_keys
+        for membership in memberships:
+            preset = db.get(SourcePresetRevision, membership.source_preset_revision_id)
+            workflow = db.get(Workflow, membership.workflow_id)
+            assert preset is not None
+            assert workflow is not None
+            blueprint = db.get(WorkflowBlueprintRevision, preset.blueprint_revision_id)
+            assert blueprint is not None
+            assert preset.config_json == _preset_config(descriptors[membership.source_key])
+
+            registry = json.loads(NEWS_PROFILE_REGISTRY.read_text(encoding="utf-8"))
+            profile = registry["sources"][membership.source_key]
+            expected = (
+                compile_news_profile_graph(
+                    profile,
+                    source_id=membership.source_id,
+                    dataset_id=dataset.id,
+                )
+                if "installedGraph" in profile
+                else compile_preset(blueprint.graph_json, preset.__dict__).graph
+            )
+            assert workflow.graph_json["nodes"] == expected["nodes"], membership.source_key
+            assert workflow.graph_json["edges"] == expected["edges"], membership.source_key
+            assert workflow.graph_json.get("contractVersion") == expected.get(
+                "contractVersion"
+            ), membership.source_key
+
+
+def test_special_official_transport_and_document_contracts_live_in_profiles():
+    """Every executable legacy knob must be editable in the source profile."""
+
+    registry = json.loads(NEWS_PROFILE_REGISTRY.read_text(encoding="utf-8"))
+    profiles = registry["sources"]
+    for source_key in ("news-01", "news-02", "news-04", "news-05", "news-06"):
+        assert "nodeOverrides" not in profiles[source_key]
+        graph = compile_news_profile_graph(
+            profiles[source_key], source_id="source", dataset_id="dataset"
+        )
+        assert next(node for node in graph["nodes"] if node["id"] == "crawl")[
+            "type"
+        ] == "crawl_links"
+
+    news_01 = profiles["news-01"]["installedGraph"]["crawl"]
+    news_02 = profiles["news-02"]["installedGraph"]["crawl"]
+    news_05 = profiles["news-05"]["installedGraph"]["crawl"]
+    news_06 = profiles["news-06"]["installedGraph"]["crawl"]
+
+    assert news_01["link_selector"] == profiles["news-01"]["listingSelector"]
+    assert news_01["url_pattern"] == profiles["news-01"]["urlPattern"]
+    assert news_01["listing_fetch_mode"] == "PLAYWRIGHT"
+    assert news_01["detail_request"]["url"] == "https://www.bcse.by/solo/calendar"
+    assert news_01["pagination_next_selector"].startswith("#pc-0 ")
+    assert news_02["listing_fetch_mode"] == "PLAYWRIGHT"
+    assert news_02["detail_request"]["url"] == "https://www.bcse.by/solo/calendar"
+    assert news_02["pagination_next_selector"].startswith("#pc-nws-")
+    assert news_05["listing_fetch_mode"] == "PLAYWRIGHT"
+    assert news_05["frontier_title_patterns"] == [
+        "Сведения о средних процентных ставках кредитно-депозитного рынка",
+        "Показатели рынка корпоративных ценных бумаг",
+    ]
+    assert news_05["attachment_documents"]["enabled"] is True
+    assert news_05["related_json_resources"][0]["url"] == (
+        "https://api.nbrb.by/AvgIntRatesDyn"
+    )
+    assert news_06["direct_document_record"] is True
+    assert news_06["attachment_documents"]["enabled"] is True
+
+
+@pytest.mark.parametrize(
+    "live_smoke",
+    [
+        None,
+        {"checked_at": "2026-08-14T00:00:00+03:00", "transport": "HTTP", "result": "FAIL"},
+    ],
+)
+def test_verified_source_requires_recorded_successful_live_smoke(
+    client, monkeypatch, tmp_path, live_smoke
+):
+    """Missing or failed operator smoke evidence must reject VERIFIED input."""
+
+    registry = json.loads(
+        belarus_market_pack.VERIFICATION_REGISTRY.read_text(encoding="utf-8")
+    )
+    if live_smoke is None:
+        registry["ul-20"].pop("live_smoke", None)
+    else:
+        registry["ul-20"]["live_smoke"] = live_smoke
+    registry_path = tmp_path / "verification.json"
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    monkeypatch.setattr(belarus_market_pack, "VERIFICATION_REGISTRY", registry_path)
+
+    with SessionLocal() as db:
+        admin = db.scalar(select(User).order_by(User.created_at))
+        assert admin is not None
+        with pytest.raises(
+            ValueError,
+            match="VERIFIED source ul-20 requires a successful recorded live smoke",
+        ):
+            install_belarus_market_pack(db, admin)
+
+
+def test_non_digest_schedule_stays_disabled(client):
+    """Hourly autostart must not activate the unrelated deposit templates."""
+
+    with SessionLocal() as db:
+        dataset = db.scalar(select(Dataset).where(Dataset.slug == "deposit-offers-legal"))
+        assert dataset is not None
+        membership = db.scalar(
+            select(DatasetSourceMembership).where(
+                DatasetSourceMembership.dataset_id == dataset.id,
+                DatasetSourceMembership.source_key == "ul-20",
+            )
+        )
+        assert membership is not None
+        schedule = db.scalar(select(Schedule).where(Schedule.workflow_id == membership.workflow_id))
+
+    assert schedule is not None
+    assert schedule.enabled is False
+
+
+def test_market_digest_schedule_starts_enabled_hourly(client):
+    """The market-news package is runnable immediately after application startup."""
+
+    with SessionLocal() as db:
+        membership = db.scalar(
+            select(DatasetSourceMembership).where(
+                DatasetSourceMembership.source_key == "news-01"
+            )
+        )
+        assert membership is not None
+        schedule = db.scalar(select(Schedule).where(Schedule.workflow_id == membership.workflow_id))
+
+    assert schedule is not None
+    assert (schedule.cron, schedule.timezone, schedule.enabled) == (
+        "0 * * * *",
+        "Europe/Minsk",
+        True,
+    )
+
+
+def test_reimport_preserves_user_workflow_revision_and_operator_schedule_state(client):
+    """Only the named package schedule is reconciled; operator schedules stay intact."""
+
+    with SessionLocal() as db:
+        admin = db.scalar(select(User).order_by(User.created_at))
+        assert admin is not None
+        news_membership = db.scalar(
+            select(DatasetSourceMembership).where(
+                DatasetSourceMembership.source_key == "news-01"
+            )
+        )
+        digest_membership = db.scalar(
+            select(DatasetSourceMembership).where(
+                DatasetSourceMembership.source_key == "news-01"
+            )
+        )
+        assert news_membership is not None
+        assert digest_membership is not None
+        workflow = db.get(Workflow, news_membership.workflow_id)
+        schedule = db.scalar(
+            select(Schedule).where(Schedule.workflow_id == digest_membership.workflow_id)
+        )
+        assert workflow is not None
+        assert schedule is not None
+        original_graph = workflow.graph_json
+        original_version = workflow.version
+        original_schedule = (schedule.cron, schedule.timezone, schedule.enabled)
+        operator_schedule = Schedule(
+            workflow_id=schedule.workflow_id,
+            name="Операторский ночной запуск",
+            cron="30 23 * * *",
+            timezone="UTC",
+            enabled=False,
+        )
+        workflow.graph_json = {
+            **workflow.graph_json,
+            "settings": {**workflow.graph_json["settings"], "user_revision_marker": "keep"},
+        }
+        workflow.version = original_version + 7
+        schedule.cron = "0 8 * * 1-5"
+        schedule.timezone = "UTC"
+        schedule.enabled = False
+        db.add(operator_schedule)
+        db.commit()
+        workflow_id = workflow.id
+
+        try:
+            install_belarus_market_pack(db, admin)
+            db.refresh(workflow)
+            db.refresh(schedule)
+            db.refresh(operator_schedule)
+            assert workflow.id == workflow_id
+            assert workflow.version == original_version + 7
+            assert workflow.graph_json["settings"]["user_revision_marker"] == "keep"
+            assert (schedule.cron, schedule.timezone, schedule.enabled) == (
+                "0 * * * *",
+                "Europe/Minsk",
+                True,
+            )
+            assert (operator_schedule.cron, operator_schedule.timezone, operator_schedule.enabled) == (
+                "30 23 * * *",
+                "UTC",
+                False,
+            )
+        finally:
+            workflow.graph_json = original_graph
+            workflow.version = original_version
+            schedule.cron, schedule.timezone, schedule.enabled = original_schedule
+            db.delete(operator_schedule)
+            db.commit()
+
+
 def test_bcse_releases_profile_includes_every_article_in_the_configured_section():
     profile = json.loads((Path(__file__).resolve().parents[2] / "presets" / "belarus-market" / "news" / "source-profiles.json").read_text(encoding="utf-8"))
     selection = profile["sources"]["news-01"]["selection"]
@@ -104,6 +360,14 @@ def test_pack_installer_is_idempotent_and_creates_per_source_workflows(client):
         market_project = db.scalar(select(Project).where(Project.slug == "belarus-market-data"))
         assert market_project is not None
         schedules = db.scalars(select(Schedule).join(Workflow).where(Workflow.project_id == market_project.id).order_by(Schedule.name)).all()
+        memberships_by_workflow = {
+            row.workflow_id: row.source_key
+            for row in db.scalars(
+                select(DatasetSourceMembership).where(
+                    DatasetSourceMembership.workflow_id.is_not(None)
+                )
+            )
+        }
 
     assert first["sources"] == 60
     # The application bootstrap installs the source pack on a clean server.
@@ -114,11 +378,24 @@ def test_pack_installer_is_idempotent_and_creates_per_source_workflows(client):
     assert workflows == 21
     assert presets >= 57
     assert len(schedules) == 60
-    assert {item.timezone for item in schedules} == {"Europe/Minsk"}
-    assert sum(item.cron == "0 8 * * 1" for item in schedules) == 44
-    assert sum(item.cron == "0 8 * * 1-5" for item in schedules) == 15
-    assert sum(item.cron == "*/30 9-18 * * 1-5" for item in schedules) == 1
-    assert sum(item.enabled for item in schedules) == 1
+    digest_schedules = [
+        item for item in schedules
+        if memberships_by_workflow[item.workflow_id].startswith(("news-", "indicator-"))
+    ]
+    non_digest_schedules = [item for item in schedules if item not in digest_schedules]
+    assert len(digest_schedules) == 19
+    assert {(item.cron, item.timezone, item.enabled) for item in digest_schedules} == {
+        ("0 * * * *", "Europe/Minsk", True)
+    }
+    assert non_digest_schedules
+    assert not any(item.enabled for item in non_digest_schedules)
+    news_source_keys = set(memberships_by_workflow.values())
+    assert news_source_keys >= {
+        "news-01", "news-02", "news-04", "news-05", "news-06", "news-07",
+        "news-08", "news-09", "news-10", "news-11", "news-12", "news-13",
+        "news-14", "news-15", "news-16",
+    }
+    assert not any(key.startswith("news-tg-") for key in news_source_keys)
 
 
 def test_pack_workflows_pair_with_their_own_segment_source(client):

@@ -26,18 +26,12 @@ from app.models import (
     Workflow,
     WorkflowBlueprintRevision,
 )
+from app.seed_templates import bcse_home_market_news_graph
+from app.services.news_profile_graph import compile_news_profile_graph
 from app.services.preset_compiler import compile_preset
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from workflow_engine import compile_executable_plan, standard_v2_graph
-from app.seed_templates import (
-    bcse_home_market_news_graph,
-    bcse_market_news_category_graph,
-    bcse_market_news_graph,
-    economy_actual_information_graph,
-    nbrb_market_press_graph,
-    nbrb_market_statistics_graph,
-)
 
 ROOT = Path(__file__).resolve().parents[4]
 PACK_ROOT = ROOT / "presets" / "belarus-market"
@@ -82,6 +76,8 @@ class PassportSource:
     url: str
     status: str = "DRAFT"
     fixture_refs: tuple[str, ...] = ()
+    live_smoke_result: str = ""
+    live_smoke_checked_at: str = ""
 
     @property
     def dataset_group(self) -> str:
@@ -108,6 +104,7 @@ def passport_sources() -> list[PassportSource]:
                 continue
             key = match.group(1).lower()
             evidence = verification.get(key) if isinstance(verification.get(key), dict) else {}
+            live_smoke = evidence.get("live_smoke") if isinstance(evidence.get("live_smoke"), dict) else {}
             sources.append(PassportSource(
                 key=key,
                 name=match.group(2).strip(),
@@ -115,6 +112,8 @@ def passport_sources() -> list[PassportSource]:
                 url=URL_OVERRIDES.get(key, url.group(0)),
                 status=str(evidence.get("status") or "DRAFT").upper(),
                 fixture_refs=tuple(str(ref) for ref in evidence.get("fixture_refs", []) if ref),
+                live_smoke_result=str(live_smoke.get("result") or "").upper(),
+                live_smoke_checked_at=str(live_smoke.get("checked_at") or ""),
             ))
     for item in json.loads(INDICATOR_REGISTRY.read_text(encoding="utf-8")):
         sources.append(PassportSource(
@@ -202,14 +201,49 @@ def _news_preset_config(source: PassportSource) -> dict:
     }
     if pagination:
         nodes["traverse"]["pagination"] = pagination
-    return _deep_merge(common, {"nodes": nodes, "metadata": {"newsProfileVersion": str(registry.get("version") or "")}})
+    metadata = {"newsProfileVersion": str(registry.get("version") or "")}
+    if isinstance(profile.get("installedGraph"), dict):
+        metadata["installedGraphDigest"] = _hash(profile["installedGraph"])
+    return _deep_merge(
+        common,
+        {"nodes": nodes, "metadata": metadata},
+    )
+
+
+def _news_profile(source_key: str) -> dict:
+    registry = json.loads(NEWS_PROFILE_REGISTRY.read_text(encoding="utf-8"))
+    profile = (registry.get("sources") or {}).get(source_key)
+    if not isinstance(profile, dict):
+        raise ValueError(f"News source {source_key} has no declarative profile")
+    return profile
+
+
+def _initial_workflow_graph(
+    descriptor: PassportSource,
+    *,
+    source_id: str,
+    dataset_id: str,
+    blueprint_graph: dict,
+    preset: SourcePresetRevision,
+) -> dict:
+    """Build a new workflow from its persisted declarative contract."""
+
+    if descriptor.key == "news-03":
+        return bcse_home_market_news_graph(source_id, dataset_id, incremental=True)
+    if descriptor.dataset_group == "news":
+        profile = _news_profile(descriptor.key)
+        if isinstance(profile.get("installedGraph"), dict):
+            return compile_news_profile_graph(
+                profile, source_id=source_id, dataset_id=dataset_id
+            )
+    return compile_preset(blueprint_graph, preset.__dict__).graph
 
 
 def _schedule_defaults(source: PassportSource) -> tuple[str, str]:
-    """Return editable pack defaults; users can change them in the Schedule UI."""
+    """Return editable per-source defaults for the installed market pack."""
 
-    if source.key == "news-03":
-        return ("*/30 9-18 * * 1-5", "Europe/Minsk")
+    if source.dataset_group in {"news", "indicators"}:
+        return ("0 * * * *", "Europe/Minsk")
     return ("0 8 * * 1-5", "Europe/Minsk") if source.dataset_group == "news" else ("0 8 * * 1", "Europe/Minsk")
 
 
@@ -239,8 +273,9 @@ def _find_pack_source(db: Session, project_id: str, key: str) -> Source | None:
 def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
     """Install or update only changed immutable preset revisions.
 
-    DRAFT/BLOCKED presets intentionally get no fixture references and therefore
-    cannot be accidentally promoted to VERIFIED by this bootstrap.
+    VERIFIED input requires retained fixture and successful live-smoke evidence.
+    Digest news/indicator schedules are enabled hourly; deposit schedules stay
+    disabled for explicit operator review.
     """
 
     project = db.scalar(select(Project).where(Project.slug == "belarus-market-data"))
@@ -291,6 +326,13 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
     for descriptor in passport_sources():
         if descriptor.status == "VERIFIED" and not descriptor.fixture_refs:
             raise ValueError(f"VERIFIED source {descriptor.key} requires a fixture reference")
+        if descriptor.status == "VERIFIED" and (
+            descriptor.live_smoke_result != "PASS"
+            or not descriptor.live_smoke_checked_at
+        ):
+            raise ValueError(
+                f"VERIFIED source {descriptor.key} requires a successful recorded live smoke"
+            )
         for reference in descriptor.fixture_refs:
             if not (ROOT / reference).is_file():
                 raise ValueError(f"Fixture reference for {descriptor.key} does not exist: {reference}")
@@ -324,20 +366,12 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
             )
         )
         if workflow is None:
-            graph = (
-                bcse_market_news_graph(source.id, dataset.id, incremental=True)
-                if descriptor.key == "news-01"
-                else bcse_market_news_category_graph(source.id, dataset.id, incremental=True)
-                if descriptor.key == "news-02"
-                else nbrb_market_press_graph(source.id, dataset.id, incremental=True)
-                if descriptor.key == "news-04"
-                else nbrb_market_statistics_graph(source.id, dataset.id, incremental=True)
-                if descriptor.key == "news-05"
-                else bcse_home_market_news_graph(source.id, dataset.id, incremental=True)
-                if descriptor.key == "news-03"
-                else economy_actual_information_graph(source.id, dataset.id, incremental=True)
-                if descriptor.key == "news-06"
-                else compile_preset(blueprint.graph_json, preset.__dict__).graph
+            graph = _initial_workflow_graph(
+                descriptor,
+                source_id=source.id,
+                dataset_id=dataset.id,
+                blueprint_graph=blueprint.graph_json,
+                preset=preset,
             )
             graph["settings"]["source_id"] = source.id
             graph["settings"]["dataset_id"] = dataset.id
@@ -349,94 +383,7 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
             # Migrate the human-facing label in place; IDs, provenance and
             # memberships remain unchanged.
             workflow.name = workflow_name
-        if descriptor.key == "news-01" and (
-            not any(node.get("id") == "crawl" for node in (workflow.graph_json or {}).get("nodes", []))
-            or "(?:news|releases)" in str(
-                next(
-                    (
-                        node.get("config", {}).get("url_pattern", "")
-                        for node in (workflow.graph_json or {}).get("nodes", [])
-                        if node.get("id") == "crawl"
-                    ),
-                    "",
-                )
-            )
-        ):
-            # Repair the original universal-v2 NEWS-01 workflow.  The BCSE
-            # releases page is a JS shell, so the generic HTTP-first graph
-            # cannot discover cards; use the reviewed browser→detail preset.
-            # It also keeps the shared calendar endpoint constrained to
-            # ``/press-center/releases`` rather than mixing in news cards.
-            graph = bcse_market_news_graph(source.id, dataset.id, incremental=True)
-            workflow.graph_json = graph
-            workflow.version += 1
-            workflow.published_version = None
-            workflow.graph_json["settings"]["compiledPlanDigest"] = compile_executable_plan(graph, project_id=project.id, workflow_id=workflow.id, workflow_version=workflow.version, source_id=source.id, revision_refs={"sourcePresetRevisionId": preset.id}).digest
-        elif descriptor.key == "news-02" and (
-            not any(node.get("id") == "crawl" for node in (workflow.graph_json or {}).get("nodes", []))
-            or "/press-center/news/" not in str(
-                next(
-                    (
-                        node.get("config", {}).get("url_pattern", "")
-                        for node in (workflow.graph_json or {}).get("nodes", [])
-                        if node.get("id") == "crawl"
-                    ),
-                    "",
-                )
-            )
-            or "bcse-news-category-v1" not in str((workflow.graph_json or {}).get("nodes", []))
-        ):
-            # NEWS-02 used to be compiled from the generic list/detail
-            # profile.  Repair that legacy row in-place with the reviewed
-            # browser → detail graph and keep the workflow id stable.
-            graph = bcse_market_news_category_graph(source.id, dataset.id, incremental=True)
-            workflow.graph_json = graph
-            workflow.version += 1
-            workflow.published_version = None
-            workflow.graph_json["settings"]["compiledPlanDigest"] = compile_executable_plan(graph, project_id=project.id, workflow_id=workflow.id, workflow_version=workflow.version, source_id=source.id, revision_refs={"sourcePresetRevisionId": preset.id}).digest
-        elif descriptor.key == "news-04" and (
-            not any(node.get("id") == "crawl" for node in (workflow.graph_json or {}).get("nodes", []))
-            or "https://www.nbrb.by/rss/" not in str(
-                next(
-                    (
-                        node.get("config", {}).get("listing_url", "")
-                        for node in (workflow.graph_json or {}).get("nodes", [])
-                        if node.get("id") == "crawl"
-                    ),
-                    "",
-                )
-            )
-            or "nbrb-press-all-v1" not in str((workflow.graph_json or {}).get("nodes", []))
-        ):
-            # NEWS-04 used to be compiled from the generic profile.  Repair
-            # that legacy row in-place with the category-scoped NBRB graph.
-            graph = nbrb_market_press_graph(source.id, dataset.id, incremental=True)
-            workflow.graph_json = graph
-            workflow.version += 1
-            workflow.published_version = None
-            workflow.graph_json["settings"]["compiledPlanDigest"] = compile_executable_plan(graph, project_id=project.id, workflow_id=workflow.id, workflow_version=workflow.version, source_id=source.id, revision_refs={"sourcePresetRevisionId": preset.id}).digest
-        elif descriptor.key == "news-05" and (
-            not any(node.get("id") == "crawl" for node in (workflow.graph_json or {}).get("nodes", []))
-            or "https://www.nbrb.by/news/statistics" not in str(next((node.get("config", {}).get("listing_url", "") for node in (workflow.graph_json or {}).get("nodes", []) if node.get("id") == "crawl"), ""))
-            or "/statistics/[^/?#]+" not in str(next((node.get("config", {}).get("url_pattern", "") for node in (workflow.graph_json or {}).get("nodes", []) if node.get("id") == "crawl"), ""))
-            or "nbrb-statistics-credit-deposit-v2" not in str((workflow.graph_json or {}).get("nodes", []))
-            or '"fields": ["title"]' not in str((workflow.graph_json or {}).get("nodes", []))
-            or "structured_tables" not in str((workflow.graph_json or {}).get("nodes", []))
-            or "attachment_documents" not in str((workflow.graph_json or {}).get("nodes", []))
-            or "attachment_base_url" not in str((workflow.graph_json or {}).get("nodes", []))
-            or "frontier_title_patterns" not in str((workflow.graph_json or {}).get("nodes", []))
-            or "api.nbrb.by/AvgIntRatesDyn" not in str((workflow.graph_json or {}).get("nodes", []))
-            or not (((workflow.graph_json or {}).get("settings", {}).get("review_policy") or {}).get("changed") is False)
-        ):
-            # NEWS-05 used to be compiled from the generic passport graph.
-            # Repair it in place so existing workflow IDs and memberships stay
-            # auditable while gaining the reviewed JS/list-detail contract.
-            graph = nbrb_market_statistics_graph(source.id, dataset.id, incremental=True)
-            workflow.graph_json = graph
-            workflow.version += 1
-            workflow.published_version = None
-            workflow.graph_json["settings"]["compiledPlanDigest"] = compile_executable_plan(graph, project_id=project.id, workflow_id=workflow.id, workflow_version=workflow.version, source_id=source.id, revision_refs={"sourcePresetRevisionId": preset.id}).digest
-        elif descriptor.key == "news-03" and (
+        if descriptor.key == "news-03" and (
             not any(node.get("id") == "browser" for node in (workflow.graph_json or {}).get("nodes", []))
             or not any(node.get("id") == "parse" and node.get("type") == "parse_html" for node in (workflow.graph_json or {}).get("nodes", []))
             or "https://www.bcse.by/" not in str(next((node.get("config", {}).get("url", "") for node in (workflow.graph_json or {}).get("nodes", []) if node.get("id") == "browser"), ""))
@@ -451,19 +398,6 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
             workflow.version += 1
             workflow.published_version = None
             workflow.graph_json["settings"]["compiledPlanDigest"] = compile_executable_plan(graph, project_id=project.id, workflow_id=workflow.id, workflow_version=workflow.version, source_id=source.id, revision_refs={"sourcePresetRevisionId": preset.id}).digest
-        elif descriptor.key == "news-06" and (
-            not any(node.get("id") == "crawl" for node in (workflow.graph_json or {}).get("nodes", []))
-            or "https://economy.gov.by/ru/aktualnaya-informatsiya-ru/" not in str(next((node.get("config", {}).get("listing_url", "") for node in (workflow.graph_json or {}).get("nodes", []) if node.get("id") == "crawl"), ""))
-            or "main article a[href]" not in str(next((node.get("config", {}).get("link_selector", "") for node in (workflow.graph_json or {}).get("nodes", []) if node.get("id") == "crawl"), ""))
-            or not bool(next((node.get("config", {}).get("direct_document_record", False) for node in (workflow.graph_json or {}).get("nodes", []) if node.get("id") == "crawl"), False))
-            or "economy-actual-all-v1" not in str((workflow.graph_json or {}).get("nodes", []))
-            or not (((workflow.graph_json or {}).get("settings", {}).get("review_policy") or {}).get("changed") is False)
-        ):
-            graph = economy_actual_information_graph(source.id, dataset.id, incremental=True)
-            workflow.graph_json = graph
-            workflow.version += 1
-            workflow.published_version = None
-            workflow.graph_json["settings"]["compiledPlanDigest"] = compile_executable_plan(graph, project_id=project.id, workflow_id=workflow.id, workflow_version=workflow.version, source_id=source.id, revision_refs={"sourcePresetRevisionId": preset.id}).digest
         elif (workflow.graph_json or {}).get("settings", {}).get("source_id") != source.id:
             # Repair a workflow paired with the wrong segment's source (the
             # JSON-path lookup failure could bind UL workflows to stray rows).
@@ -471,6 +405,7 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
             settings = {**((workflow.graph_json or {}).get("settings") or {}), "source_id": source.id, "dataset_id": dataset.id}
             workflow.graph_json = {**(workflow.graph_json or {}), "settings": settings}
         cron, timezone = _schedule_defaults(descriptor)
+        autostart = descriptor.dataset_group in {"news", "indicators"}
         schedule_name = workflow_name
         schedule = db.scalar(
             select(Schedule).where(
@@ -479,19 +414,23 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
             )
         )
         if schedule is None:
-            # DRAFT rows are intentionally opt-in: their schedule is visible
-            # and editable in no-code UI but cannot execute an unverified
-            # parser until an operator enables it after fixture/smoke review.
-            schedule = Schedule(workflow_id=workflow.id, name=schedule_name, cron=cron, timezone=timezone, enabled=descriptor.status == "VERIFIED")
+            schedule = Schedule(
+                workflow_id=workflow.id,
+                name=schedule_name,
+                cron=cron,
+                timezone=timezone,
+                enabled=autostart,
+            )
             db.add(schedule)
             counters["schedules"] += 1
         elif schedule.name == legacy_workflow_name and schedule_name != legacy_workflow_name:
             schedule.name = schedule_name
-        if descriptor.key == "news-03" and schedule.cron != cron:
-            # NEWS-03 is an intraday market snapshot, not a once-weekly news
-            # feed. Upgrade the legacy schedule to the reviewed default.
+        if autostart and (schedule.cron, schedule.timezone, schedule.enabled) != (cron, timezone, True):
+            # Pack-owned schedules are reconciled at startup so a deployment
+            # never needs an operator to activate or repair the digest.
             schedule.cron = cron
             schedule.timezone = timezone
+            schedule.enabled = True
         membership = db.scalar(select(DatasetSourceMembership).where(DatasetSourceMembership.dataset_id == dataset.id, DatasetSourceMembership.source_key == descriptor.key))
         if membership is None:
             db.add(DatasetSourceMembership(dataset_id=dataset.id, source_id=source.id, workflow_id=workflow.id, source_preset_revision_id=preset.id, source_key=descriptor.key, required=descriptor.status != "BLOCKED"))

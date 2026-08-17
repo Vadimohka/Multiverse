@@ -55,6 +55,41 @@ private API or paywall bypass was attempted.  The two NBRB timeouts remain
 | NEWS-15 | HTTP 200 public HTML | DRAFT | gold relevance and paywall-metadata fixture |
 | NEWS-16 | HTTP 200 public HTML | DRAFT | page-distinctness and date-boundary fixture |
 
+## Market-news readiness handoff
+
+`python3 scripts/smoke_belarus_market_pack.py` is report-only: with no
+`--live` flag it performs no network I/O and returns
+`SKIPPED_REQUIRES_LIVE`. An operator may run exactly one anonymous public
+profile with `--live --source-key <key>`. Its row cannot modify
+`verification.json`, a source status, or `Schedule.enabled`; `PASS` means
+only that an anonymous public representation was observed, not that a source
+is `VERIFIED`.
+
+| Key | Dataset | Fixture | Smoke | Status | Reason |
+| --- | --- | --- | --- | --- | --- |
+| NEWS-01 | market-news | `news-01-list.html`, `news-01-detail.html` | pending | DRAFT | operator live smoke required |
+| NEWS-02 | market-news | `news-02-list.html`, `news-02-detail.html` | pending | DRAFT | operator live smoke required |
+| NEWS-04 | market-news | none | pending | DRAFT | public transport + fixture evidence required |
+| NEWS-05 | market-news | none | pending | DRAFT | public transport + fixture evidence required |
+| NEWS-06 | market-news | `news-06-list.html` | pending | DRAFT | operator live smoke; document MIME/parser proof required |
+| NEWS-07 | market-news | `news-07-list.html`, `news-07-detail.html` | pending | DRAFT | operator live smoke required |
+| NEWS-08 | market-news | `news-08-list.html`, `news-08-detail.html`, `news-08-page-1.html`, `news-08-page-2.html` | pending | DRAFT | operator live smoke required |
+| NEWS-09 | market-news | `news-09-list.html`, `news-09-detail.html`, `news-09-detail-commercial-sector-outlook-1002.html` | pending | DRAFT | operator live smoke required |
+| NEWS-10 | market-news | `news-10-list.html` | pending | DRAFT | operator live smoke required |
+| NEWS-11 | market-news | `news-11-list.html` | pending | DRAFT | operator live smoke required |
+| NEWS-12 | market-news | `news-12-list.html` | pending | DRAFT | operator live smoke required |
+| NEWS-13 | market-news | `news-13-list.html` | pending | DRAFT | operator live smoke required |
+| NEWS-14 | market-news | `news-14-list.html` | pending | DRAFT | operator live smoke required |
+| NEWS-15 | market-news | `news-15-list.html` | pending | DRAFT | operator live smoke required |
+| NEWS-16 | market-news | `news-16-page-1.html`, `news-16-page-2.html` | pending | DRAFT | operator live smoke required |
+
+Manual promotion is deliberately stricter than a smoke `PASS`: retain the
+fixture evidence, run and review the anonymous operator smoke, then record
+that evidence in the verification registry through a reviewed preset revision.
+For the deployed `market-news` and `market-indicators` digest, collection runs
+hourly by explicit product requirement; `DRAFT` still means that readiness
+evidence is incomplete and must not be presented as `VERIFIED`.
+
 ## Verified evidence
 
 | Key | Source | Fixture | Live smoke | Status |

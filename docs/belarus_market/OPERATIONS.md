@@ -31,8 +31,10 @@ normalisation, field evidence, validation и output.
    source-role и useful data либо допустимое пустое окно; отсутствие доступа
    фиксируйте как `BLOCKED` с причиной.
 6. Только после fixture и passing live smoke создайте новую revision со статусом
-   `VERIFIED`. Откройте **Расписания**, проверьте cron/timezone и включите
-   schedule. DRAFT schedules, созданные Belarus pack, выключены по умолчанию.
+   `VERIFIED`. Для пользовательских источников откройте **Расписания**,
+   проверьте cron/timezone и включите schedule. Готовый пакет `market-news` и
+   `market-indicators` — исключение: он включён автоматически каждый час в
+   `Europe/Minsk`, чтобы развёртывание не требовало настройки в UI.
 7. Внешний ИИ сначала вызывает coverage, затем records; evidence подключается
    явно через `include=evidence`.
 
@@ -51,4 +53,10 @@ GET /api/v1/datasets/market-indicators/records?view=current
 workflows/schedules: 21 ЮЛ, 20 ФЛ, 15 websites news и 4 indicators. Это
 стартовая библиотека конфигураций, а не набор встроенных банковских парсеров.
 Telegram не импортируется. Все rows начинают с `DRAFT`; пользователь вправе
-изменить и подтвердить каждую revision в UI.
+изменить и подтвердить каждую revision в UI. При старте приложения workflows
+для `market-news` и `market-indicators` автоматически включены с cron
+`0 * * * *` и timezone `Europe/Minsk`; депозитные шаблоны остаются выключены.
+Статус `DRAFT` отражает готовность доказательств, а не запрет на hourly-сбор.
+
+Для вызова из `https://destiny.by` с конкретной даты используйте
+[Destiny market-news API guide](DESTINY_API_GUIDE.md).
