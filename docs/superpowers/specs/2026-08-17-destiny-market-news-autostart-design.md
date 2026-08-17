@@ -12,14 +12,16 @@ not part of the deployment.
 - Keep the existing 15 public website news workflows and the separate
   `market-indicators` workflow set; do not import Telegram sources.
 - Make the market-pack installer create and maintain an hourly
-  (`0 * * * *`, `Europe/Minsk`) enabled schedule for each packaged workflow.
+  (`0 * * * *`, `Europe/Minsk`) enabled schedule for the `market-news` and
+  `market-indicators` workflows only. Deposit templates retain their existing
+  disabled schedules.
   The existing Celery Beat minute tick will claim and enqueue the first due
   hourly occurrence after services are up; no request handler performs a
   crawl synchronously.
-- Make the setting explicit and idempotent: a package-owned schedule is
+- Make the setting explicit and idempotent: a digest package schedule is
   reconciled to the hourly default on every bootstrap. A user-created schedule
-  is not altered. Existing pack schedules are upgraded once, so old installs
-  need no UI action.
+  and non-digest package schedule are not altered. Existing digest schedules
+  are upgraded once, so old installs need no UI action.
 - Keep startup import in `app.bootstrap.seed`; this already runs in FastAPI's
   lifespan after database setup. Docker Compose already starts API, worker
   queues and Celery Beat, so `docker compose up -d` is the only operational
@@ -62,8 +64,8 @@ as if they were article records.
 ## Tests
 
 1. Fresh pack installation creates enabled schedules with hourly cron and
-   `Europe/Minsk` for news and indicators.
-2. Reinstallation upgrades legacy package schedules to those values while
+   `Europe/Minsk` for news and indicators, while deposits remain disabled.
+2. Reinstallation upgrades legacy digest schedules to those values while
    preserving IDs and does not alter a separately named operator schedule.
 3. Bootstrap test proves the pack remains installed automatically.
 4. API integration test proves `market-news` accepts `from` with

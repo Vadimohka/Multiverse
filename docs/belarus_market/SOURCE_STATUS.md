@@ -86,7 +86,9 @@ is `VERIFIED`.
 Manual promotion is deliberately stricter than a smoke `PASS`: retain the
 fixture evidence, run and review the anonymous operator smoke, then record
 that evidence in the verification registry through a reviewed preset revision.
-Schedule activation is a separate explicit operator decision.
+For the deployed `market-news` and `market-indicators` digest, collection runs
+hourly by explicit product requirement; `DRAFT` still means that readiness
+evidence is incomplete and must not be presented as `VERIFIED`.
 
 ## Verified evidence
 

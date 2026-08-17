@@ -24,26 +24,43 @@ from app.routers.workflows import metadata_datetime, raw_document_for_item
 from sqlalchemy import select
 
 
-def create_observed_dataset(client, auth, *, source_published_at: str) -> tuple[dict, dict, dict, dict]:
-    project = client.get("/api/v1/projects", headers=auth).json()[0]
+def create_observed_dataset(
+    client, auth, *, source_published_at: str, existing_dataset_slug: str | None = None
+) -> tuple[dict, dict, dict, dict]:
+    projects = client.get("/api/v1/projects", headers=auth).json()
     suffix = uuid4().hex[:10]
-    dataset = client.post(
-        "/api/v1/datasets",
-        headers=auth,
-        json={
-            "project_id": project["id"],
-            "name": f"Observed records {suffix}",
-            "slug": f"observed-records-{suffix}",
-            "natural_key_fields": ["external_id"],
-            "review_policy": {"new": False, "changed": False, "confidence_below": 0},
-        },
-    ).json()
+    if existing_dataset_slug:
+        dataset = next(item for item in client.get("/api/v1/datasets", headers=auth).json() if item["slug"] == existing_dataset_slug)
+        project = next(item for item in projects if item["id"] == dataset["project_id"])
+    else:
+        project = projects[0]
+        dataset = client.post(
+            "/api/v1/datasets",
+            headers=auth,
+            json={
+                "project_id": project["id"],
+                "name": f"Observed records {suffix}",
+                "slug": f"observed-records-{suffix}",
+                "natural_key_fields": ["external_id"],
+                "review_policy": {"new": False, "changed": False, "confidence_below": 0},
+            },
+        ).json()
     record = {
         "external_id": "item-1",
         "title": "First observation",
         "source_published_at": source_published_at,
         "fetched_at": "2026-08-10T12:35:03.412987Z",
     }
+    if existing_dataset_slug == "market-news":
+        record.update(
+            {
+                "source_id": "news-test",
+                "source_name": "Test market news",
+                "canonical_url": "https://example.test/market-news/item-1",
+                "candidate_status": "INCLUDE",
+                "access_status": "PUBLIC",
+            }
+        )
     graph = {
         "version": 1,
         "settings": {},
@@ -208,6 +225,30 @@ def test_source_publication_filter_uses_half_open_exact_second(client, auth):
     assert matching.status_code == 200 and len(matching.json()["items"]) == 1
     assert following_second.status_code == 200 and following_second.json()["items"] == []
     assert naive.status_code == 422
+
+
+def test_market_news_accepts_source_publication_date_range(client, auth):
+    dataset, _, first_run, second_run = create_observed_dataset(
+        client,
+        auth,
+        source_published_at="2026-08-17T05:15:00+03:00",
+        existing_dataset_slug="market-news",
+    )
+
+    assert first_run["status"] == "SUCCESS", first_run
+    assert second_run["status"] == "SUCCESS", second_run
+
+    response = client.get(
+        "/api/v1/datasets/market-news/records?view=current"
+        "&time_basis=source_published_at"
+        "&from=2026-08-17T00:00:00%2B03:00"
+        "&to=2026-08-18T00:00:00%2B03:00&sort=asc",
+        headers=auth,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["meta"]["dataset_id"] == dataset["id"]
+    assert any(item["data"]["external_id"] == "item-1" for item in response.json()["items"])
 
 
 def test_empty_success_run_event_stream_terminates(client):

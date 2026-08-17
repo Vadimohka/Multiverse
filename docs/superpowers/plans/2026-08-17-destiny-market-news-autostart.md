@@ -4,7 +4,7 @@
 
 **Goal:** Make the installed Belarusian market digest collect hourly without UI setup and document retrieval from `destiny.by` by source-publication date.
 
-**Architecture:** The existing FastAPI lifespan already invokes the idempotent market-pack installer, while Docker Compose already runs Celery Beat and the queue workers. The installer becomes the only bootstrap change: package-owned schedules are enabled with `0 * * * *` and `Europe/Minsk`; record retrieval continues through the unchanged protected Data API.
+**Architecture:** The existing FastAPI lifespan already invokes the idempotent market-pack installer, while Docker Compose already runs Celery Beat and the queue workers. The installer becomes the only bootstrap change: `market-news` and `market-indicators` schedules are enabled with `0 * * * *` and `Europe/Minsk`, while deposits stay disabled; record retrieval continues through the unchanged protected Data API.
 
 **Tech Stack:** FastAPI, SQLAlchemy, Celery Beat, pytest, Docker Compose, Markdown.
 
@@ -29,14 +29,14 @@
 
 **Interfaces:**
 - Consumes: `passport_sources() -> list[PassportSource]` and `install_belarus_market_pack(db, admin) -> dict[str, int]`.
-- Produces: every package `Schedule` has `cron == "0 * * * *"`, `timezone == "Europe/Minsk"`, and `enabled is True`; a separately named schedule remains unchanged.
+- Produces: every digest `Schedule` has `cron == "0 * * * *"`, `timezone == "Europe/Minsk"`, and `enabled is True`; deposit and separately named operator schedules remain unchanged.
 
 - [ ] **Step 1: Write the failing schedule tests**
 
 ```python
-def test_imported_verified_schedule_starts_enabled_hourly(client):
+def test_market_digest_schedule_starts_enabled_hourly(client):
     with SessionLocal() as db:
-        schedule = db.scalar(select(Schedule).join(Workflow).where(Workflow.name.like("ul-20:%")))
+        schedule = db.scalar(select(Schedule).join(Workflow).where(Workflow.name.like("new-news-01:%")))
     assert schedule is not None
     assert (schedule.cron, schedule.timezone, schedule.enabled) == ("0 * * * *", "Europe/Minsk", True)
 
@@ -70,15 +70,18 @@ Expected: FAIL because imported schedules are disabled and have source-specific 
 
 ```python
 def _schedule_defaults(source: PassportSource) -> tuple[str, str]:
-    return ("0 * * * *", "Europe/Minsk")
+    if source.dataset_group in {"news", "indicators"}:
+        return ("0 * * * *", "Europe/Minsk")
+    return ("0 8 * * 1", "Europe/Minsk")
 
 # After locating the package schedule by its canonical or legacy package name:
-schedule.cron, schedule.timezone, schedule.enabled = (*_schedule_defaults(descriptor), True)
+if descriptor.dataset_group in {"news", "indicators"}:
+    schedule.cron, schedule.timezone, schedule.enabled = (*_schedule_defaults(descriptor), True)
 ```
 
-Perform this assignment only for the schedule found through `schedule_name` or
-`legacy_workflow_name`; never query or update arbitrary schedules attached to
-the same workflow.
+Perform this assignment only for a digest schedule found through
+`schedule_name` or `legacy_workflow_name`; never query or update arbitrary
+schedules attached to the same workflow.
 
 - [ ] **Step 4: Run focused tests to verify they pass**
 
