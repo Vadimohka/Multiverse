@@ -58,7 +58,7 @@ class EgressPolicy:
             raise EgressPolicyError("allowed_ports must contain numeric ports") from exc
         if not normalized_ports or any(port < 1 or port > 65535 for port in normalized_ports):
             raise EgressPolicyError("allowed_ports must contain ports from 1 to 65535")
-        redirects = int(config.get("max_redirects", 10))
+        redirects = int(config.get("max_redirects") or 10)
         if not 0 <= redirects <= 20:
             raise EgressPolicyError("max_redirects must be between 0 and 20")
         return cls(

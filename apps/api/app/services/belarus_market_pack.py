@@ -30,6 +30,7 @@ from app.services.preset_compiler import compile_preset
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from workflow_engine import compile_executable_plan, standard_v2_graph
+from app.seed_templates import bcse_market_news_graph
 
 ROOT = Path(__file__).resolve().parents[4]
 PACK_ROOT = ROOT / "presets" / "belarus-market"
@@ -276,13 +277,40 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
             preset = latest; counters["presets_unchanged"] += 1
         workflow = db.scalar(select(Workflow).where(Workflow.project_id == project.id, Workflow.name == f"{descriptor.key}: {descriptor.name}"))
         if workflow is None:
-            graph = compile_preset(blueprint.graph_json, preset.__dict__).graph
+            graph = (
+                bcse_market_news_graph(source.id, dataset.id, incremental=True)
+                if descriptor.key == "news-01"
+                else compile_preset(blueprint.graph_json, preset.__dict__).graph
+            )
             graph["settings"]["source_id"] = source.id
             graph["settings"]["dataset_id"] = dataset.id
             workflow = Workflow(project_id=project.id, name=f"{descriptor.key}: {descriptor.name}", description=f"Compiled {descriptor.status} preset {descriptor.key}@{preset.revision}", graph_json=graph, is_active=descriptor.status != "BLOCKED")
             db.add(workflow); db.flush()
             workflow.graph_json["settings"]["compiledPlanDigest"] = compile_executable_plan(graph, project_id=project.id, workflow_id=workflow.id, workflow_version=workflow.version, source_id=source.id, revision_refs={"sourcePresetRevisionId": preset.id}).digest
             counters["workflows"] += 1
+        elif descriptor.key == "news-01" and (
+            not any(node.get("id") == "crawl" for node in (workflow.graph_json or {}).get("nodes", []))
+            or "(?:news|releases)" in str(
+                next(
+                    (
+                        node.get("config", {}).get("url_pattern", "")
+                        for node in (workflow.graph_json or {}).get("nodes", [])
+                        if node.get("id") == "crawl"
+                    ),
+                    "",
+                )
+            )
+        ):
+            # Repair the original universal-v2 NEWS-01 workflow.  The BCSE
+            # releases page is a JS shell, so the generic HTTP-first graph
+            # cannot discover cards; use the reviewed browser→detail preset.
+            # It also keeps the shared calendar endpoint constrained to
+            # ``/press-center/releases`` rather than mixing in news cards.
+            graph = bcse_market_news_graph(source.id, dataset.id, incremental=True)
+            workflow.graph_json = graph
+            workflow.version += 1
+            workflow.published_version = None
+            workflow.graph_json["settings"]["compiledPlanDigest"] = compile_executable_plan(graph, project_id=project.id, workflow_id=workflow.id, workflow_version=workflow.version, source_id=source.id, revision_refs={"sourcePresetRevisionId": preset.id}).digest
         elif (workflow.graph_json or {}).get("settings", {}).get("source_id") != source.id:
             # Repair a workflow paired with the wrong segment's source (the
             # JSON-path lookup failure could bind UL workflows to stray rows).

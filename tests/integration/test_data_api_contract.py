@@ -606,6 +606,22 @@ def test_bcse_news_preset_is_bootstrapped_as_an_executable_chain(client, auth):
     assert crawl["detail_request"]["html_path"] == "solo.html"
 
 
+def test_market_news_bootstrap_binds_bcse_releases_to_the_shared_news_dataset(client, auth):
+    projects = client.get("/api/v1/projects", headers=auth).json()
+    project = next(item for item in projects if item["slug"] == "belarus-market-data")
+    datasets = client.get(f"/api/v1/datasets?project_id={project['id']}", headers=auth).json()
+    sources = client.get(f"/api/v1/sources?project_id={project['id']}", headers=auth).json()
+    workflows = client.get(f"/api/v1/workflows?project_id={project['id']}", headers=auth).json()
+
+    dataset = next(item for item in datasets if item["slug"] == "market-news")
+    source = next(item for item in sources if (item.get("settings") or {}).get("source_key") == "news-01")
+    workflow = next(item for item in workflows if item["name"].startswith("news-01:"))
+
+    assert source["entry_url"] == "https://www.bcse.by/press-center/releases"
+    assert workflow["graph_json"]["settings"]["source_id"] == source["id"]
+    assert workflow["graph_json"]["settings"]["dataset_id"] == dataset["id"]
+
+
 def test_every_universal_template_binds_source_and_dataset_without_site_configuration(client, auth):
     project = next(
         item for item in client.get("/api/v1/projects", headers=auth).json()
