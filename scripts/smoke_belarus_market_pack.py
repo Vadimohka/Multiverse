@@ -13,7 +13,10 @@ from app.services.belarus_market_smoke import run_smoke  # noqa: E402
 
 
 def main() -> None:
-    print(json.dumps(run_smoke(sys.argv[1:]), ensure_ascii=False, indent=2))
+    try:
+        print(json.dumps(run_smoke(sys.argv[1:]), ensure_ascii=False, indent=2))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 if __name__ == "__main__":

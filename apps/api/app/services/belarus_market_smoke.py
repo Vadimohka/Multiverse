@@ -43,7 +43,15 @@ def _readiness_row(source: PassportSource, *, transport: str, result: str, reaso
 
 
 def _selected_sources(keys: set[str] | None) -> list[PassportSource]:
-    return [source for source in passport_sources() if not keys or source.key in keys]
+    sources = passport_sources()
+    if not keys:
+        return sources
+    known_keys = {source.key for source in sources}
+    unknown_keys = sorted(keys - known_keys)
+    if unknown_keys:
+        label = "key" if len(unknown_keys) == 1 else "keys"
+        raise ValueError(f"Unknown source {label}: {', '.join(unknown_keys)}")
+    return [source for source in sources if source.key in keys]
 
 
 async def smoke_sources(
@@ -105,6 +113,6 @@ def _parse_args(args: Sequence[str] | None) -> argparse.Namespace:
 def run_smoke(args: Sequence[str] | None = None) -> list[dict[str, Any]]:
     """Parse report options and return readiness rows without changing source state."""
 
-    options = _parse_args(args)
+    options = _parse_args([] if args is None else args)
     keys = {key.lower() for key in options.source_key} or None
     return asyncio.run(smoke_sources(keys, options.timeout, live=options.live))

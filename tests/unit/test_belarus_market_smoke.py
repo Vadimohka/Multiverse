@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import httpx
+import pytest
 from app.services import belarus_market_smoke
 from app.services.belarus_market_smoke import run_smoke, summarize_profile
 
@@ -46,6 +47,24 @@ def test_smoke_requires_live_flag_before_network(monkeypatch):
     assert all(item["status_after"] == item["status_before"] for item in results)
 
 
+def test_smoke_no_arg_library_call_ignores_host_arguments(monkeypatch):
+    """Filling ``args`` from host argv must make this library contract fail."""
+
+    monkeypatch.setattr(sys, "argv", ["host", "--host-option"])
+
+    results = run_smoke()
+
+    assert results
+    assert all(item["result"] == "SKIPPED_REQUIRES_LIVE" for item in results)
+
+
+def test_smoke_rejects_unknown_source_key():
+    """Dropping an unrecognized key and returning an empty report is unsafe."""
+
+    with pytest.raises(ValueError, match="Unknown source key: news-typo"):
+        run_smoke(["--source-key", "news-typo"])
+
+
 def test_live_smoke_never_promotes_source(monkeypatch):
     """Changing a report row into a promotion must fail this status assertion."""
 
@@ -81,3 +100,16 @@ def test_smoke_cli_reports_skipped_rows_without_live_flag():
 
     assert result.returncode == 0
     assert '"result": "SKIPPED_REQUIRES_LIVE"' in result.stdout
+
+
+def test_smoke_cli_rejects_unknown_source_key():
+    root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [sys.executable, str(root / "scripts" / "smoke_belarus_market_pack.py"), "--source-key", "news-typo"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "Unknown source key: news-typo" in result.stderr
