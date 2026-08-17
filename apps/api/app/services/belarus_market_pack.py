@@ -274,7 +274,8 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
     """Install or update only changed immutable preset revisions.
 
     VERIFIED input requires retained fixture and successful live-smoke evidence.
-    Every newly imported schedule remains disabled for explicit operator review.
+    Digest news/indicator schedules are enabled hourly; deposit schedules stay
+    disabled for explicit operator review.
     """
 
     project = db.scalar(select(Project).where(Project.slug == "belarus-market-data"))
