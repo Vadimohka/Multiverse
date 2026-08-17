@@ -60,7 +60,6 @@ def _fixture_detail(title: str, body: str) -> str:
 async def _run_sanitized_listing(
     source_key: str,
     *fixture_names: str,
-    detail_fixture_name: str | None = None,
 ):
     """Run a compiled profile over retained public listing structures."""
     source, config = _fixture_config(source_key, WINDOW)
@@ -69,13 +68,6 @@ async def _run_sanitized_listing(
         (FIXTURE_HELPERS / "news" / fixture_name).read_text(encoding="utf-8")
         for fixture_name in fixture_names
     ]
-    retained_detail_body = None
-    if detail_fixture_name:
-        detail_soup = BeautifulSoup(
-            (FIXTURE_HELPERS / "news" / detail_fixture_name).read_text(encoding="utf-8"),
-            "lxml",
-        )
-        retained_detail_body = detail_soup.select_one("article").get_text(" ", strip=True)
     details = {}
     for fixture_body in fixture_bodies:
         for link in BeautifulSoup(fixture_body, "lxml").select(selector):
@@ -83,7 +75,7 @@ async def _run_sanitized_listing(
             title = link.get_text(" ", strip=True)
             details[url] = _fixture_detail(
                 title,
-                str(retained_detail_body or link.get("data-public-summary") or title),
+                str(link.get("data-public-summary") or title),
             )
     pages = {}
     pagination = config["nodes"]["traverse"].get("pagination") or {}
@@ -327,20 +319,19 @@ async def test_fixture_runner_reports_repeated_pagination_page():
 @pytest.mark.asyncio
 async def test_paid_article_keeps_only_public_metadata():
     """Removing access redaction would expose a commercial article body."""
-    records = (
-        await _run_sanitized_listing(
-            "news-09",
-            "news-09-list.html",
-            detail_fixture_name="news-09-detail.html",
-        )
-    ).records
+    records = (await run_news_fixture_from_files("news-09")).records
     paid = next(record for record in records if record["access_status"] == "PAYWALLED")
     public = next(record for record in records if record["access_status"] == "PUBLIC")
 
-    assert paid["title"] and paid["canonical_url"]
+    assert public["title"] == "Public market analysis"
+    assert public["body_text"] == "Public market analysis excerpt."
+    assert paid["title"] == "Commercial sector outlook"
+    assert paid["canonical_url"]
+    assert paid["source_published_at"] == "2026-08-14T10:00:00+03:00"
+    assert paid["summary_raw"] == "Subscription required; public metadata only."
     assert paid["body_text"] is None
     assert paid["body_html"] is None
-    assert public["body_text"] == "Public market analysis excerpt."
+    assert paid["access_evidence"]["matched_terms"] == ["subscription required"]
 
 
 @pytest.mark.asyncio
@@ -420,6 +411,10 @@ async def test_texmetals_non_repeating_pages_keep_unique_article_identities():
             [
                 "tests/fixtures/belarus-market/news/news-09-list.html",
                 "tests/fixtures/belarus-market/news/news-09-detail.html",
+                (
+                    "tests/fixtures/belarus-market/news/"
+                    "news-09-detail-commercial-sector-outlook-1002.html"
+                ),
             ],
         ),
         ("news-10", ["tests/fixtures/belarus-market/news/news-10-list.html"]),

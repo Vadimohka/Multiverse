@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 from unittest.mock import patch
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -162,6 +162,12 @@ async def run_news_fixture_from_files(source_key: str) -> NewsFixtureResult:
     root = Path(__file__).resolve().parent
     listing = (root / f"{source_key}-list.html").read_text(encoding="utf-8")
     detail = (root / f"{source_key}-detail.html").read_text(encoding="utf-8")
+    detail_variants = {
+        path.stem.removeprefix(f"{source_key}-detail-"): path.read_text(
+            encoding="utf-8"
+        )
+        for path in root.glob(f"{source_key}-detail-*.html")
+    }
     source, config = _fixture_config(
         source_key,
         {"from": "2000-01-01T00:00:00+03:00", "to": "2100-01-01T00:00:00+03:00"},
@@ -185,7 +191,10 @@ async def run_news_fixture_from_files(source_key: str) -> NewsFixtureResult:
         for link in soup.select(selector):
             href = str(link.get("href") or "").strip()
             if href:
-                details[urljoin(source.url, href)] = detail
+                detail_slug = Path(urlsplit(href).path).name
+                details[urljoin(source.url, href)] = detail_variants.get(
+                    detail_slug, detail
+                )
 
     window = {
         "from": "2000-01-01T00:00:00+03:00",
