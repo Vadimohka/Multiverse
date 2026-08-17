@@ -228,8 +228,8 @@ def test_verified_source_requires_recorded_successful_live_smoke(
             install_belarus_market_pack(db, admin)
 
 
-def test_imported_verified_schedule_starts_enabled_hourly(client):
-    """A packaged source is runnable immediately after application startup."""
+def test_non_digest_schedule_stays_disabled(client):
+    """Hourly autostart must not activate the unrelated deposit templates."""
 
     with SessionLocal() as db:
         dataset = db.scalar(select(Dataset).where(Dataset.slug == "deposit-offers-legal"))
@@ -238,6 +238,22 @@ def test_imported_verified_schedule_starts_enabled_hourly(client):
             select(DatasetSourceMembership).where(
                 DatasetSourceMembership.dataset_id == dataset.id,
                 DatasetSourceMembership.source_key == "ul-20",
+            )
+        )
+        assert membership is not None
+        schedule = db.scalar(select(Schedule).where(Schedule.workflow_id == membership.workflow_id))
+
+    assert schedule is not None
+    assert schedule.enabled is False
+
+
+def test_market_digest_schedule_starts_enabled_hourly(client):
+    """The market-news package is runnable immediately after application startup."""
+
+    with SessionLocal() as db:
+        membership = db.scalar(
+            select(DatasetSourceMembership).where(
+                DatasetSourceMembership.source_key == "news-01"
             )
         )
         assert membership is not None
@@ -262,16 +278,16 @@ def test_reimport_preserves_user_workflow_revision_and_operator_schedule_state(c
                 DatasetSourceMembership.source_key == "news-01"
             )
         )
-        verified_membership = db.scalar(
+        digest_membership = db.scalar(
             select(DatasetSourceMembership).where(
-                DatasetSourceMembership.source_key == "ul-20"
+                DatasetSourceMembership.source_key == "news-01"
             )
         )
         assert news_membership is not None
-        assert verified_membership is not None
+        assert digest_membership is not None
         workflow = db.get(Workflow, news_membership.workflow_id)
         schedule = db.scalar(
-            select(Schedule).where(Schedule.workflow_id == verified_membership.workflow_id)
+            select(Schedule).where(Schedule.workflow_id == digest_membership.workflow_id)
         )
         assert workflow is not None
         assert schedule is not None
@@ -344,15 +360,14 @@ def test_pack_installer_is_idempotent_and_creates_per_source_workflows(client):
         market_project = db.scalar(select(Project).where(Project.slug == "belarus-market-data"))
         assert market_project is not None
         schedules = db.scalars(select(Schedule).join(Workflow).where(Workflow.project_id == market_project.id).order_by(Schedule.name)).all()
-        news_dataset = db.scalar(select(Dataset).where(Dataset.slug == "market-news"))
-        assert news_dataset is not None
-        news_source_keys = set(
-            db.scalars(
-                select(DatasetSourceMembership.source_key).where(
-                    DatasetSourceMembership.dataset_id == news_dataset.id
+        memberships_by_workflow = {
+            row.workflow_id: row.source_key
+            for row in db.scalars(
+                select(DatasetSourceMembership).where(
+                    DatasetSourceMembership.workflow_id.is_not(None)
                 )
             )
-        )
+        }
 
     assert first["sources"] == 60
     # The application bootstrap installs the source pack on a clean server.
@@ -363,9 +378,18 @@ def test_pack_installer_is_idempotent_and_creates_per_source_workflows(client):
     assert workflows == 21
     assert presets >= 57
     assert len(schedules) == 60
-    assert {item.timezone for item in schedules} == {"Europe/Minsk"}
-    assert {item.cron for item in schedules} == {"0 * * * *"}
-    assert all(item.enabled for item in schedules)
+    digest_schedules = [
+        item for item in schedules
+        if memberships_by_workflow[item.workflow_id].startswith(("news-", "indicator-"))
+    ]
+    non_digest_schedules = [item for item in schedules if item not in digest_schedules]
+    assert len(digest_schedules) == 19
+    assert {(item.cron, item.timezone, item.enabled) for item in digest_schedules} == {
+        ("0 * * * *", "Europe/Minsk", True)
+    }
+    assert non_digest_schedules
+    assert not any(item.enabled for item in non_digest_schedules)
+    news_source_keys = set(memberships_by_workflow.values())
     assert news_source_keys >= {
         "news-01", "news-02", "news-04", "news-05", "news-06", "news-07",
         "news-08", "news-09", "news-10", "news-11", "news-12", "news-13",

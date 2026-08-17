@@ -240,9 +240,11 @@ def _initial_workflow_graph(
 
 
 def _schedule_defaults(source: PassportSource) -> tuple[str, str]:
-    """Return the zero-touch hourly schedule used by the installed market pack."""
+    """Return editable per-source defaults for the installed market pack."""
 
-    return ("0 * * * *", "Europe/Minsk")
+    if source.dataset_group in {"news", "indicators"}:
+        return ("0 * * * *", "Europe/Minsk")
+    return ("0 8 * * 1-5", "Europe/Minsk") if source.dataset_group == "news" else ("0 8 * * 1", "Europe/Minsk")
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -402,6 +404,7 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
             settings = {**((workflow.graph_json or {}).get("settings") or {}), "source_id": source.id, "dataset_id": dataset.id}
             workflow.graph_json = {**(workflow.graph_json or {}), "settings": settings}
         cron, timezone = _schedule_defaults(descriptor)
+        autostart = descriptor.dataset_group in {"news", "indicators"}
         schedule_name = workflow_name
         schedule = db.scalar(
             select(Schedule).where(
@@ -415,13 +418,13 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
                 name=schedule_name,
                 cron=cron,
                 timezone=timezone,
-                enabled=True,
+                enabled=autostart,
             )
             db.add(schedule)
             counters["schedules"] += 1
         elif schedule.name == legacy_workflow_name and schedule_name != legacy_workflow_name:
             schedule.name = schedule_name
-        if (schedule.cron, schedule.timezone, schedule.enabled) != (cron, timezone, True):
+        if autostart and (schedule.cron, schedule.timezone, schedule.enabled) != (cron, timezone, True):
             # Pack-owned schedules are reconciled at startup so a deployment
             # never needs an operator to activate or repair the digest.
             schedule.cron = cron
