@@ -3,6 +3,14 @@
 `VERIFIED` is reserved for a fixture-backed extraction regression plus
 anonymous live smoke. Telegram rows are intentionally absent.
 
+Readiness command: `python3 scripts/smoke_belarus_market_pack.py`. It returns
+report rows only; no request is made until `--live` is passed, and neither
+that report nor a `PASS` result changes `verification.json`, preset status,
+or `Schedule.enabled`. Use `--source-key NEWS-08` (keys are case-insensitive)
+to limit an anonymous-public live check to a source. Every market-news row
+below remains `DRAFT` until an operator records the required evidence through
+the normal reviewed promotion process.
+
 | Key | Dataset | Status | Evidence / blocker |
 | --- | --- | --- | --- |
 | UL-01 | legal deposits | DRAFT | fixture + live extraction smoke required |
@@ -46,21 +54,21 @@ anonymous live smoke. Telegram rows are intentionally absent.
 | FL-18 | retail deposits | DRAFT | fixture + live extraction smoke required |
 | FL-19 | retail deposits | DRAFT | fixture + live extraction smoke required |
 | FL-20 | retail deposits | DRAFT | fixture + live extraction smoke required |
-| NEWS-01 | market news | DRAFT | HTTP profile; fixture/list-detail proof required |
-| NEWS-02 | market news | DRAFT | HTTP profile; fixture/selection proof required |
-| NEWS-04 | market news | DRAFT | NBRB anonymous read timeout |
-| NEWS-05 | market news | DRAFT | NBRB anonymous read timeout |
-| NEWS-06 | market news | DRAFT | HTTP profile; HTML/file fixture required |
-| NEWS-07 | market news | DRAFT | HTTP profile; fixture/list-detail proof required |
-| NEWS-08 | market news | DRAFT | HTTP profile; pagination fixture required |
-| NEWS-09 | market news | DRAFT | HTTP profile; paid/public fixture required |
-| NEWS-10 | market news | DRAFT | HTTP profile; bank-context fixture required |
-| NEWS-11 | market news | DRAFT | HTTP profile; scoped category fixture required |
-| NEWS-12 | market news | DRAFT | HTTP profile; scoped category fixture required |
-| NEWS-13 | market news | DRAFT | HTTP profile; scoped category fixture required |
-| NEWS-14 | market news | DRAFT | HTTP profile; topic fixture required |
-| NEWS-15 | market news | DRAFT | HTTP profile; gold/paywall fixture required |
-| NEWS-16 | market news | DRAFT | HTTP profile; repeated-page fixture required |
+| NEWS-01 | market news | DRAFT | list/detail fixtures retained; report-only live smoke required |
+| NEWS-02 | market news | DRAFT | list/detail fixtures retained; report-only live smoke required |
+| NEWS-04 | market news | DRAFT | NBRB anonymous read timeout; fixture + stable public transport required |
+| NEWS-05 | market news | DRAFT | NBRB anonymous read timeout; fixture + stable public transport required |
+| NEWS-06 | market news | DRAFT | listing fixture retained; live smoke and document MIME/parser proof required |
+| NEWS-07 | market news | DRAFT | list/detail fixtures retained; report-only live smoke required |
+| NEWS-08 | market news | DRAFT | listing/detail/page fixtures retained; report-only live smoke required |
+| NEWS-09 | market news | DRAFT | public/paid fixtures retained; report-only live smoke required |
+| NEWS-10 | market news | DRAFT | finance-scope fixture retained; report-only live smoke required |
+| NEWS-11 | market news | DRAFT | scoped category fixture retained; report-only live smoke required |
+| NEWS-12 | market news | DRAFT | scoped category fixture retained; report-only live smoke required |
+| NEWS-13 | market news | DRAFT | scoped category fixture retained; report-only live smoke required |
+| NEWS-14 | market news | DRAFT | topic fixture retained; report-only live smoke required |
+| NEWS-15 | market news | DRAFT | gold/paywall fixture retained; report-only live smoke required |
+| NEWS-16 | market news | DRAFT | page-distinctness fixtures retained; report-only live smoke required |
 | NEWS-03 | market indicators | DRAFT | BCSE indicator series fixture + smoke required |
 | indicator-nbrb-refinancing | market indicators | DRAFT | NBRB series fixture + stable transport required |
 | indicator-nbrb-daily-rates | market indicators | DRAFT | NBRB series fixture + stable transport required |

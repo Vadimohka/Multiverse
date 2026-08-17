@@ -22,3 +22,28 @@ Datasets:
 
 The schemas in `schemas/` are shared contracts; a source adds only its URL,
 scoped extraction selectors, state coverage and mapping configuration.
+
+## Readiness smoke and manual promotion
+
+Use the report-only smoke command to see the current fixture and live-smoke
+handoff state:
+
+```bash
+python3 scripts/smoke_belarus_market_pack.py
+```
+
+Without `--live`, the command makes no network requests and returns
+`SKIPPED_REQUIRES_LIVE` rows. To profile one public source anonymously, an
+operator must opt in explicitly:
+
+```bash
+python3 scripts/smoke_belarus_market_pack.py --live --source-key news-08
+```
+
+The command has no database or registry writes: it never changes
+`verification.json`, source/preset status, or `Schedule.enabled`. A `PASS`
+row is only public-representation evidence. Promotion remains a separate
+manual review: retain and test the required fixture evidence, record the
+operator's successful anonymous live smoke in `verification.json`, create a
+reviewed immutable preset revision with `VERIFIED` status, and enable a
+schedule only through the normal Schedule UI after that review.
