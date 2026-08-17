@@ -27,6 +27,7 @@ from app.models import (
     WorkflowBlueprintRevision,
 )
 from app.seed_templates import bcse_home_market_news_graph
+from app.services.news_profile_graph import compile_news_profile_graph
 from app.services.preset_compiler import compile_preset
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -178,7 +179,6 @@ def _news_preset_config(source: PassportSource) -> dict:
         raise ValueError(f"News source {source.key} has no declarative profile")
     selection = profile.get("selection") if isinstance(profile.get("selection"), dict) else {}
     pagination = profile.get("pagination") if isinstance(profile.get("pagination"), dict) else {}
-    node_overrides = profile.get("nodeOverrides") if isinstance(profile.get("nodeOverrides"), dict) else {}
     common_nodes = common.get("nodes") if isinstance(common.get("nodes"), dict) else {}
     common_process = common_nodes.get("process") if isinstance(common_nodes.get("process"), dict) else {}
     common_operations = common_process.get("operations") if isinstance(common_process.get("operations"), list) else []
@@ -201,11 +201,42 @@ def _news_preset_config(source: PassportSource) -> dict:
     }
     if pagination:
         nodes["traverse"]["pagination"] = pagination
-    generated = _deep_merge(
+    metadata = {"newsProfileVersion": str(registry.get("version") or "")}
+    if isinstance(profile.get("installedGraph"), dict):
+        metadata["installedGraphDigest"] = _hash(profile["installedGraph"])
+    return _deep_merge(
         common,
-        {"nodes": nodes, "metadata": {"newsProfileVersion": str(registry.get("version") or "")}},
+        {"nodes": nodes, "metadata": metadata},
     )
-    return _deep_merge(generated, {"nodes": node_overrides})
+
+
+def _news_profile(source_key: str) -> dict:
+    registry = json.loads(NEWS_PROFILE_REGISTRY.read_text(encoding="utf-8"))
+    profile = (registry.get("sources") or {}).get(source_key)
+    if not isinstance(profile, dict):
+        raise ValueError(f"News source {source_key} has no declarative profile")
+    return profile
+
+
+def _initial_workflow_graph(
+    descriptor: PassportSource,
+    *,
+    source_id: str,
+    dataset_id: str,
+    blueprint_graph: dict,
+    preset: SourcePresetRevision,
+) -> dict:
+    """Build a new workflow from its persisted declarative contract."""
+
+    if descriptor.key == "news-03":
+        return bcse_home_market_news_graph(source_id, dataset_id, incremental=True)
+    if descriptor.dataset_group == "news":
+        profile = _news_profile(descriptor.key)
+        if isinstance(profile.get("installedGraph"), dict):
+            return compile_news_profile_graph(
+                profile, source_id=source_id, dataset_id=dataset_id
+            )
+    return compile_preset(blueprint_graph, preset.__dict__).graph
 
 
 def _schedule_defaults(source: PassportSource) -> tuple[str, str]:
@@ -334,10 +365,12 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
             )
         )
         if workflow is None:
-            graph = (
-                bcse_home_market_news_graph(source.id, dataset.id, incremental=True)
-                if descriptor.key == "news-03"
-                else compile_preset(blueprint.graph_json, preset.__dict__).graph
+            graph = _initial_workflow_graph(
+                descriptor,
+                source_id=source.id,
+                dataset_id=dataset.id,
+                blueprint_graph=blueprint.graph_json,
+                preset=preset,
             )
             graph["settings"]["source_id"] = source.id
             graph["settings"]["dataset_id"] = dataset.id

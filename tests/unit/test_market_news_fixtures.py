@@ -6,7 +6,10 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 import pytest
+from app.database import SessionLocal
+from app.models import DatasetSourceMembership, Workflow
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+from sqlalchemy import select
 from workflow_engine.nodes import (
     ExtractRepeatingListNode,
     TransformNode,
@@ -196,6 +199,31 @@ async def test_official_source_has_fixture_evidence_or_explicit_draft_reason(sou
         record["selection_rule_id"] and record["selection_reason"]
         for record in result.records
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_key", ["news-01", "news-02"])
+async def test_retained_fixture_executes_the_actual_installed_special_graph(
+    client, source_key
+):
+    """Fixture evidence must fail when an installed official graph drifts."""
+
+    with SessionLocal() as db:
+        membership = db.scalar(
+            select(DatasetSourceMembership).where(
+                DatasetSourceMembership.source_key == source_key
+            )
+        )
+        assert membership is not None
+        workflow = db.get(Workflow, membership.workflow_id)
+        assert workflow is not None
+        installed_graph = workflow.graph_json
+
+    result = await run_news_fixture_from_files(source_key, graph=installed_graph)
+
+    assert result.records
+    assert all(record["body_text"] for record in result.records)
+    assert all(record["selection_rule_id"] for record in result.records)
 
 
 @pytest.mark.asyncio

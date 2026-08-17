@@ -2,21 +2,30 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 from unittest.mock import patch
 from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 import httpx
-from bs4 import BeautifulSoup
 from app.services.belarus_market_pack import _preset_config, passport_sources
+from app.services.news_profile_graph import load_news_profile_graph
 from app.services.preset_compiler import compile_preset
-from workflow_engine.nodes import HTTPRequestNode, MappingNode, TransformNode, ValidateNode, canonical_url
+from bs4 import BeautifulSoup
+from workflow_engine.nodes import (
+    CrawlLinksNode,
+    HTTPRequestNode,
+    MappingNode,
+    TransformNode,
+    ValidateNode,
+    canonical_url,
+)
 from workflow_engine.strategies import TraverseFacadeStrategy
 from workflow_engine.types import ExecutionContext
 
@@ -71,6 +80,7 @@ async def run_news_fixture(
     window: Mapping[str, Any],
     *,
     pages: Mapping[str, str] | None = None,
+    graph: Mapping[str, Any] | None = None,
 ) -> NewsFixtureResult:
     """Execute an existing news profile against a hermetic HTML transport.
 
@@ -81,9 +91,22 @@ async def run_news_fixture(
     """
 
     source, config = _fixture_config(source_key, window)
+    if graph is not None and any(
+        node.get("id") == "crawl" and node.get("type") == "crawl_links"
+        for node in graph.get("nodes", [])
+    ):
+        return await _run_legacy_installed_fixture(
+            source,
+            graph,
+            listing_html,
+            details,
+            window,
+            pages=pages,
+        )
     compiled = compile_preset(None, config).graph
     nodes = {node["id"]: node["config"] for node in compiled["nodes"]}
-    public_resolver = lambda _host, _port: ["93.184.216.34"]
+    def public_resolver(_host: str, _port: int) -> list[str]:
+        return ["93.184.216.34"]
     for phase in ("acquire", "traverse"):
         nodes[phase]["egress_resolver"] = public_resolver
     expected_details = {canonical_url(str(url)): body for url, body in details.items()}
@@ -156,7 +179,165 @@ async def run_news_fixture(
     )
 
 
-async def run_news_fixture_from_files(source_key: str) -> NewsFixtureResult:
+async def _run_legacy_installed_fixture(
+    source: Any,
+    graph: Mapping[str, Any],
+    listing_html: str,
+    details: Mapping[str, str],
+    window: Mapping[str, Any],
+    *,
+    pages: Mapping[str, str] | None = None,
+) -> NewsFixtureResult:
+    """Execute the installed legacy crawl/mapping/validation node contract."""
+
+    nodes = {node["id"]: deepcopy(node["config"]) for node in graph["nodes"]}
+    crawl_config = nodes["crawl"]
+    crawl_config["pagination_max_pages"] = int(window.get("max_pages", 1))
+    crawl_config["max_pages"] = int(window.get("max_pages", 1))
+    crawl_config["egress_resolver"] = lambda _host, _port: ["93.184.216.34"]
+    expected_details = {canonical_url(str(url)): body for url, body in details.items()}
+    expected_pages = {
+        canonical_url(str(url)): body for url, body in (pages or {}).items()
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if canonical_url(url) == canonical_url(source.url):
+            return httpx.Response(
+                200,
+                request=request,
+                text=listing_html,
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        if canonical_url(url) in expected_pages:
+            return httpx.Response(
+                200,
+                request=request,
+                text=expected_pages[canonical_url(url)],
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        if request.url.path == "/solo/calendar":
+            record_id = str(request.url.params.get("link") or "")
+            detail_body = next(
+                (
+                    body
+                    for detail_url, body in expected_details.items()
+                    if f"/{record_id}/" in urlsplit(detail_url).path
+                ),
+                None,
+            )
+            if detail_body is None:
+                return httpx.Response(404, request=request, json={"solo": {"notFound": True}})
+            detail = BeautifulSoup(detail_body, "lxml")
+            article = detail.select_one("article") or detail.body or detail
+            title = detail.select_one("h1")
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "day": str(request.url.params.get("sDay") or ""),
+                    "solo": {
+                        "title": title.get_text(" ", strip=True) if title else "",
+                        "html": str(article),
+                        "tags": [],
+                        "categoryName": "",
+                        "notFound": False,
+                    },
+                },
+            )
+        if canonical_url(url) in expected_details:
+            return httpx.Response(
+                200,
+                request=request,
+                text=expected_details[canonical_url(url)],
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        return httpx.Response(404, request=request, text="fixture URL not supplied")
+
+    original_async_client = httpx.AsyncClient
+
+    def fixture_client(**kwargs: Any) -> httpx.AsyncClient:
+        return original_async_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    async def fixture_browser(_self: Any, _context: Any, _inputs: Any, config: Any) -> dict:
+        url = str(config.get("url") or source.url)
+        return {
+            "url": url,
+            "html": listing_html,
+            "body": listing_html,
+            "network": [],
+            "tab_count": 0,
+            "tab_labels": [],
+        }
+
+    context = ExecutionContext(
+        run_id="news-fixture",
+        project_id="belarus-market",
+        workflow_version_id="fixture-installed",
+        variables={
+            "source": {
+                "url": source.url,
+                "base_url": source.url,
+                "fetch_mode": "PLAYWRIGHT",
+            }
+        },
+    )
+    with ExitStack() as stack:
+        stack.enter_context(patch("workflow_engine.nodes.httpx.AsyncClient", fixture_client))
+        stack.enter_context(
+            patch("workflow_engine.nodes.BrowserOpenNode.execute", fixture_browser)
+        )
+        crawled = await CrawlLinksNode().execute(context, {}, crawl_config)
+
+    selected = crawled
+    if "select" in nodes:
+        selected = await TransformNode().execute(context, crawled, nodes["select"])
+    mapped = await MappingNode().execute(context, selected, nodes["mapping"])
+    traversal = {
+        "reconciliation": {
+            "discovered": int(crawled.get("discovered") or 0),
+            "succeeded": int(crawled.get("count") or 0),
+            "intentionally_skipped": max(
+                int(crawled.get("count") or 0) - len(mapped.get("records") or []), 0
+            ),
+            "failed": len(crawled.get("errors") or []),
+            "duplicate": 0,
+        },
+        "checkpoint": {"completed_urls": list(crawled.get("completed_urls") or [])},
+        "stop_reason": "COMPLETED",
+    }
+    assessed = await ValidateNode().execute(
+        context,
+        {**mapped, "traversal": traversal, "errors": crawled.get("errors") or []},
+        {**nodes["validate"], "fail_on_error": False},
+    )
+    codes = list(assessed["assessment_codes"])
+    if crawled.get("errors"):
+        codes.append("DETAIL_FAILURE")
+    published_field = next(
+        (
+            field
+            for field in crawl_config.get("detail_fields", [])
+            if field.get("name") == "source_published_at"
+        ),
+        {},
+    )
+    return NewsFixtureResult(
+        records=_display_source_dates(
+            assessed["records"], str(published_field.get("timezone") or "UTC")
+        ),
+        assessment_status=str(assessed["assessment_status"]),
+        assessment_codes=list(dict.fromkeys(codes)),
+        traversal=traversal,
+        pagination=NewsFixturePagination(
+            visited_pages=1 if crawled.get("listing_diagnostics") else 0
+        ),
+    )
+
+
+async def run_news_fixture_from_files(
+    source_key: str, *, graph: Mapping[str, Any] | None = None
+) -> NewsFixtureResult:
     """Load a retained fixture set using generic filename/profile conventions."""
 
     root = Path(__file__).resolve().parent
@@ -172,9 +353,22 @@ async def run_news_fixture_from_files(source_key: str) -> NewsFixtureResult:
         source_key,
         {"from": "2000-01-01T00:00:00+03:00", "to": "2100-01-01T00:00:00+03:00"},
     )
+    if graph is None:
+        try:
+            graph = load_news_profile_graph(
+                source_key, source_id="fixture-source", dataset_id="fixture-dataset"
+            )
+        except ValueError:
+            graph = None
+    graph_nodes = {
+        node["id"]: node.get("config", {}) for node in (graph or {}).get("nodes", [])
+    }
     traverse = config["nodes"]["traverse"]
-    selector = str(traverse.get("detail", {}).get("selector") or "")
-    pagination = traverse.get("pagination") or {}
+    crawl = graph_nodes.get("crawl") or {}
+    selector = str(
+        crawl.get("link_selector") or traverse.get("detail", {}).get("selector") or ""
+    )
+    pagination = crawl or traverse.get("pagination") or {}
     fixture_pages = sorted(root.glob(f"{source_key}-page-*.html"))
     page_bodies: dict[str, str] = {}
     bodies = [listing]
@@ -202,5 +396,5 @@ async def run_news_fixture_from_files(source_key: str) -> NewsFixtureResult:
         "max_pages": max(1, len(fixture_pages)),
     }
     return await run_news_fixture(
-        source_key, listing, details, window, pages=page_bodies
+        source_key, listing, details, window, pages=page_bodies, graph=graph
     )

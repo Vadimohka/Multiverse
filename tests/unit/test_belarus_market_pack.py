@@ -16,10 +16,12 @@ from app.models import (
 )
 from app.services import belarus_market_pack
 from app.services.belarus_market_pack import (
+    NEWS_PROFILE_REGISTRY,
     _preset_config,
     install_belarus_market_pack,
     passport_sources,
 )
+from app.services.news_profile_graph import compile_news_profile_graph
 from app.services.preset_compiler import compile_preset
 from sqlalchemy import func, select
 from workflow_engine.nodes import ParseTableNode, TransformNode
@@ -135,38 +137,62 @@ def test_installed_market_news_workflows_match_the_fixture_profile_contract(clie
             assert blueprint is not None
             assert preset.config_json == _preset_config(descriptors[membership.source_key])
 
-            expected = compile_preset(blueprint.graph_json, preset.__dict__).graph
+            registry = json.loads(NEWS_PROFILE_REGISTRY.read_text(encoding="utf-8"))
+            profile = registry["sources"][membership.source_key]
+            expected = (
+                compile_news_profile_graph(
+                    profile,
+                    source_id=membership.source_id,
+                    dataset_id=dataset.id,
+                )
+                if "installedGraph" in profile
+                else compile_preset(blueprint.graph_json, preset.__dict__).graph
+            )
             assert workflow.graph_json["nodes"] == expected["nodes"], membership.source_key
             assert workflow.graph_json["edges"] == expected["edges"], membership.source_key
-            assert workflow.graph_json["contractVersion"] == 2, membership.source_key
+            assert workflow.graph_json.get("contractVersion") == expected.get(
+                "contractVersion"
+            ), membership.source_key
 
 
-def test_special_official_transport_and_document_contracts_compile_from_profiles():
-    """Dropping a profile node override must not restore installer-only behavior."""
+def test_special_official_transport_and_document_contracts_live_in_profiles():
+    """Every executable legacy knob must be editable in the source profile."""
 
-    sources = {item.key: item for item in passport_sources()}
-    news_01 = _preset_config(sources["news-01"])["nodes"]
-    news_02 = _preset_config(sources["news-02"])["nodes"]
-    news_05 = _preset_config(sources["news-05"])["nodes"]
-    news_06 = _preset_config(sources["news-06"])["nodes"]
+    registry = json.loads(NEWS_PROFILE_REGISTRY.read_text(encoding="utf-8"))
+    profiles = registry["sources"]
+    for source_key in ("news-01", "news-02", "news-04", "news-05", "news-06"):
+        assert "nodeOverrides" not in profiles[source_key]
+        graph = compile_news_profile_graph(
+            profiles[source_key], source_id="source", dataset_id="dataset"
+        )
+        assert next(node for node in graph["nodes"] if node["id"] == "crawl")[
+            "type"
+        ] == "crawl_links"
 
-    assert news_01["acquire"]["transport"] == "PLAYWRIGHT"
-    assert news_01["traverse"]["detail_request"]["url"] == "https://www.bcse.by/solo/calendar"
-    assert news_01["traverse"]["pagination"]["nextSelector"].startswith("#pc-0 ")
-    assert news_02["acquire"]["transport"] == "PLAYWRIGHT"
-    assert news_02["traverse"]["detail_request"]["url"] == "https://www.bcse.by/solo/calendar"
-    assert news_02["traverse"]["pagination"]["nextSelector"].startswith("#pc-nws-")
-    assert news_05["acquire"]["transport"] == "PLAYWRIGHT"
-    assert news_05["traverse"]["frontier_title_patterns"] == [
+    news_01 = profiles["news-01"]["installedGraph"]["crawl"]
+    news_02 = profiles["news-02"]["installedGraph"]["crawl"]
+    news_05 = profiles["news-05"]["installedGraph"]["crawl"]
+    news_06 = profiles["news-06"]["installedGraph"]["crawl"]
+
+    assert news_01["link_selector"] == profiles["news-01"]["listingSelector"]
+    assert news_01["url_pattern"] == profiles["news-01"]["urlPattern"]
+    assert news_01["listing_fetch_mode"] == "PLAYWRIGHT"
+    assert news_01["detail_request"]["url"] == "https://www.bcse.by/solo/calendar"
+    assert news_01["pagination_next_selector"].startswith("#pc-0 ")
+    assert news_02["listing_fetch_mode"] == "PLAYWRIGHT"
+    assert news_02["detail_request"]["url"] == "https://www.bcse.by/solo/calendar"
+    assert news_02["pagination_next_selector"].startswith("#pc-nws-")
+    assert news_05["listing_fetch_mode"] == "PLAYWRIGHT"
+    assert news_05["frontier_title_patterns"] == [
         "Сведения о средних процентных ставках кредитно-депозитного рынка",
         "Показатели рынка корпоративных ценных бумаг",
     ]
-    assert news_05["traverse"]["attachment_documents"]["enabled"] is True
-    assert news_05["traverse"]["related_json_resources"][0]["url"] == (
+    assert news_05["attachment_documents"]["enabled"] is True
+    assert news_05["related_json_resources"][0]["url"] == (
         "https://api.nbrb.by/AvgIntRatesDyn"
     )
-    assert news_06["traverse"]["direct_document_record"] is True
-    assert news_06["traverse"]["attachment_documents"]["enabled"] is True
+    assert news_06["direct_document_record"] is True
+    assert news_06["attachment_documents"]["enabled"] is True
 
 
 @pytest.mark.parametrize(
