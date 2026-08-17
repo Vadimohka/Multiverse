@@ -40,4 +40,3 @@ $ pytest -q tests/unit/test_belarus_market_pack.py tests/integration/test_data_a
 ## Change
 
 `test_every_market_news_source_has_a_shared_dataset_binding` asserts exactly the 15 required source keys and that every generated profile binds to `market-news`.
-
