@@ -208,3 +208,90 @@ def bcse_market_news_category_graph(source_id: str, dataset_id: str, *, incremen
     ]}
     graph["settings"]["natural_key_fields"] = ["source_id", "identity_key"]
     return graph
+
+
+def nbrb_market_press_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
+    """NBRB press-release graph for the shared market-news dataset.
+
+    The operator-facing source is ``/news/press``.  NBRB exposes the same
+    category through its official RSS endpoint, which is more complete and
+    stable than scraping the archive shell; every item is still fetched from
+    its full public ``/press/<id>`` detail page.
+    """
+    crawl_config = {
+        "listing_url": "https://www.nbrb.by/rss/",
+        "listing_query": {"p": "press"},
+        "source_entry_url": "https://www.nbrb.by/news/press",
+        "base_url": "https://www.nbrb.by/",
+        "listing_fetch_mode": "HTTP",
+        "listing_wait_until": "networkidle",
+        "link_selector": "",
+        "pagination_enabled": False,
+        "tabs_enabled": False,
+        "detail_fetch_mode": "HTTP",
+        "url_path": "url",
+        "url_pattern": r"/press/(?P<record_id>[^/?#]+)",
+        "max_items": 5000,
+        "concurrency": 6,
+        "delay_ms": 150,
+        "request_retries": 2,
+        "request_timeout": 45,
+        "timeout": 900,
+        "headers": {"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5"},
+        "detail_fields": [
+            {"name": "title", "selector": "h1"},
+            {"name": "source_published_at", "selector": ".usercontent-wrap > .flex-row:first-child > div:first-child", "timezone": "Europe/Minsk", "format": "DD.MM.YYYY"},
+            {"name": "body_text", "selector": ".news-content", "value": "text"},
+            {"name": "body_html", "selector": ".news-content", "value": "html"},
+            {"name": "category", "selector": ".usercontent-wrap > .flex-row:first-child > div:nth-child(2)"},
+            {"name": "attachments", "selector": ".news-content a[href$='.pdf'], .news-content a[href$='.doc'], .news-content a[href$='.docx'], .news-content a[href$='.xls'], .news-content a[href$='.xlsx'], .news-content a[href$='.zip']", "multiple": True, "value": "links"},
+        ],
+        "detail_constants": {"language": "ru", "source_name": "НБРБ"},
+        "drop_query_params": ["utm_source", "utm_medium", "utm_campaign"],
+        "save_artifacts": True,
+    }
+    mapping_fields = [
+        {"target": "source_id", "constant": "nbrb-press"},
+        {"target": "source_name", "constant": "НБРБ / пресс-релизы"},
+        {"target": "source_section", "constant": "press"},
+        {"target": "source_authority", "constant": "PRIMARY"},
+        {"target": "external_id", "source_path": "record_id"},
+        {"target": "identity_key", "source_path": "record_id"},
+        {"target": "canonical_url", "source_path": "url"},
+        {"target": "title", "source_path": "title"},
+        {"target": "body_text", "source_path": "body_text"},
+        {"target": "body_html", "source_path": "body_html"},
+        {"target": "source_published_at", "source_path": "source_published_at"},
+        {"target": "category", "source_path": "category"},
+        {"target": "candidate_status", "constant": "INCLUDE"},
+        {"target": "access_status", "constant": "PUBLIC"},
+        {"target": "selection_rule_id", "constant": "nbrb-press-all-v1"},
+        {"target": "selection_rule_version", "constant": "news-passport-v2"},
+        {"target": "selection_reason", "constant": "all publications in the official NBRB press-release RSS category"},
+        {"target": "selection_evidence", "constant": {"section": "press", "feed": "/rss/?p=press", "entry_url": "/news/press", "url_prefix": "/press/"}},
+        {"target": "attachments", "source_path": "attachments"},
+        {"target": "language", "source_path": "language"},
+        {"target": "fetched_at", "source_path": "fetched_at"},
+    ]
+    graph = {
+        "version": 1,
+        "settings": {"source_id": source_id, "dataset_id": dataset_id, "natural_key_fields": ["source_id", "identity_key"], "review_policy": {"new": False, "changed": True, "confidence_below": 0.8}},
+        "nodes": [
+            {"id": "trigger", "type": "manual_trigger", "position": {"x": 30, "y": 180}, "config": {}},
+            {"id": "crawl", "type": "crawl_links", "position": {"x": 280, "y": 180}, "config": crawl_config},
+            {"id": "mapping", "type": "mapping", "position": {"x": 590, "y": 180}, "config": {"input_path": "records", "fields": mapping_fields}},
+            {"id": "validate", "type": "validate", "position": {"x": 850, "y": 180}, "config": {"input_path": "records", "required": ["source_id", "source_name", "canonical_url", "title", "candidate_status", "access_status"], "fail_on_error": True}},
+            {"id": "output", "type": "output", "position": {"x": 1120, "y": 180}, "config": {"input_path": "records", "name": "market_news"}},
+        ],
+        "edges": [
+            {"id": "e1", "source": "trigger", "target": "crawl"},
+            {"id": "e2", "source": "crawl", "target": "mapping"},
+            {"id": "e3", "source": "mapping", "target": "validate"},
+            {"id": "e4", "source": "validate", "target": "output"},
+        ],
+    }
+    return graph
+
+
+# Compatibility alias for callers that use the generic market-news naming.
+nbrb_market_news_graph = nbrb_market_press_graph

@@ -1086,6 +1086,26 @@ class CrawlLinksNode:
     def _listing_items(self, listing: Any, config: dict[str, Any]) -> list[Any]:
         if isinstance(listing, str):
             soup = BeautifulSoup(listing, "lxml")
+            # RSS/Atom feeds expose links as XML ``<link>`` text rather than
+            # HTML ``href`` attributes. Preserve the feed GUID as stable id.
+            feed_soup = BeautifulSoup(listing, "xml")
+            feed_items = feed_soup.find_all("item")
+            if feed_items and not soup.select("a[href]"):
+                feed_links: list[dict[str, Any]] = []
+                for item in feed_items:
+                    link = item.find("link")
+                    href = link.get_text(strip=True) if link else ""
+                    if not href:
+                        continue
+                    guid = item.find("guid")
+                    title = item.find("title")
+                    feed_links.append({
+                        "url": href,
+                        "title": title.get_text(" ", strip=True) if title else "",
+                        "record_id": guid.get_text(strip=True) if guid else None,
+                    })
+                if feed_links:
+                    return feed_links
             selector = str(config.get("link_selector") or "").strip()
             elements = soup.select(selector) if selector else soup.select("main a[href]") or soup.select("a[href]")
             items: list[dict[str, Any]] = []
