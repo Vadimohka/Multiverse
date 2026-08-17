@@ -644,7 +644,11 @@ def test_market_news_bootstrap_binds_bcse_releases_to_the_shared_news_dataset(cl
 
     dataset = next(item for item in datasets if item["slug"] == "market-news")
     source = next(item for item in sources if (item.get("settings") or {}).get("source_key") == "news-01")
-    workflow = next(item for item in workflows if item["name"].startswith("news-01:"))
+    workflow = next(
+        item
+        for item in workflows
+        if item["graph_json"]["settings"].get("source_id") == source["id"]
+    )
 
     assert source["entry_url"] == "https://www.bcse.by/press-center/releases"
     assert workflow["graph_json"]["settings"]["source_id"] == source["id"]
