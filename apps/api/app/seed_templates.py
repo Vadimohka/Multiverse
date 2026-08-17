@@ -293,5 +293,115 @@ def nbrb_market_press_graph(source_id: str, dataset_id: str, *, incremental: boo
     return graph
 
 
+def nbrb_market_statistics_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
+    """NBRB statistical-publications graph for the shared market-news dataset.
+
+    The statistics landing page contains a mixed publication stream.  Keep
+    the frontier restricted to the two passport series before opening detail
+    pages; the title rule remains as a second, auditable guard against route
+    drift or unrelated cards entering the dataset.
+    """
+    crawl_config = {
+        "listing_url": "https://www.nbrb.by/news/statistics",
+        "source_entry_url": "https://www.nbrb.by/news/statistics",
+        "base_url": "https://www.nbrb.by/",
+        "listing_fetch_mode": "PLAYWRIGHT",
+        "listing_wait_until": "networkidle",
+        "link_selector": "#newsData article.n-article .pub__descr a[href]",
+        # Filter directly on the dynamic listing-card title before crawling
+        # details or documents.  This keeps raw artifacts as scoped as the
+        # output dataset, rather than downloading unrelated NBRB sections.
+        "frontier_title_patterns": [
+            "Сведения о средних процентных ставках кредитно-депозитного рынка",
+            "Показатели рынка корпоративных ценных бумаг",
+        ],
+        "pagination_enabled": True,
+        "pagination_max_pages": 100,
+        "pagination_next_selector": "#newsData a[rel='next'], #newsData .pagination a.next, #newsData li.next a",
+        "pagination_wait_ms": 750,
+        "tabs_enabled": True,
+        "tabs_wait_ms": 500,
+        "tabs_max_depth": 2,
+        "detail_fetch_mode": "HTTP",
+        "url_path": "url",
+        # Keep the whole statistics publication frontier.  Category
+        # membership is decided from the material title below, because NBRB
+        # has used several URLs for the same series over time.
+        "url_pattern": r"/statistics/[^/?#]+(?:/[^/?#]+)*(?:$|[/?#])",
+        "max_items": 5000,
+        "concurrency": 6,
+        "delay_ms": 150,
+        "request_retries": 2,
+        "request_timeout": 45,
+        "timeout": 900,
+        "headers": {"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5"},
+        "detail_fields": [
+            {"name": "title", "selector": "main h1, h1"},
+            {"name": "source_published_at", "selector": "main .pub-date, main time, meta[property='article:published_time']", "attribute": "content", "timezone": "Europe/Minsk"},
+            {"name": "body_text", "selector": "main.l-main.usercontent, main.usercontent, main", "value": "text"},
+            {"name": "body_html", "selector": "main.l-main.usercontent, main.usercontent, main", "value": "html"},
+            {"name": "tables", "selector": "main table", "multiple": True, "value": "structured_tables"},
+            {"name": "attachments", "selector": "main a[href$='.pdf'], main a[href$='.doc'], main a[href$='.docx'], main a[href$='.xls'], main a[href$='.xlsx'], main a[href$='.zip']", "multiple": True, "value": "links"},
+        ],
+        "detail_constants": {"language": "ru", "source_name": "НБРБ"},
+        "attachment_base_url": "https://www.nbrb.by/",
+        "attachment_documents": {"enabled": True, "max_files": 25, "extensions": [".xlsx", ".xls", ".csv", ".pdf", ".docx"]},
+        "related_json_resources": [{"name": "official_api", "target": "official_api", "url": "https://api.nbrb.by/AvgIntRatesDyn", "title_patterns": ["Сведения о средних процентных ставках кредитно-депозитного рынка"]}],
+        "drop_query_params": ["utm_source", "utm_medium", "utm_campaign"],
+        "save_artifacts": True,
+    }
+    selection_rules = {
+        "fields": ["title"],
+        "default": {"action": "EXCLUDE", "ruleId": "nbrb-statistics-series-v1", "reason": "outside the two configured NBRB statistical series"},
+        "rules": [
+            {"id": "nbrb-statistics-credit-deposit-v2", "action": "INCLUDE", "reason": "материал о средних процентных ставках кредитно-депозитного рынка", "when": {"anyPatterns": ["Сведения о средних процентных ставках кредитно-депозитного рынка"]}},
+            {"id": "nbrb-statistics-corporate-securities-v1", "action": "INCLUDE", "reason": "материал о показателях рынка корпоративных ценных бумаг", "when": {"anyPatterns": ["Показатели рынка корпоративных ценных бумаг"]}},
+        ],
+    }
+    mapping_fields = [
+        {"target": "source_id", "constant": "nbrb-statistics"},
+        {"target": "source_name", "constant": "НБРБ / статистика"},
+        {"target": "source_section", "constant": "statistics"},
+        {"target": "source_authority", "constant": "PRIMARY"},
+        {"target": "external_id", "source_path": "record_id"},
+        {"target": "identity_key", "source_path": "record_id"},
+        {"target": "canonical_url", "source_path": "url"},
+        {"target": "title", "source_path": "title"},
+        {"target": "body_text", "source_path": "body_text"},
+        {"target": "body_html", "source_path": "body_html"},
+        {"target": "tables", "source_path": "tables"},
+        {"target": "source_published_at", "source_path": "source_published_at"},
+        {"target": "candidate_status", "source_path": "candidate_status"},
+        {"target": "access_status", "constant": "PUBLIC"},
+        {"target": "selection_rule_id", "source_path": "selection_rule_id"},
+        {"target": "selection_rule_version", "constant": "news-passport-v2"},
+        {"target": "selection_reason", "source_path": "selection_reason"},
+        {"target": "selection_evidence", "source_path": "selection_evidence"},
+        {"target": "attachments", "source_path": "attachments"},
+        {"target": "official_api", "source_path": "official_api"},
+        {"target": "language", "source_path": "language"},
+        {"target": "fetched_at", "source_path": "fetched_at"},
+    ]
+    return {
+        "version": 1,
+        "settings": {"source_id": source_id, "dataset_id": dataset_id, "natural_key_fields": ["source_id", "identity_key"], "review_policy": {"new": False, "changed": False, "confidence_below": 0.8}},
+        "nodes": [
+            {"id": "trigger", "type": "manual_trigger", "position": {"x": 30, "y": 180}, "config": {}},
+            {"id": "crawl", "type": "crawl_links", "position": {"x": 280, "y": 180}, "config": crawl_config},
+            {"id": "select", "type": "transform", "position": {"x": 540, "y": 180}, "config": {"input_path": "records", "operations": [{"type": "select_by_rules", **selection_rules}], "filters": [{"field": "candidate_status", "operator": "equals", "value": "INCLUDE", "action": "include_only", "reason": "only exact NBRB statistical series"}], "identity": ["url"]}},
+            {"id": "mapping", "type": "mapping", "position": {"x": 780, "y": 180}, "config": {"input_path": "records", "fields": mapping_fields}},
+            {"id": "validate", "type": "validate", "position": {"x": 1030, "y": 180}, "config": {"input_path": "records", "required": ["source_id", "source_name", "canonical_url", "title", "body_text", "candidate_status", "access_status", "selection_rule_id"], "fail_on_error": True}},
+            {"id": "output", "type": "output", "position": {"x": 1270, "y": 180}, "config": {"input_path": "records", "name": "market_news"}},
+        ],
+        "edges": [
+            {"id": "e1", "source": "trigger", "target": "crawl"},
+            {"id": "e2", "source": "crawl", "target": "select"},
+            {"id": "e3", "source": "select", "target": "mapping"},
+            {"id": "e4", "source": "mapping", "target": "validate"},
+            {"id": "e5", "source": "validate", "target": "output"},
+        ],
+    }
+
+
 # Compatibility alias for callers that use the generic market-news naming.
 nbrb_market_news_graph = nbrb_market_press_graph

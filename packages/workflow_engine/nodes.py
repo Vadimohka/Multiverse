@@ -813,6 +813,13 @@ class CrawlLinksNode:
                         artifact = await store_artifact(context, artifact_content, artifact_content_type, detail_url, f"{artifact_id}.json" if "json" in artifact_content_type else f"{artifact_id}.html", "raw_article")
                     fetched_candidate = {**candidate, "fetched_at": datetime.now(UTC).isoformat()}
                     record = extract_article_record(detail_html, detail_url, fetched_candidate, config, artifact)
+                    await enrich_record_related_resources(
+                        context,
+                        record,
+                        detail_url,
+                        config,
+                        client,
+                    )
                     if response is not None:
                         async with record_lock:
                             detail_diagnostics.append({
@@ -2315,8 +2322,14 @@ def build_url_frontier(
     }
     seen: set[str] = set()
     frontier: list[dict[str, Any]] = []
+    title_patterns = [str(value) for value in (config.get("frontier_title_patterns") or []) if str(value)]
+    title_path = str(config.get("frontier_title_path") or "title")
     for value in items:
         item = dict(value) if isinstance(value, dict) else {url_path: value}
+        if title_patterns:
+            candidate_title = str(find_value(item, title_path) or item.get("title") or "")
+            if not candidate_title or not any(re.search(pattern, candidate_title, re.I) for pattern in title_patterns):
+                continue
         raw_url = find_value(item, url_path)
         if not raw_url:
             continue
@@ -2500,10 +2513,16 @@ def extract_article_record(
             element = elements[0] if elements else None
             value_mode = str(field.get("value") or "text")
             if field.get("multiple") and value_mode == "links":
+                # Some publishers (notably NBRB) emit document hrefs such as
+                # ``statistics/financialmarkets/...`` from a detail page
+                # nested below ``/statistics/financialmarkets/...``.  When a
+                # workflow supplies an explicit attachment base, resolve
+                # those hrefs against it instead of the current article URL.
+                attachment_base = str(config.get("attachment_base_url") or page_url)
                 links = [
                     {
                         "title": item.get_text(" ", strip=True) or Path(urlsplit(str(item.get("href") or "")).path).name,
-                        "url": canonical_url(urljoin(page_url, str(item.get("href") or ""))),
+                        "url": canonical_url(urljoin(attachment_base, str(item.get("href") or ""))),
                     }
                     for item in elements if item.get("href")
                 ]
@@ -2513,6 +2532,12 @@ def extract_article_record(
                 # which is declared as an array and must stay structured all
                 # the way through Mapping → persistence validation.
                 record[name] = links if name == "attachments" else json.dumps(links, ensure_ascii=False)
+                continue
+            if field.get("multiple") and value_mode in {"structured_tables", "table_json"}:
+                record[name] = parse_html_tables_structured(elements)
+                continue
+            if field.get("multiple") and value_mode == "html":
+                record[name] = [item.decode_contents() for item in elements]
                 continue
             if element is None:
                 record[name] = None
@@ -2571,11 +2596,12 @@ def extract_article_record(
     tags = unique_strings(element.get_text(" ", strip=True) for element in soup.select(tag_selector)) if tag_selector else unique_strings([element.get("content") or element.get_text(" ", strip=True) for element in soup.select("[data-parser-studio-tag], [rel='tag'], meta[name='keywords']")])
     attachment_selector = str(config.get("attachment_selector") or "a[href$='.pdf'],a[href$='.doc'],a[href$='.docx'],a[href$='.xls'],a[href$='.xlsx'],a[href$='.zip']")
     attachments = []
+    attachment_base = str(config.get("attachment_base_url") or page_url)
     if body:
         for element in body.select(attachment_selector):
             href = element.get("href")
             if href:
-                attachments.append({"title": element.get_text(" ", strip=True) or Path(urlsplit(href).path).name, "url": canonical_url(urljoin(page_url, href))})
+                attachments.append({"title": element.get_text(" ", strip=True) or Path(urlsplit(href).path).name, "url": canonical_url(urljoin(attachment_base, href))})
     published_at = (
         normalize_source_datetime(date_text)
         if re.search(r"T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})$", date_text)
@@ -2607,6 +2633,142 @@ def extract_article_record(
     if artifact:
         record["__provenance"] = {"raw_artifact": artifact}
     return record
+
+
+def parse_html_tables_structured(elements: list[Any]) -> list[dict[str, Any]]:
+    """Convert selected HTML tables into lossless, export-friendly structures."""
+    tables: list[dict[str, Any]] = []
+    for table_index, table in enumerate(elements):
+        matrix: list[list[str]] = []
+        rowspans: dict[int, tuple[str, int]] = {}
+        for tr in table.select("tr"):
+            row: list[str] = []
+            column = 0
+            cells = tr.select(":scope > th, :scope > td")
+            for cell in cells:
+                while column in rowspans and rowspans[column][1] > 0:
+                    value, remaining = rowspans[column]
+                    row.append(value)
+                    rowspans[column] = (value, remaining - 1)
+                    column += 1
+                value = clean_inline_text(cell.get_text(" ", strip=True))
+                colspan = max(int(cell.get("colspan", 1) or 1), 1)
+                rowspan = max(int(cell.get("rowspan", 1) or 1), 1)
+                for _ in range(colspan):
+                    row.append(value)
+                    if rowspan > 1:
+                        rowspans[column] = (value, rowspan - 1)
+                    column += 1
+            while column in rowspans and rowspans[column][1] > 0:
+                value, remaining = rowspans[column]
+                row.append(value)
+                rowspans[column] = (value, remaining - 1)
+                column += 1
+            if any(row):
+                matrix.append(row)
+        header_rows = table.select("thead tr")
+        header_matrix = [
+            [clean_inline_text(cell.get_text(" ", strip=True)) for cell in row.select("th,td")]
+            for row in header_rows
+        ]
+        headers = dedupe_headers(header_matrix[-1] if header_matrix else (matrix[0] if matrix else []))
+        data_start = len(header_matrix) if header_matrix else 1
+        rows = [dict(zip(headers, row, strict=False)) for row in matrix[data_start:] if any(row)]
+        tables.append({
+            "table_index": table_index,
+            "headers": headers,
+            "rows": rows,
+            "matrix": matrix,
+            "html": table.decode_contents(),
+        })
+    return tables
+
+
+async def enrich_record_related_resources(
+    context: ExecutionContext,
+    record: dict[str, Any],
+    page_url: str,
+    config: dict[str, Any],
+    client: httpx.AsyncClient,
+) -> None:
+    """Download configured linked documents/API payloads and retain parsed data."""
+    attachment_config = config.get("attachment_documents")
+    if isinstance(attachment_config, dict) and attachment_config.get("enabled"):
+        attachments = record.get("attachments") if isinstance(record.get("attachments"), list) else []
+        maximum = max(int(attachment_config.get("max_files") or 25), 0)
+        allowed = {str(value).lower() for value in attachment_config.get("extensions", [".xlsx", ".xls", ".csv", ".pdf", ".docx"])}
+        policy = FetchPolicy.from_config({**config, **attachment_config})
+        egress_policy = EgressPolicy.from_config({**config, **attachment_config})
+        resolver = attachment_config.get("egress_resolver") or config.get("egress_resolver") or default_resolver
+        for attachment in attachments[:maximum]:
+            if not isinstance(attachment, dict):
+                continue
+            url = canonical_url(urljoin(str(config.get("attachment_base_url") or page_url), str(attachment.get("url") or "")))
+            # Keep the corrected URL in the persisted record as well as using
+            # it for the download, so exports and provenance point at the
+            # actual source document rather than a nested 404 path.
+            attachment["url"] = url
+            suffix = Path(urlsplit(url).path).suffix.lower()
+            if suffix not in allowed:
+                continue
+            try:
+                response = await request_with_egress_policy(
+                    client, "GET", url, policy, egress_policy=egress_policy,
+                    resolver=resolver, request_fn=request_with_policy,
+                )
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "application/octet-stream")
+                filename = filename_from_response(response)
+                artifact = await store_artifact(context, response.content, content_type, str(response.url), filename, "raw_attachment")
+                attachment["artifact"] = artifact
+                attachment["content_type"] = content_type
+                attachment["document"] = parse_downloaded_document(response.content, filename)
+            except Exception as exc:
+                attachment["parse_error"] = str(exc)
+
+    for resource in config.get("related_json_resources") or []:
+        if not isinstance(resource, dict):
+            continue
+        patterns = [str(value) for value in resource.get("title_patterns") or []]
+        if patterns and not any(re.search(pattern, str(record.get("title") or ""), re.I) for pattern in patterns):
+            continue
+        url = render_template(str(resource.get("url") or ""), context, record)
+        if not url:
+            continue
+        try:
+            policy = FetchPolicy.from_config({**config, **resource})
+            response = await request_with_egress_policy(
+                client, "GET", url, policy, egress_policy=EgressPolicy.from_config({**config, **resource}),
+                resolver=resource.get("egress_resolver") or config.get("egress_resolver") or default_resolver,
+                request_fn=request_with_policy,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            artifact = await store_artifact(context, response.content, response.headers.get("content-type", "application/json"), str(response.url), filename_from_response(response), "raw_related_json")
+            record[str(resource.get("target") or resource.get("name") or "related_json")] = {"url": str(response.url), "records": payload if isinstance(payload, list) else [payload], "artifact": artifact}
+        except Exception as exc:
+            record.setdefault("related_resource_errors", []).append({"url": url, "error": str(exc)})
+
+
+def parse_downloaded_document(data: bytes, filename: str) -> dict[str, Any]:
+    def json_value(value: Any) -> Any:
+        """Keep parsed spreadsheet cells safe for workflow JSON persistence."""
+        if isinstance(value, (datetime, date, datetime_time)):
+            return value.isoformat()
+        return value
+
+    suffix = Path(filename).suffix.lower()
+    if suffix in {".xlsx", ".xlsm"}:
+        workbook = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+        sheets = []
+        for sheet in workbook.worksheets:
+            rows = [[json_value(value) for value in row] for row in sheet.iter_rows(values_only=True)]
+            sheets.append({"name": sheet.title, "rows": rows, "row_count": len(rows), "column_count": max((len(row) for row in rows), default=0)})
+        return {"type": "XLSX", "filename": filename, "sheets": sheets}
+    if suffix == ".csv":
+        text = data.decode("utf-8-sig", errors="replace")
+        return {"type": "CSV", "filename": filename, "rows": list(csv.reader(io.StringIO(text)))}
+    return {"type": suffix.lstrip(".").upper() or "BINARY", "filename": filename, "size": len(data)}
 
 
 def extract_jsonld_dates(soup: BeautifulSoup) -> dict[str, str]:

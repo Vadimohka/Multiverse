@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.audit import audit
@@ -132,16 +132,17 @@ def update_dataset(
 
 
 def clear_dataset_records(db: Session, dataset_id: str) -> int:
-    """Remove only data owned by a dataset, including its review tasks."""
+    """Remove records and every record-owned dependency in FK-safe order."""
     records = list(db.scalars(select(Record).where(Record.dataset_id == dataset_id)).all())
     record_ids = [record.id for record in records]
     if record_ids:
-        for task in db.scalars(
-            select(ReviewTask).where(ReviewTask.record_id.in_(record_ids))
-        ).all():
-            db.delete(task)
-    for record in records:
-        db.delete(record)
+        # These bulk operations have a deliberate order.  PostgreSQL cannot
+        # delete a record while review_tasks still reference it; observations
+        # also reference both records and record versions.
+        db.execute(delete(ReviewTask).where(ReviewTask.record_id.in_(record_ids)))
+        db.execute(delete(RecordObservation).where(RecordObservation.record_id.in_(record_ids)))
+        db.execute(delete(RecordVersion).where(RecordVersion.record_id.in_(record_ids)))
+        db.execute(delete(Record).where(Record.id.in_(record_ids)))
     return len(records)
 
 
@@ -733,7 +734,18 @@ def export_dataset(
         columns = sorted({k for row in rows for k in row})
         writer = csv.DictWriter(buffer, fieldnames=columns)
         writer.writeheader()
-        writer.writerows(rows)
+        # CSV is flat by definition. Preserve nested parser output as valid
+        # JSON text (rather than Python's repr) so tables, attachments and
+        # official API payloads can be loaded back without losing structure.
+        writer.writerows(
+            {
+                column: json.dumps(value, ensure_ascii=False, default=str)
+                if isinstance(value, (dict, list))
+                else value
+                for column, value in row.items()
+            }
+            for row in rows
+        )
         return Response(
             buffer.getvalue(),
             media_type="text/csv; charset=utf-8",
