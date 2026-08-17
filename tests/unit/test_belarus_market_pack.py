@@ -83,6 +83,22 @@ def test_every_news_site_has_a_declarative_list_detail_and_selection_profile():
         assert {operation["type"] for operation in operations} >= {"copy", "coalesce", "classify_access", "select_by_rules"}
 
 
+def test_every_market_news_source_has_a_shared_dataset_binding():
+    expected = {
+        "news-01", "news-02", "news-04", "news-05", "news-06",
+        "news-07", "news-08", "news-09", "news-10", "news-11",
+        "news-12", "news-13", "news-14", "news-15", "news-16",
+    }
+    profiles = {
+        source.key: _preset_config(source)
+        for source in passport_sources()
+        if source.key in expected
+    }
+
+    assert set(profiles) == expected
+    assert all(config["bindings"]["dataset"] == "market-news" for config in profiles.values())
+
+
 def test_bcse_releases_profile_includes_every_article_in_the_configured_section():
     profile = json.loads((Path(__file__).resolve().parents[2] / "presets" / "belarus-market" / "news" / "source-profiles.json").read_text(encoding="utf-8"))
     selection = profile["sources"]["news-01"]["selection"]
