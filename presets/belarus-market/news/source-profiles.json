@@ -16,7 +16,6 @@
             {"name": "summary_raw", "selector": "meta[name='description']", "attribute": "content"},
             {"name": "body_text", "selector": ".document-content, .news-content, article, [itemprop='articleBody'], main"},
             {"name": "body_html", "selector": ".document-content, .news-content, article, [itemprop='articleBody'], main", "value": "html"},
-            {"name": "attachment_url", "selector": "main a[href$='.pdf'], main a[href$='.doc'], main a[href$='.docx'], main a[href$='.xls'], main a[href$='.xlsx']", "attribute": "href"},
             {"name": "source_published_at", "source": "metadata", "metadata_key": "source_published_at", "timezone": "Europe/Minsk"},
             {"name": "source_modified_at", "source": "metadata", "metadata_key": "source_modified_at", "timezone": "Europe/Minsk"}
           ]
