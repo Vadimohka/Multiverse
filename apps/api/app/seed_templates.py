@@ -167,3 +167,44 @@ def bcse_market_news_graph(source_id: str, dataset_id: str, *, incremental: bool
     output["config"] = {"input_path": "records", "name": "market_news"}
     graph["settings"]["natural_key_fields"] = ["source_id", "identity_key"]
     return graph
+
+
+def bcse_market_news_category_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
+    """BCSE ``Новости`` category graph sharing the NEWS-01 transport contract.
+
+    The BCSE calendar endpoint returns a mixed stream (all publications,
+    releases and news).  NEWS-02 deliberately uses the rendered ``Новости``
+    tab and a strict ``/press-center/news/`` frontier, so press releases and
+    other press-centre categories can never enter this workflow.
+    """
+    graph = bcse_market_news_graph(source_id, dataset_id, incremental=incremental)
+    crawl = next(node for node in graph["nodes"] if node["id"] == "crawl")["config"]
+    crawl["link_selector"] = "#pc-nws-1c a.text-pc[href*='/press-center/news/']"
+    crawl["pagination_next_selector"] = "#pc-nws-1 li.paginationjs-next:not(.disabled) a"
+    crawl["url_pattern"] = r"/press-center/news/(?P<record_id>n[^/?#]+)/(?P<publication_time>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})$"
+
+    mapping = next(node for node in graph["nodes"] if node["id"] == "mapping")
+    mapping["config"] = {"input_path": "records", "fields": [
+        {"target": "source_id", "constant": "bcse-news"},
+        {"target": "source_name", "constant": "БВФБ / новости"},
+        {"target": "source_section", "constant": "news"},
+        {"target": "source_authority", "constant": "PRIMARY"},
+        {"target": "external_id", "source_path": "record_id"},
+        {"target": "identity_key", "source_path": "record_id"},
+        {"target": "canonical_url", "source_path": "url"},
+        {"target": "title", "source_path": "title"},
+        {"target": "body_text", "source_path": "body_text"},
+        {"target": "body_html", "source_path": "body_html"},
+        {"target": "source_published_at", "source_path": "source_published_at"},
+        {"target": "candidate_status", "constant": "INCLUDE"},
+        {"target": "access_status", "constant": "PUBLIC"},
+        {"target": "selection_rule_id", "constant": "bcse-news-category-v1"},
+        {"target": "selection_rule_version", "constant": "news-passport-v2"},
+        {"target": "selection_reason", "constant": "all publications in the configured news category"},
+        {"target": "selection_evidence", "constant": {"section": "news", "url_prefix": "/press-center/news/"}},
+        {"target": "attachments", "source_path": "attachments"},
+        {"target": "language", "source_path": "language"},
+        {"target": "fetched_at", "source_path": "fetched_at"},
+    ]}
+    graph["settings"]["natural_key_fields"] = ["source_id", "identity_key"]
+    return graph

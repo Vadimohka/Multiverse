@@ -30,7 +30,7 @@ from app.services.preset_compiler import compile_preset
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from workflow_engine import compile_executable_plan, standard_v2_graph
-from app.seed_templates import bcse_market_news_graph
+from app.seed_templates import bcse_market_news_category_graph, bcse_market_news_graph
 
 ROOT = Path(__file__).resolve().parents[4]
 PACK_ROOT = ROOT / "presets" / "belarus-market"
@@ -259,13 +259,15 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
         dataset = datasets[descriptor.dataset_group]
         source = _find_pack_source(db, project.id, descriptor.key)
         if source is None:
-            source = Source(project_id=project.id, name=descriptor.name, source_type="WEB_PAGE", entry_url=descriptor.url, base_url=descriptor.url, fetch_mode="HTTP", settings={"source_key": descriptor.key, "authority": "SECONDARY" if "tg-" in descriptor.key else "PRIMARY", "access": "PUBLIC"})
+            source = Source(project_id=project.id, name=descriptor.name, source_type="WEB_PAGE", entry_url=descriptor.url, base_url=descriptor.url, fetch_mode="PLAYWRIGHT" if descriptor.key in {"news-01", "news-02"} else "HTTP", settings={"source_key": descriptor.key, "authority": "SECONDARY" if "tg-" in descriptor.key else "PRIMARY", "access": "PUBLIC"})
             db.add(source); db.flush()
         elif source.entry_url != descriptor.url:
             # The passports (and their URL overrides) are the pack's canonical
             # entry points; keep an existing source row in sync on re-import.
             source.entry_url = descriptor.url
             source.base_url = descriptor.url
+        if descriptor.key in {"news-01", "news-02"}:
+            source.fetch_mode = "PLAYWRIGHT"
         config = _preset_config(descriptor)
         config_hash = _hash(config)
         latest = db.scalar(select(SourcePresetRevision).where(SourcePresetRevision.project_id == project.id, SourcePresetRevision.slug == descriptor.key).order_by(SourcePresetRevision.revision.desc()))
@@ -280,6 +282,8 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
             graph = (
                 bcse_market_news_graph(source.id, dataset.id, incremental=True)
                 if descriptor.key == "news-01"
+                else bcse_market_news_category_graph(source.id, dataset.id, incremental=True)
+                if descriptor.key == "news-02"
                 else compile_preset(blueprint.graph_json, preset.__dict__).graph
             )
             graph["settings"]["source_id"] = source.id
@@ -307,6 +311,28 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
             # It also keeps the shared calendar endpoint constrained to
             # ``/press-center/releases`` rather than mixing in news cards.
             graph = bcse_market_news_graph(source.id, dataset.id, incremental=True)
+            workflow.graph_json = graph
+            workflow.version += 1
+            workflow.published_version = None
+            workflow.graph_json["settings"]["compiledPlanDigest"] = compile_executable_plan(graph, project_id=project.id, workflow_id=workflow.id, workflow_version=workflow.version, source_id=source.id, revision_refs={"sourcePresetRevisionId": preset.id}).digest
+        elif descriptor.key == "news-02" and (
+            not any(node.get("id") == "crawl" for node in (workflow.graph_json or {}).get("nodes", []))
+            or "/press-center/news/" not in str(
+                next(
+                    (
+                        node.get("config", {}).get("url_pattern", "")
+                        for node in (workflow.graph_json or {}).get("nodes", [])
+                        if node.get("id") == "crawl"
+                    ),
+                    "",
+                )
+            )
+            or "bcse-news-category-v1" not in str((workflow.graph_json or {}).get("nodes", []))
+        ):
+            # NEWS-02 used to be compiled from the generic list/detail
+            # profile.  Repair that legacy row in-place with the reviewed
+            # browser → detail graph and keep the workflow id stable.
+            graph = bcse_market_news_category_graph(source.id, dataset.id, incremental=True)
             workflow.graph_json = graph
             workflow.version += 1
             workflow.published_version = None

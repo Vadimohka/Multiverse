@@ -2,7 +2,7 @@ import asyncio
 from datetime import UTC, datetime
 
 from app.routers.workflow_templates import SYSTEM_TEMPLATES
-from app.seed_templates import bcse_news_graph
+from app.seed_templates import bcse_market_news_category_graph, bcse_news_graph
 from workflow_engine import WorkflowEngine, validate_dag
 from workflow_engine.nodes import CrawlLinksNode, extract_article_record
 from workflow_engine.types import ExecutionContext
@@ -171,6 +171,23 @@ def test_bcse_preset_keeps_listing_pagination_and_detail_api_in_configuration():
     assert record["tags"] == "итоги торгов|фондовый рынок"
     assert record["category"] == "Фондовый рынок"
     assert record["attachments_json"] == '[{"title": "Протокол", "url": "https://www.bcse.by/files/result.pdf"}]'
+
+
+def test_bcse_news_category_graph_isolated_from_releases_with_distinct_provenance():
+    graph = bcse_market_news_category_graph("source-2", "dataset-1", incremental=True)
+    crawl = next(node for node in graph["nodes"] if node["id"] == "crawl")["config"]
+    fields = {field["target"]: field for field in next(node for node in graph["nodes"] if node["id"] == "mapping")["config"]["fields"]}
+
+    assert crawl["listing_url"] == "https://www.bcse.by/press-center/releases"
+    assert crawl["listing_fetch_mode"] == "PLAYWRIGHT"
+    assert crawl["link_selector"] == "#pc-nws-1c a.text-pc[href*='/press-center/news/']"
+    assert crawl["pagination_next_selector"] == "#pc-nws-1 li.paginationjs-next:not(.disabled) a"
+    assert "/press-center/news/" in crawl["url_pattern"]
+    assert "/press-center/releases/" not in crawl["url_pattern"]
+    assert fields["source_id"]["constant"] == "bcse-news"
+    assert fields["source_section"]["constant"] == "news"
+    assert fields["selection_rule_id"]["constant"] == "bcse-news-category-v1"
+    assert fields["selection_evidence"]["constant"]["url_prefix"] == "/press-center/news/"
 
 
 def test_crawler_date_query_parameter_names_are_fully_configurable(monkeypatch):
