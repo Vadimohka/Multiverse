@@ -69,7 +69,7 @@ WORKFLOW_PREFIXES = {
     "news-02": "new-news-02",
     "news-04": "new-news-04",
     "news-05": "new-news-05",
-    "news-06": "new-news-07",
+    "news-06": "new-news-06",
     "news-03": "new-news-03",
 }
 
