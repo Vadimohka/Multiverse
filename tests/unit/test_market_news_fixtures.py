@@ -1,7 +1,9 @@
 import sys
 from datetime import datetime
+from html import escape
 from json import loads
 from pathlib import Path
+from urllib.parse import urljoin
 
 import pytest
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
@@ -12,12 +14,14 @@ from workflow_engine.nodes import (
 )
 from workflow_engine.types import ExecutionContext
 
-
 FIXTURE_HELPERS = Path(__file__).resolve().parents[1] / "fixtures" / "belarus-market"
 sys.path.insert(0, str(FIXTURE_HELPERS))
 
-from news import _fixture_config, run_news_fixture, run_news_fixture_from_files
-
+from news import (  # noqa: E402
+    _fixture_config,
+    run_news_fixture,
+    run_news_fixture_from_files,
+)
 
 DETAIL_URL = "https://www.centraldepo.by/news/public-market-update/"
 LISTING = f"""
@@ -39,6 +43,60 @@ VERIFICATION = loads(
         encoding="utf-8"
     )
 )
+
+
+def _fixture_detail(title: str, body: str) -> str:
+    """Render a sanitized detail response from public listing metadata."""
+    return f"""
+    <!doctype html><html><head>
+      <meta property="article:published_time" content="2026-08-14T09:00:00+03:00">
+    </head><body>
+      <h1>{escape(title)}</h1>
+      <article>{escape(body)}</article>
+    </body></html>
+    """
+
+
+async def _run_sanitized_listing(
+    source_key: str,
+    *fixture_names: str,
+    detail_fixture_name: str | None = None,
+):
+    """Run a compiled profile over retained public listing structures."""
+    source, config = _fixture_config(source_key, WINDOW)
+    selector = config["nodes"]["traverse"]["detail"]["selector"]
+    fixture_bodies = [
+        (FIXTURE_HELPERS / "news" / fixture_name).read_text(encoding="utf-8")
+        for fixture_name in fixture_names
+    ]
+    retained_detail_body = None
+    if detail_fixture_name:
+        detail_soup = BeautifulSoup(
+            (FIXTURE_HELPERS / "news" / detail_fixture_name).read_text(encoding="utf-8"),
+            "lxml",
+        )
+        retained_detail_body = detail_soup.select_one("article").get_text(" ", strip=True)
+    details = {}
+    for fixture_body in fixture_bodies:
+        for link in BeautifulSoup(fixture_body, "lxml").select(selector):
+            url = urljoin(source.url, str(link.get("href") or ""))
+            title = link.get_text(" ", strip=True)
+            details[url] = _fixture_detail(
+                title,
+                str(retained_detail_body or link.get("data-public-summary") or title),
+            )
+    pages = {}
+    pagination = config["nodes"]["traverse"].get("pagination") or {}
+    template = str(pagination.get("urlTemplate") or "")
+    for page_number, fixture_body in enumerate(fixture_bodies[1:], start=2):
+        pages[template.replace("{{page}}", str(page_number))] = fixture_body
+    return await run_news_fixture(
+        source_key,
+        fixture_bodies[0],
+        details,
+        {**WINDOW, "max_pages": len(fixture_bodies)},
+        pages=pages,
+    )
 
 
 def test_unavailable_nbrb_statistics_html_is_not_accepted_fixture_evidence():
@@ -264,3 +322,127 @@ async def test_fixture_runner_reports_repeated_pagination_page():
 
     assert repeated_page.traversal["reconciliation"]["failed"] == 0
     assert "REPEATED_PAGE" in repeated_page.assessment_codes
+
+
+@pytest.mark.asyncio
+async def test_paid_article_keeps_only_public_metadata():
+    """Removing access redaction would expose a commercial article body."""
+    records = (
+        await _run_sanitized_listing(
+            "news-09",
+            "news-09-list.html",
+            detail_fixture_name="news-09-detail.html",
+        )
+    ).records
+    paid = next(record for record in records if record["access_status"] == "PAYWALLED")
+    public = next(record for record in records if record["access_status"] == "PUBLIC")
+
+    assert paid["title"] and paid["canonical_url"]
+    assert paid["body_text"] is None
+    assert paid["body_html"] is None
+    assert public["body_text"] == "Public market analysis excerpt."
+
+
+@pytest.mark.asyncio
+async def test_finance_scope_keeps_decisions_explainable():
+    """Changing rule order or defaults would silently change finance scope."""
+    records = (await _run_sanitized_listing("news-10", "news-10-list.html")).records
+    finance_by_title = {record["title"]: record for record in records}
+
+    assert {record["candidate_status"] for record in records} == {
+        "INCLUDE",
+        "EXCLUDE",
+        "AMBIGUOUS",
+    }
+    assert finance_by_title["Bank deposit promotion"]["candidate_status"] == "EXCLUDE"
+    assert finance_by_title["Government bonds market"]["candidate_status"] == "INCLUDE"
+    assert finance_by_title["Household finance outlook"]["candidate_status"] == "AMBIGUOUS"
+    assert all(record["selection_rule_id"] for record in records)
+    assert all(record["selection_reason"] for record in records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_key", "fixture_name", "expected_title"),
+    [
+        ("news-11", "news-11-list.html", "Securities category report"),
+        ("news-12", "news-12-list.html", "Precious metals category report"),
+        ("news-13", "news-13-list.html", "Analysis category report"),
+    ],
+)
+async def test_myfin_scopes_exclude_global_recommendations(
+    source_key, fixture_name, expected_title
+):
+    """Broadening a scoped selector would leak an unrelated global card."""
+    records = (await _run_sanitized_listing(source_key, fixture_name)).records
+
+    assert [record["title"] for record in records] == [expected_title]
+    assert records[0]["candidate_status"] == "INCLUDE"
+
+
+@pytest.mark.asyncio
+async def test_precious_metal_topics_apply_include_exclude_and_paid_contracts():
+    """A lost topic or access rule would admit noise or expose paid text."""
+    phoenix = await _run_sanitized_listing("news-14", "news-14-list.html")
+    phoenix_by_title = {record["title"]: record for record in phoenix.records}
+    business_times = await _run_sanitized_listing("news-15", "news-15-list.html")
+    business_by_title = {record["title"]: record for record in business_times.records}
+
+    assert phoenix_by_title["Gold recycling outlook"]["candidate_status"] == "INCLUDE"
+    assert phoenix_by_title["Copper recycling outlook"]["candidate_status"] == "EXCLUDE"
+    business_times_paid = business_by_title["Gold market - subscription required"]
+    assert business_times_paid["candidate_status"] == "INCLUDE"
+    assert business_times_paid["access_status"] == "PAYWALLED"
+    assert business_times_paid["body_text"] is None
+    assert business_by_title["Silver market outlook"]["candidate_status"] == "AMBIGUOUS"
+
+
+@pytest.mark.asyncio
+async def test_texmetals_non_repeating_pages_keep_unique_article_identities():
+    """Losing page/frontier dedupe would emit one article observation twice."""
+    texmetals = await _run_sanitized_listing(
+        "news-16", "news-16-page-1.html", "news-16-page-2.html"
+    )
+
+    assert texmetals.pagination.visited_pages == 2
+    assert texmetals.traversal["stop_reason"] == "MAX_PAGES"
+    assert len(texmetals.records) == 3
+    assert len(texmetals.records) == len(
+        {record["identity_key"] for record in texmetals.records}
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_key", "fixture_refs"),
+    [
+        (
+            "news-09",
+            [
+                "tests/fixtures/belarus-market/news/news-09-list.html",
+                "tests/fixtures/belarus-market/news/news-09-detail.html",
+            ],
+        ),
+        ("news-10", ["tests/fixtures/belarus-market/news/news-10-list.html"]),
+        ("news-11", ["tests/fixtures/belarus-market/news/news-11-list.html"]),
+        ("news-12", ["tests/fixtures/belarus-market/news/news-12-list.html"]),
+        ("news-13", ["tests/fixtures/belarus-market/news/news-13-list.html"]),
+        ("news-14", ["tests/fixtures/belarus-market/news/news-14-list.html"]),
+        ("news-15", ["tests/fixtures/belarus-market/news/news-15-list.html"]),
+        (
+            "news-16",
+            [
+                "tests/fixtures/belarus-market/news/news-16-page-1.html",
+                "tests/fixtures/belarus-market/news/news-16-page-2.html",
+            ],
+        ),
+    ],
+)
+def test_commercial_fixture_references_remain_draft_after_anonymous_live_check(
+    source_key, fixture_refs
+):
+    """Fixture evidence must not silently promote a source or claim an operator run."""
+    evidence = VERIFICATION[source_key]
+
+    assert evidence["status"] == "DRAFT"
+    assert evidence["fixture_refs"] == fixture_refs
+    assert evidence["live_smoke"]["result"] == "PENDING_OPERATOR_SMOKE"
