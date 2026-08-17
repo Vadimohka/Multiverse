@@ -67,11 +67,12 @@ async def test_fixture_runner_reports_partial_detail_failure():
 async def test_fixture_runner_reports_repeated_pagination_page():
     """Removing generic frontier loop protection would allow a repeated page."""
     listing = """
-    <section id="newsData"><a rel="next" href="https://www.nbrb.by/press/">Следующая</a></section>
+    <section id="newsData"><a rel="next" href="https://www.nbrb.by/news/statistics">Следующая</a></section>
     """
 
     repeated_page = await run_news_fixture(
         "news-05", listing, {}, {**WINDOW, "max_pages": 2}
     )
 
+    assert repeated_page.traversal["reconciliation"]["failed"] == 0
     assert "REPEATED_PAGE" in repeated_page.assessment_codes

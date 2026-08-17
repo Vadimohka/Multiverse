@@ -86,3 +86,33 @@ source key or hostname branch.
   test.
 - The full-detail case verifies body content, source-local publication time,
   provenance state, and `PASS` assurance.
+
+## Review fix — repeated-page fixture
+
+Review identified that the NEWS-05 repeated-page fixture linked to
+`https://www.nbrb.by/press/`, not the profile's listing URL
+`https://www.nbrb.by/news/statistics`. The fixture transport correctly returned
+404 for that unsupplied URL, so the prior test could report `REPEATED_PAGE`
+only after a pagination fetch failure.
+
+### RED evidence
+
+Added `assert repeated_page.traversal["reconciliation"]["failed"] == 0` while
+the fixture still used the incorrect `/press/` URL:
+
+```text
+pytest -q tests/unit/test_market_news_fixtures.py -k repeated_pagination_page
+FAILED: assert 1 == 0
+```
+
+### Fix and GREEN evidence
+
+Changed the next link to the actual NEWS-05 source URL. That route is served by
+the fixture transport as the listing response, so Traverse sees a previously
+visited successful page and exercises the generic `REPEATED_PAGE` guard without
+a fetch error.
+
+```text
+pytest -q tests/unit/test_market_news_fixtures.py -k repeated_pagination_page
+1 passed
+```
