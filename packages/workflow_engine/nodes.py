@@ -810,7 +810,11 @@ class CrawlLinksNode:
                     artifact: dict[str, Any] | None = None
                     if config.get("save_artifacts", True):
                         artifact_id = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(candidate["record_id"]))
-                        artifact = await store_artifact(context, artifact_content, artifact_content_type, detail_url, f"{artifact_id}.json" if "json" in artifact_content_type else f"{artifact_id}.html", "raw_article")
+                        detail_suffix = Path(urlsplit(detail_url).path).suffix.lower()
+                        if detail_suffix not in {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".zip"}:
+                            detail_suffix = ".json" if "json" in artifact_content_type else ".html"
+                        filename = artifact_id if artifact_id.lower().endswith(detail_suffix) else f"{artifact_id}{detail_suffix}"
+                        artifact = await store_artifact(context, artifact_content, artifact_content_type, detail_url, filename, "raw_article")
                     fetched_candidate = {**candidate, "fetched_at": datetime.now(UTC).isoformat()}
                     record = extract_article_record(detail_html, detail_url, fetched_candidate, config, artifact)
                     await enrich_record_related_resources(
@@ -2452,6 +2456,23 @@ def extract_article_record(
     artifact: dict[str, Any] | None,
 ) -> dict[str, Any]:
     soup = BeautifulSoup(page_html, "lxml")
+    direct_document = bool(config.get("direct_document_record")) and Path(urlsplit(page_url).path).suffix.lower() in {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".zip"}
+    if direct_document:
+        listing_item = candidate.get("item") if isinstance(candidate.get("item"), dict) else {}
+        title = clean_inline_text(str(listing_item.get("title") or Path(urlsplit(page_url).path).name))
+        attachment = {"title": title or Path(urlsplit(page_url).path).name, "url": canonical_url(page_url)}
+        record = {
+            "record_id": candidate.get("record_id") or hashlib.sha256(canonical_url(page_url).encode("utf-8")).hexdigest()[:20],
+            "title": title, "published_at": "", "url": canonical_url(page_url),
+            "body_text": title, "body_html": f"<p>{escape(title)}</p>", "tags": "",
+            "attachments": [attachment], "attachments_json": json.dumps([attachment], ensure_ascii=False),
+            "language": str(config.get("language") or ""), "source_name": str(config.get("source_name") or ""),
+            "fetched_at": candidate.get("fetched_at") or datetime.now(UTC).isoformat(),
+            "observed_at": datetime.now(UTC).isoformat(),
+        }
+        if artifact:
+            record["__provenance"] = {"raw_artifact": artifact}
+        return record
     detail_fields = config.get("detail_fields")
     if isinstance(detail_fields, list):
         record: dict[str, Any] = {"record_id": candidate.get("record_id") or hashlib.sha256(canonical_url(page_url).encode()).hexdigest()[:20]}
@@ -2615,6 +2636,7 @@ def extract_article_record(
         "body_text": body_text,
         "body_html": body_html,
         "tags": "|".join(tags),
+        "attachments": attachments,
         "attachments_json": json.dumps(attachments, ensure_ascii=False),
         "language": str(config.get("language") or (soup.html or {}).get("lang") or "").split("-", 1)[0],
         "source_name": str(config.get("source_name") or candidate.get("item", {}).get("source_name") or ""),
@@ -2768,6 +2790,18 @@ def parse_downloaded_document(data: bytes, filename: str) -> dict[str, Any]:
     if suffix == ".csv":
         text = data.decode("utf-8-sig", errors="replace")
         return {"type": "CSV", "filename": filename, "rows": list(csv.reader(io.StringIO(text)))}
+    if suffix == ".pdf":
+        # Keep text and page boundaries: a linked public PDF remains useful in
+        # data exports even when a heavyweight layout parser is not installed.
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(data))
+        pages = [{"page": index + 1, "text": reader.pages[index].extract_text() or ""} for index in range(len(reader.pages))]
+        return {
+            "type": "PDF", "parser": "PYPDF", "filename": filename,
+            "pages": pages, "page_count": len(pages),
+            "text": "\n".join(page["text"] for page in pages),
+            "tables": [], "evidence": {"filename": filename},
+        }
     return {"type": suffix.lstrip(".").upper() or "BINARY", "filename": filename, "size": len(data)}
 
 

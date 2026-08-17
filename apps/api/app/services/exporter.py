@@ -95,6 +95,13 @@ def _append_attachments_sheet(wb: Workbook, records: list[dict[str, Any]]) -> No
             if not isinstance(attachment, dict):
                 continue
             document = attachment.get("document") if isinstance(attachment.get("document"), dict) else {}
+            for page in document.get("pages") or []:
+                if isinstance(page, dict) and page.get("text"):
+                    output.append({
+                        **_base_row(record), "attachment_title": attachment.get("title"),
+                        "attachment_url": attachment.get("url"), "filename": document.get("filename"),
+                        "document_page": page.get("page"), "document_text": page.get("text"),
+                    })
             for sheet in document.get("sheets") or []:
                 if not isinstance(sheet, dict):
                     continue

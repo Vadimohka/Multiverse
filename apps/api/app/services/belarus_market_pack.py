@@ -34,6 +34,7 @@ from app.seed_templates import (
     bcse_home_market_news_graph,
     bcse_market_news_category_graph,
     bcse_market_news_graph,
+    economy_actual_information_graph,
     nbrb_market_press_graph,
     nbrb_market_statistics_graph,
 )
@@ -68,6 +69,7 @@ WORKFLOW_PREFIXES = {
     "news-02": "new-news-02",
     "news-04": "new-news-04",
     "news-05": "new-news-05",
+    "news-06": "new-news-07",
     "news-03": "new-news-03",
 }
 
@@ -278,17 +280,6 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
         membership.required = False
         if membership.workflow_id and (workflow := db.get(Workflow, membership.workflow_id)):
             workflow.is_active = False
-    # NEWS-03 was briefly bootstrapped under an indicator-only key. Keep those
-    # rows auditable, but retire them when the canonical NEWS-03 bootstrap is
-    # installed so the UI cannot run two copies of the same BCSE collection.
-    for membership in db.scalars(
-        select(DatasetSourceMembership).where(DatasetSourceMembership.source_key == "indicator-bcse-home")
-    ):
-        membership.required = False
-        if membership.workflow_id and (workflow := db.get(Workflow, membership.workflow_id)):
-            workflow.is_active = False
-            for schedule in db.scalars(select(Schedule).where(Schedule.workflow_id == workflow.id)).all():
-                schedule.enabled = False
     # NEWS-03 belongs to ``Новости рынка``. A historical bootstrap bound the
     # same source key to ``Рыночные индикаторы``; leave that row visible for
     # audit, but never treat it as a required membership.
@@ -344,6 +335,8 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
                 if descriptor.key == "news-05"
                 else bcse_home_market_news_graph(source.id, dataset.id, incremental=True)
                 if descriptor.key == "news-03"
+                else economy_actual_information_graph(source.id, dataset.id, incremental=True)
+                if descriptor.key == "news-06"
                 else compile_preset(blueprint.graph_json, preset.__dict__).graph
             )
             graph["settings"]["source_id"] = source.id
@@ -454,6 +447,19 @@ def install_belarus_market_pack(db: Session, admin: User) -> dict[str, int]:
             # Keep an existing source and membership stable while upgrading a
             # pre-bootstrap or obsolete graph to the reviewed home-page parser.
             graph = bcse_home_market_news_graph(source.id, dataset.id, incremental=True)
+            workflow.graph_json = graph
+            workflow.version += 1
+            workflow.published_version = None
+            workflow.graph_json["settings"]["compiledPlanDigest"] = compile_executable_plan(graph, project_id=project.id, workflow_id=workflow.id, workflow_version=workflow.version, source_id=source.id, revision_refs={"sourcePresetRevisionId": preset.id}).digest
+        elif descriptor.key == "news-06" and (
+            not any(node.get("id") == "crawl" for node in (workflow.graph_json or {}).get("nodes", []))
+            or "https://economy.gov.by/ru/aktualnaya-informatsiya-ru/" not in str(next((node.get("config", {}).get("listing_url", "") for node in (workflow.graph_json or {}).get("nodes", []) if node.get("id") == "crawl"), ""))
+            or "main article a[href]" not in str(next((node.get("config", {}).get("link_selector", "") for node in (workflow.graph_json or {}).get("nodes", []) if node.get("id") == "crawl"), ""))
+            or not bool(next((node.get("config", {}).get("direct_document_record", False) for node in (workflow.graph_json or {}).get("nodes", []) if node.get("id") == "crawl"), False))
+            or "economy-actual-all-v1" not in str((workflow.graph_json or {}).get("nodes", []))
+            or not (((workflow.graph_json or {}).get("settings", {}).get("review_policy") or {}).get("changed") is False)
+        ):
+            graph = economy_actual_information_graph(source.id, dataset.id, incremental=True)
             workflow.graph_json = graph
             workflow.version += 1
             workflow.published_version = None

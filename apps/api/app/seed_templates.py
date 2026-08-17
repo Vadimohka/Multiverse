@@ -329,6 +329,48 @@ def bcse_home_market_news_graph(source_id: str, dataset_id: str, *, incremental:
     return graph
 
 
+def economy_actual_information_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
+    """Collect every article and direct file linked from MinEconomy's section."""
+    crawl_config = {
+        "listing_url": "https://economy.gov.by/ru/aktualnaya-informatsiya-ru/",
+        "base_url": "https://economy.gov.by/",
+        "listing_fetch_mode": "HTTP",
+        "link_selector": "main article a[href]",
+        "url_pattern": r"/(?:ru/[^?#]+|uploads/files/[^?#]+)$",
+        "same_origin_only": True, "max_items": 5000, "max_pages": 5000,
+        "concurrency": 4, "delay_ms": 100, "request_retries": 2,
+        "request_timeout": 45, "timeout": 900, "detail_fetch_mode": "HTTP",
+        "direct_document_record": True,
+        "attachment_documents": {"enabled": True, "max_files": 50, "extensions": [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".zip"]},
+        "language": "ru", "source_name": "Министерство экономики", "save_artifacts": True,
+    }
+    mapping_fields = [
+        {"target": "source_id", "constant": "ministry-economy"}, {"target": "source_name", "constant": "Министерство экономики"},
+        {"target": "source_section", "constant": "actual-information"}, {"target": "source_authority", "constant": "PRIMARY"},
+        {"target": "external_id", "source_path": "record_id"}, {"target": "identity_key", "source_path": "record_id"},
+        {"target": "canonical_url", "source_path": "url"}, {"target": "title", "source_path": "title"},
+        {"target": "body_text", "source_path": "body_text"}, {"target": "body_html", "source_path": "body_html"},
+        {"target": "candidate_status", "constant": "INCLUDE"}, {"target": "access_status", "constant": "PUBLIC"},
+        {"target": "selection_rule_id", "constant": "economy-actual-all-v1"}, {"target": "selection_rule_version", "constant": "news-passport-v2"},
+        {"target": "selection_reason", "constant": "all public articles and linked files in the configured actual-information section"},
+        {"target": "selection_evidence", "constant": {"section_url": "https://economy.gov.by/ru/aktualnaya-informatsiya-ru/", "selector": "main article a[href]"}},
+        {"target": "attachments", "source_path": "attachments"}, {"target": "language", "source_path": "language"},
+        {"target": "fetched_at", "source_path": "fetched_at"}, {"target": "observed_at", "source_path": "observed_at"},
+    ]
+    return {
+        "version": 1,
+        "settings": {"source_id": source_id, "dataset_id": dataset_id, "natural_key_fields": ["source_id", "identity_key"], "review_policy": {"new": False, "changed": False, "confidence_below": 0.8}},
+        "nodes": [
+            {"id": "trigger", "type": "manual_trigger", "position": {"x": 30, "y": 180}, "config": {}},
+            {"id": "crawl", "type": "crawl_links", "position": {"x": 280, "y": 180}, "config": crawl_config},
+            {"id": "mapping", "type": "mapping", "position": {"x": 590, "y": 180}, "config": {"input_path": "records", "fields": mapping_fields}},
+            {"id": "validate", "type": "validate", "position": {"x": 850, "y": 180}, "config": {"input_path": "records", "required": ["source_id", "source_name", "canonical_url", "title", "candidate_status", "access_status"], "fail_on_error": True}},
+            {"id": "output", "type": "output", "position": {"x": 1120, "y": 180}, "config": {"input_path": "records", "name": "market_news"}},
+        ],
+        "edges": [{"id": "e1", "source": "trigger", "target": "crawl"}, {"id": "e2", "source": "crawl", "target": "mapping"}, {"id": "e3", "source": "mapping", "target": "validate"}, {"id": "e4", "source": "validate", "target": "output"}],
+    }
+
+
 def nbrb_market_press_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
     """NBRB press-release graph for the shared market-news dataset.
 
