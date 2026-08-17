@@ -14,6 +14,7 @@ from app.models import (
     Record,
     RecordObservation,
     RecordVersion,
+    ReviewTask,
     Run,
     Source,
     Workflow,
@@ -123,6 +124,34 @@ def test_unchanged_record_is_present_in_latest_successful_run(client, auth):
     ).json()
     assert len(history["items"]) == 2
     assert len({item["record_version_id"] for item in history["items"]}) == 1
+
+
+def test_clear_dataset_records_removes_review_tasks_and_record_history(client, auth):
+    dataset, _, first_run, _ = create_observed_dataset(
+        client, auth, source_published_at="2026-08-10T12:34:56Z"
+    )
+    with SessionLocal() as db:
+        record = db.scalar(select(Record).where(Record.dataset_id == dataset["id"]))
+        assert record is not None
+        db.add(
+            ReviewTask(
+                project_id=dataset["project_id"],
+                record_id=record.id,
+                run_id=first_run["id"],
+                reason="CHANGED_RECORD",
+            )
+        )
+        db.commit()
+
+    response = client.delete(f"/api/v1/datasets/{dataset['id']}/records", headers=auth)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"removed_records": 1}
+    with SessionLocal() as db:
+        assert db.scalar(select(Record).where(Record.dataset_id == dataset["id"])) is None
+        assert db.scalar(select(RecordVersion).where(RecordVersion.record_id == record.id)) is None
+        assert db.scalar(select(RecordObservation).where(RecordObservation.record_id == record.id)) is None
+        assert db.scalar(select(ReviewTask).where(ReviewTask.record_id == record.id)) is None
 
 
 def test_coverage_reports_expected_sources_and_evidence_is_opt_in(client, auth):

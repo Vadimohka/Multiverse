@@ -1,5 +1,6 @@
 import base64
 import io
+from datetime import datetime
 
 import pytest
 from openpyxl import Workbook
@@ -16,8 +17,10 @@ from workflow_engine.nodes import (
     TransformNode,
     ValidateNode,
     collect_paginated_html,
+    build_url_frontier,
     dedupe_extracted_records,
     extract_article_record,
+    parse_downloaded_document,
 )
 from workflow_engine.types import ExecutionContext
 
@@ -225,6 +228,71 @@ def test_compatibility_article_extractor_uses_standard_semantics_only():
     assert record["url"] == "https://news.example.test/releases/42"
     assert record["body_text"] == "First paragraph.\n\nSecond paragraph.\n\nRules"
     assert record["attachments_json"] == '[{"title": "Rules", "url": "https://news.example.test/files/rules.pdf"}]'
+
+
+def test_nbrb_table_extraction_is_structured_and_keeps_values():
+    record = extract_article_record(
+        """<main><h1>Rates</h1><table><thead><tr><th>Показатель</th><th>Июль</th></tr></thead><tbody><tr><td>Новые кредиты</td><td>10,04</td></tr></tbody></table></main>""",
+        "https://example.test/statistics/rates",
+        {"record_id": "rates", "item": {}},
+        {"detail_fields": [{"name": "title", "selector": "h1"}, {"name": "tables", "selector": "main table", "multiple": True, "value": "structured_tables"}]},
+        None,
+    )
+    assert record["tables"][0]["rows"] == [{"Показатель": "Новые кредиты", "Июль": "10,04"}]
+
+
+def test_attachment_links_use_explicit_publisher_base_url():
+    record = extract_article_record(
+        """<main><h1>Rates</h1><a href='statistics/financialmarkets/avgintratesdyn/2026_ru.xlsx'>2026</a></main>""",
+        "https://www.nbrb.by/statistics/financialmarkets/avgintratesdyn",
+        {"record_id": "rates", "item": {}},
+        {
+            "attachment_base_url": "https://www.nbrb.by/",
+            "detail_fields": [{"name": "title", "selector": "h1"}, {"name": "attachments", "selector": "main a", "multiple": True, "value": "links"}],
+        },
+        None,
+    )
+    assert record["attachments"][0]["url"] == "https://www.nbrb.by/statistics/financialmarkets/avgintratesdyn/2026_ru.xlsx"
+
+
+def test_frontier_title_patterns_filter_before_detail_fetches():
+    frontier = build_url_frontier(
+        [
+            {"url": "/statistics/financialmarkets/avgintratesdyn", "title": "Сведения о средних процентных ставках кредитно-депозитного рынка Республики Беларусь"},
+            {"url": "/statistics/creditdepositmarketrates", "title": "Динамика ставок кредитно-депозитного рынка"},
+        ],
+        base_url="https://www.nbrb.by/",
+        origin_url="https://www.nbrb.by/news/statistics",
+        url_path="url",
+        config={"frontier_title_patterns": ["Сведения о средних процентных ставках кредитно-депозитного рынка"]},
+        limit=10,
+    )
+    assert [candidate["url"] for candidate in frontier] == ["https://www.nbrb.by/statistics/financialmarkets/avgintratesdyn"]
+
+
+def test_downloaded_xlsx_is_preserved_sheet_by_sheet():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "2026"
+    sheet.append(["Показатель", "Июль"])
+    sheet.append(["Новые кредиты", 10.04])
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    parsed = parse_downloaded_document(buffer.getvalue(), "rates.xlsx")
+    assert parsed["type"] == "XLSX"
+    assert parsed["sheets"][0]["rows"][1] == ["Новые кредиты", 10.04]
+
+
+def test_downloaded_xlsx_converts_excel_dates_to_json_safe_values():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append([datetime(2026, 8, 17, 12, 30)])
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+
+    parsed = parse_downloaded_document(buffer.getvalue(), "rates.xlsx")
+
+    assert parsed["sheets"][0]["rows"] == [["2026-08-17T12:30:00"]]
 
 
 @pytest.mark.asyncio

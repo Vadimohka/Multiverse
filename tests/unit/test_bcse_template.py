@@ -2,7 +2,7 @@ import asyncio
 from datetime import UTC, datetime
 
 from app.routers.workflow_templates import SYSTEM_TEMPLATES
-from app.seed_templates import bcse_news_graph
+from app.seed_templates import bcse_home_market_news_graph, bcse_market_news_category_graph, bcse_news_graph
 from workflow_engine import WorkflowEngine, validate_dag
 from workflow_engine.nodes import CrawlLinksNode, extract_article_record
 from workflow_engine.types import ExecutionContext
@@ -171,6 +171,62 @@ def test_bcse_preset_keeps_listing_pagination_and_detail_api_in_configuration():
     assert record["tags"] == "итоги торгов|фондовый рынок"
     assert record["category"] == "Фондовый рынок"
     assert record["attachments_json"] == '[{"title": "Протокол", "url": "https://www.bcse.by/files/result.pdf"}]'
+
+
+def test_bcse_news_category_graph_isolated_from_releases_with_distinct_provenance():
+    graph = bcse_market_news_category_graph("source-2", "dataset-1", incremental=True)
+    crawl = next(node for node in graph["nodes"] if node["id"] == "crawl")["config"]
+    fields = {field["target"]: field for field in next(node for node in graph["nodes"] if node["id"] == "mapping")["config"]["fields"]}
+
+    assert crawl["listing_url"] == "https://www.bcse.by/press-center/releases"
+    assert crawl["listing_fetch_mode"] == "PLAYWRIGHT"
+    assert crawl["link_selector"] == "#pc-nws-1c a.text-pc[href*='/press-center/news/']"
+    assert crawl["pagination_next_selector"] == "#pc-nws-1 li.paginationjs-next:not(.disabled) a"
+    assert "/press-center/news/" in crawl["url_pattern"]
+    assert "/press-center/releases/" not in crawl["url_pattern"]
+    assert fields["source_id"]["constant"] == "bcse-news"
+    assert fields["source_section"]["constant"] == "news"
+    assert fields["selection_rule_id"]["constant"] == "bcse-news-category-v1"
+    assert fields["selection_evidence"]["constant"]["url_prefix"] == "/press-center/news/"
+
+
+def test_bcse_home_market_news_graph_targets_only_currency_and_repo_widgets():
+    graph = bcse_home_market_news_graph("source-3", "dataset-2", incremental=True)
+    assert validate_dag(graph) == []
+    nodes = {node["id"]: node for node in graph["nodes"]}
+    browser = nodes["browser"]["config"]
+    extract = nodes["extract"]["config"]
+    assert browser["url"] == "https://www.bcse.by/"
+    assert extract["container_selector"] == "#currency .inf-instrument, #repo-body .inf-wrap"
+    fields = {field["target"]: field for field in nodes["mapping"]["config"]["fields"]}
+    assert fields["source_id"]["constant"] == "bcse-currency-repo-news"
+    assert fields["selection_rule_id"]["constant"] == "bcse-currency-and-byn-repo-v1"
+    assert nodes["output"]["config"]["name"] == "market_news"
+
+
+def test_bcse_home_repo_widget_extracts_typed_row():
+    from workflow_engine.nodes import ExtractRepeatingListNode
+
+    html = """
+    <div id='currency'><div class='inf-instrument'><a class='text-asfalt'>USD/BYN_TOD</a><div class='inf-date'>13:00</div><div class='w-60p'><span class='text-asfalt'>3.0131</span></div><div class='w-50p'><span class='text-right'>+0.75%</span><span>+0.0225</span></div></div></div>
+    <div id='repo-body'><div class='inf-wrap'><span class='inf-name'>1-3 дней</span><span class='inf-repo-percent'>4%</span><span class='inf-repo-date'>12:16</span></div></div>
+    """
+    result = asyncio.run(ExtractRepeatingListNode().execute(
+        ExecutionContext(run_id="run", project_id="p", workflow_version_id="v"),
+        {"html": html},
+        {"input_path": "html", "container_selector": "#currency .inf-instrument, #repo-body .inf-wrap", "fields": [
+            {"name": "label", "selector": "a.text-asfalt, .inf-name"},
+            {"name": "value_raw", "selector": ".w-60p .text-asfalt, .inf-repo-percent"},
+            {"name": "observed_source", "selector": ".inf-date, .inf-repo-date"},
+            {"name": "change_percent_raw", "selector": ".w-50p > .text-right:first-child"},
+            {"name": "change_absolute_raw", "selector": ".w-50p span"},
+        ]},
+    ))
+    assert result["count"] == 2
+    assert result["records"][0]["label"] == "USD/BYN_TOD"
+    assert result["records"][0]["value_raw"] == "3.0131"
+    assert result["records"][1]["label"] == "1-3 дней"
+    assert result["records"][1]["value_raw"] == "4%"
 
 
 def test_crawler_date_query_parameter_names_are_fully_configurable(monkeypatch):

@@ -9,7 +9,7 @@
     "body_text": {"type": ["string", "null"]}, "body_html": {"type": ["string", "null"]}, "source_published_at": {"type": ["string", "null"], "format": "date-time"}, "source_modified_at": {"type": ["string", "null"], "format": "date-time"},
     "candidate_status": {"enum": ["INCLUDE", "EXCLUDE", "AMBIGUOUS"]}, "access_status": {"enum": ["PUBLIC", "PAYWALLED", "ACCESS_LIMITED"]},
     "selection_rule_id": {"type": ["string", "null"]}, "selection_rule_version": {"type": ["string", "null"]}, "selection_reason": {"type": ["string", "null"]}, "selection_evidence": {"type": ["object", "null"]},
-    "access_evidence": {"type": ["object", "null"]}, "attachments": {"type": "array", "items": {"type": "object"}},
+    "access_evidence": {"type": ["object", "null"]}, "tables": {"type": "array", "items": {"type": "object"}}, "attachments": {"type": "array", "items": {"type": "object"}}, "official_api": {"type": ["object", "null"]}, "related_resource_errors": {"type": "array", "items": {"type": "object"}},
     "language": {"type": ["string", "null"]}, "fetched_at": {"type": ["string", "null"], "format": "date-time"}, "observed_at": {"type": ["string", "null"], "format": "date-time"},
     "evidence_ref": {"type": ["string", "null"]}, "content_hash": {"type": ["string", "null"]}
   }

@@ -46,8 +46,8 @@ def test_passport_registry_covers_every_required_source_and_corrected_routes():
     assert len(sources) == 60
     assert len([item for item in sources.values() if item.group == "legal"]) == 21
     assert len([item for item in sources.values() if item.group == "retail"]) == 20
-    assert len([item for item in sources.values() if item.dataset_group == "news"]) == 15
-    assert len([item for item in sources.values() if item.dataset_group == "indicators"]) == 4
+    assert len([item for item in sources.values() if item.dataset_group == "news"]) == 16
+    assert len([item for item in sources.values() if item.dataset_group == "indicators"]) == 3
     assert sources["indicator-nbrb-refinancing"].url == "https://www.nbrb.by/statistics/MonetaryPolicyInstruments/RefinancingRate"
     assert sources["indicator-nbrb-daily-rates"].url == "https://www.nbrb.by/statistics/rates/ratesDaily"
     assert sources["indicator-nbrb-precious-metals"].url == "https://www.nbrb.by/statistics/valuables/bankingots"
@@ -115,8 +115,9 @@ def test_pack_installer_is_idempotent_and_creates_per_source_workflows(client):
     assert presets >= 57
     assert len(schedules) == 60
     assert {item.timezone for item in schedules} == {"Europe/Minsk"}
-    assert sum(item.cron == "0 8 * * 1" for item in schedules) == 45
+    assert sum(item.cron == "0 8 * * 1" for item in schedules) == 44
     assert sum(item.cron == "0 8 * * 1-5" for item in schedules) == 15
+    assert sum(item.cron == "*/30 9-18 * * 1-5" for item in schedules) == 1
     assert sum(item.enabled for item in schedules) == 1
 
 
