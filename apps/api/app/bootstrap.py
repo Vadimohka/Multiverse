@@ -10,6 +10,7 @@ from app.seed_templates import (
     DEPOSIT_SYSTEM_PROMPT,
     bcse_news_graph,
 )
+from app.services.belarus_market_pack import install_belarus_market_pack
 
 
 def seed(db: Session) -> None:
@@ -24,6 +25,11 @@ def seed(db: Session) -> None:
         )
         db.add(admin)
         db.flush()
+    # The market-news project is a first-class bootstrap, not a manual
+    # post-deployment import.  The installer is idempotent: it preserves
+    # existing rows and creates a new immutable preset revision only when its
+    # declarative source configuration changes.
+    install_belarus_market_pack(db, admin)
     ensure_bcse_news_preset(db, admin)
     project = db.scalar(select(Project).where(Project.slug == "demo-bank-deposits"))
     if project:

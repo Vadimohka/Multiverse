@@ -31,11 +31,9 @@ class FetchPolicy:
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> FetchPolicy:
-        timeout = float(
-            config.get("request_timeout", config.get("timeout", config.get("listing_timeout", 30)))
-        )
-        retries = int(config.get("request_retries", config.get("retries", 2)))
-        backoff = float(config.get("retry_backoff_seconds", 0.5))
+        timeout = float(config.get("request_timeout") or config.get("timeout") or config.get("listing_timeout") or 30)
+        retries = int(config.get("request_retries") or config.get("retries") or 2)
+        backoff = float(config.get("retry_backoff_seconds") or 0.5)
         raw_statuses = config.get("retry_statuses", DEFAULT_RETRY_STATUSES)
         statuses = tuple(int(value) for value in raw_statuses)
         if not 0 < timeout <= 300:

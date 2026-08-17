@@ -82,7 +82,10 @@ def bcse_news_graph(source_id: str, dataset_id: str, *, incremental: bool = Fals
             "not_found_path": "solo.notFound",
         },
         "url_path": "url",
-        "url_pattern": r"/press-center/(?:news|releases)/(?P<record_id>(?:n|pr)[^/?#]+)/(?P<publication_time>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})$",
+        # The calendar endpoint is shared by the releases and news feeds.
+        # Keep the frontier constrained to the requested releases section;
+        # otherwise it quietly returns cards from ``/press-center/news`` too.
+        "url_pattern": r"/press-center/releases/(?P<record_id>pr[^/?#]+)/(?P<publication_time>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})$",
         "max_items": 5000, "concurrency": 6, "delay_ms": 150, "request_retries": 2, "request_timeout": 45, "timeout": 900,
         "headers": {"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5"},
         "detail_fields": [
@@ -115,3 +118,52 @@ def bcse_news_graph(source_id: str, dataset_id: str, *, incremental: bool = Fals
             {"id": "e4", "source": "validate", "target": "output"},
         ],
     }
+
+
+def bcse_market_news_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
+    """BCSE press-release crawler mapped into the shared market-news schema.
+
+    The public releases page is an HTML shell; its cards are rendered by the
+    browser and the full publication is returned by ``/solo/calendar``.  Keep
+    that source-specific configuration in this bootstrap preset while the
+    execution engine remains generic.
+    """
+    graph = bcse_news_graph(source_id, dataset_id, incremental=incremental)
+    crawl = next(node for node in graph["nodes"] if node["id"] == "crawl")["config"]
+    for field in crawl.get("detail_fields", []):
+        if field.get("name") == "attachments_json":
+            field["name"] = "attachments"
+    mapping_fields = [
+        {"target": "source_id", "constant": "bcse-releases"},
+        {"target": "source_name", "constant": "БВФБ / пресс-релизы"},
+        {"target": "source_section", "constant": "press-releases"},
+        {"target": "source_authority", "constant": "PRIMARY"},
+        {"target": "external_id", "source_path": "record_id"},
+        {"target": "identity_key", "source_path": "record_id"},
+        {"target": "canonical_url", "source_path": "url"},
+        {"target": "title", "source_path": "title"},
+        {"target": "body_text", "source_path": "body_text"},
+        {"target": "body_html", "source_path": "body_html"},
+        {"target": "source_published_at", "source_path": "source_published_at"},
+        {"target": "candidate_status", "constant": "INCLUDE"},
+        {"target": "access_status", "constant": "PUBLIC"},
+        {"target": "selection_rule_id", "constant": "bcse-releases-all-v1"},
+        {"target": "selection_rule_version", "constant": "news-passport-v2"},
+        {"target": "selection_reason", "constant": "all publications in the configured press-releases section"},
+        {"target": "selection_evidence", "constant": {"section": "press-releases"}},
+        {"target": "attachments", "source_path": "attachments"},
+        {"target": "language", "source_path": "language"},
+        {"target": "fetched_at", "source_path": "fetched_at"},
+    ]
+    mapping = next(node for node in graph["nodes"] if node["id"] == "mapping")
+    mapping["config"] = {"input_path": "records", "fields": mapping_fields}
+    validate = next(node for node in graph["nodes"] if node["id"] == "validate")
+    validate["config"] = {
+        "input_path": "records",
+        "required": ["source_id", "source_name", "canonical_url", "title", "candidate_status", "access_status"],
+        "fail_on_error": True,
+    }
+    output = next(node for node in graph["nodes"] if node["id"] == "output")
+    output["config"] = {"input_path": "records", "name": "market_news"}
+    graph["settings"]["natural_key_fields"] = ["source_id", "identity_key"]
+    return graph

@@ -255,7 +255,7 @@ async def collect_paginated_html(
     descriptors = await discover_tab_descriptors(page) if tabs_enabled else []
     if descriptors:
         sections: list[str] = []
-        wait_ms = int(config.get("tabs_wait_ms", config.get("pagination_wait_ms", 500)))
+        wait_ms = int(config.get("tabs_wait_ms") or config.get("pagination_wait_ms") or 500)
 
         async def visit(path: list[dict[str, str]]) -> None:
             try:
@@ -271,7 +271,7 @@ async def collect_paginated_html(
                 current_depth = int(path[-1].get("scope_depth") or 0)
                 path_keys = {tab_descriptor_key(item) for item in path}
                 children = [item for item in visible if int(item.get("scope_depth") or 0) > current_depth and tab_descriptor_key(item) not in path_keys]
-                if children and len(path) < int(config.get("tabs_max_depth", 4)):
+                if children and len(path) < int(config.get("tabs_max_depth") or 4):
                     for child in children:
                         await visit(path + [child])
                 else:
@@ -354,7 +354,7 @@ async def collect_current_paginated_html(
     """Collect the current tab through visible pagination controls."""
     if not config.get("pagination_enabled"):
         return await page.content()
-    max_pages = min(max(int(config.get("pagination_max_pages", 25)), 1), 500)
+    max_pages = min(max(int(config.get("pagination_max_pages") or 25), 1), 500)
     selector = str(config.get("pagination_next_selector") or "li[aria-label='Next page'] a")
     rendered_pages: list[str] = []
     seen_signatures: set[str] = set()
@@ -392,7 +392,7 @@ async def collect_current_paginated_html(
             break
         try:
             await next_link.click(timeout=timeout_ms)
-            await page.wait_for_timeout(int(config.get("pagination_wait_ms", 500)))
+            await page.wait_for_timeout(int(config.get("pagination_wait_ms") or 500))
             await page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 15000))
             if egress_guard:
                 egress_guard.assert_safe()
@@ -491,7 +491,7 @@ class FollowLinksNode:
             collection = [{str(config.get("url_field", "url")): urljoin(base_url, element.get("href", ""))}
                           for element in soup.select(str(config.get("selector", "a[href]"))) if element.get("href")]
         url_field = str(config.get("url_field", "url"))
-        limit = max(0, int(config.get("max_pages", len(collection) or 20)))
+        limit = max(0, int(config.get("max_pages") or len(collection) or 20))
         frontier = build_url_frontier(
             collection,
             base_url=base_url,
@@ -506,7 +506,7 @@ class FollowLinksNode:
             parent[url_field] = candidate["url"]
             parents.append(parent)
 
-        concurrency = min(max(int(config.get("concurrency", 3)), 1), 20)
+        concurrency = min(max(int(config.get("concurrency") or 3), 1), 20)
         fetch_policy = FetchPolicy.from_config(config)
         merge_mode = str(config.get("merge_mode", "MERGE_PARENT_CHILD"))
         policy = str(config.get("error_policy", "CONTINUE"))
@@ -586,14 +586,14 @@ class PaginationNode:
         template = str(config.get("url_template") or "")
         if not template:
             raise ValueError("Pagination: url_template не задан")
-        current = int(config.get("start", 1))
-        step = int(config.get("step", 1))
+        current = int(config.get("start") or 1)
+        step = int(config.get("step") or 1)
         pages: list[dict[str, Any]] = []
         policy = FetchPolicy.from_config(config)
         egress_policy = EgressPolicy.from_config(config)
         resolver = config.get("egress_resolver") or default_resolver
         async with httpx.AsyncClient(follow_redirects=False, timeout=policy.timeout) as client:
-            for _ in range(min(int(config.get("max_pages", 10)), 1000)):
+            for _ in range(min(int(config.get("max_pages") or 10), 1000)):
                 url = render_template(template, context, {**inputs, "page": current, "offset": current})
                 response = await request_with_egress_policy(
                     client,
@@ -656,8 +656,8 @@ class CrawlLinksNode:
         pattern = re.compile(pattern_text, re.I) if pattern_text else None
         url_path = str(config.get("url_path") or "url")
         maximum = min(
-            max(int(config.get("max_items", 5000)), 1),
-            max(int(config.get("max_pages", config.get("max_items", 5000))), 1),
+            max(int(config.get("max_items") or 5000), 1),
+            max(int(config.get("max_pages") or config.get("max_items") or 5000), 1),
             5000,
         )
         candidates = build_url_frontier(
@@ -680,8 +680,8 @@ class CrawlLinksNode:
             )
             candidate["depth"] = 1
 
-        concurrency = min(max(int(config.get("concurrency", 3)), 1), 20)
-        delay_ms = max(int(config.get("delay_ms", 400)), 0)
+        concurrency = min(max(int(config.get("concurrency") or 3), 1), 20)
+        delay_ms = max(int(config.get("delay_ms") or 400), 0)
         fetch_policy = FetchPolicy.from_config(config)
         egress_policy = EgressPolicy.from_config(config)
         resolver = config.get("egress_resolver") or default_resolver
@@ -692,7 +692,7 @@ class CrawlLinksNode:
         record_lock = asyncio.Lock()
         visited_urls = {candidate["url"] for candidate in candidates}
         all_candidates = list(candidates)
-        max_depth = min(max(int(config.get("max_depth", 1)), 1), 20)
+        max_depth = min(max(int(config.get("max_depth") or 1), 1), 20)
         recursive_selector = str(config.get("recursive_link_selector") or "").strip()
 
         async def crawl(candidate: dict[str, Any]) -> list[dict[str, Any]]:
@@ -874,7 +874,7 @@ class CrawlLinksNode:
         if errors and error_policy in {"FAIL", "FAIL_FAST"}:
             raise ValueError(f"Crawl failed for {errors[0]['url']}: {errors[0]['error']}")
         if error_policy == "REQUIRE_MINIMUM":
-            minimum = max(int(config.get("minimum_successful_records", 1)), 0)
+            minimum = max(int(config.get("minimum_successful_records") or 1), 0)
             if len(records) < minimum:
                 raise ValueError(f"Crawl minimum successful records not met: {len(records)} < {minimum}")
         context.log("INFO", "Crawl Links завершён", found=len(all_candidates), extracted=len(records), errors=len(errors))
@@ -1033,7 +1033,7 @@ class CrawlLinksNode:
             if "json" not in content_type:
                 documents.append(response.text)
             if config.get("pagination_enabled") and documents:
-                maximum_pages = min(max(int(config.get("pagination_max_pages", 25)), 1), 500)
+                maximum_pages = min(max(int(config.get("pagination_max_pages") or 25), 1), 500)
                 selector = str(config.get("pagination_next_selector") or "a[rel='next']")
                 seen_pages = {canonical_url(str(response.url))}
                 while len(documents) < maximum_pages:
@@ -2480,13 +2480,19 @@ def extract_article_record(
             element = elements[0] if elements else None
             value_mode = str(field.get("value") or "text")
             if field.get("multiple") and value_mode == "links":
-                record[name] = json.dumps([
+                links = [
                     {
                         "title": item.get_text(" ", strip=True) or Path(urlsplit(str(item.get("href") or "")).path).name,
                         "url": canonical_url(urljoin(page_url, str(item.get("href") or ""))),
                     }
                     for item in elements if item.get("href")
-                ], ensure_ascii=False)
+                ]
+                # The legacy ``attachments_json`` field intentionally remains
+                # a JSON string for backwards compatibility.  The shared
+                # market-news schema uses the renamed ``attachments`` field,
+                # which is declared as an array and must stay structured all
+                # the way through Mapping → persistence validation.
+                record[name] = links if name == "attachments" else json.dumps(links, ensure_ascii=False)
                 continue
             if element is None:
                 record[name] = None

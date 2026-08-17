@@ -253,7 +253,7 @@ class WorkflowEngine:
             output: dict[str, Any] = {}
             error: dict[str, Any] = {}
             strategy_attempts: list[AdaptiveAttempt] = []
-            attempts = max(int(config.get("retries", 0)), 0) + 1
+            attempts = max(int(config.get("retries") or 0), 0) + 1
             for attempt in range(1, attempts + 1):
                 try:
                     if contract_version == 2:

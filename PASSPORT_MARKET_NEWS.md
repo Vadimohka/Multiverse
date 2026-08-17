@@ -151,11 +151,7 @@ Early stop разрешён только если preset доказал моно
 ## NEWS-01 — БВФБ / пресс-релизы
 
 - **URL:** https://www.bcse.by/press-center/releases
-- **Темы из паспорта:**
-  - депозитарные облигации;
-  - биржевые облигации;
-  - облигации;
-  - изменения информации проспекта/условий выпуска.
+- **Правило отбора:** все публикации из категории «Пресс-релизы».
 - **Repo intelligence:** существующий Multiverse уже знает detail endpoint `/solo/calendar`; аудит проекта также выявлял публичный listing/calendar API family.
 - **Recommended Acquire:** public JSON/API first **после live-проверки endpoint**; HTML/browser только fallback.
 - **Known detail pattern from current repo seed:**
@@ -167,7 +163,7 @@ query: sType=6, sDay=<publication_time>, link=<record_id>
 
 - **Traverse:** category/listing IDs → detail; date boundary.
 - **Extract:** title/date/body/attachments/external id.
-- **Process:** deterministic topic inclusion по full detail, не только title.
+- **Process:** включать все материалы категории; сохранять полный detail, а не только заголовок.
 - **Assure:** discovered IDs = fetched + explicit failed/skipped; required topic decision reason.
 - **Legal note:** публичная доступность не равна свободной лицензии на перераспространение. Deployment owner должен отдельно проверить условия использования/перепечатки сайта; Multiverse не должен обходить ограничения.
 

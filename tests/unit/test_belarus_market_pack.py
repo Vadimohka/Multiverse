@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -82,6 +83,15 @@ def test_every_news_site_has_a_declarative_list_detail_and_selection_profile():
         assert {operation["type"] for operation in operations} >= {"copy", "coalesce", "classify_access", "select_by_rules"}
 
 
+def test_bcse_releases_profile_includes_every_article_in_the_configured_section():
+    profile = json.loads((Path(__file__).resolve().parents[2] / "presets" / "belarus-market" / "news" / "source-profiles.json").read_text(encoding="utf-8"))
+    selection = profile["sources"]["news-01"]["selection"]
+
+    assert selection["default"]["action"] == "INCLUDE"
+    assert selection["default"]["ruleId"] == "bcse-releases-all-v1"
+    assert selection["rules"] == []
+
+
 def test_pack_installer_is_idempotent_and_creates_per_source_workflows(client):
     with SessionLocal() as db:
         admin = db.scalar(select(User).order_by(User.created_at))
@@ -96,7 +106,9 @@ def test_pack_installer_is_idempotent_and_creates_per_source_workflows(client):
         schedules = db.scalars(select(Schedule).join(Workflow).where(Workflow.project_id == market_project.id).order_by(Schedule.name)).all()
 
     assert first["sources"] == 60
-    assert first["presets_created"] == 60
+    # The application bootstrap installs the source pack on a clean server.
+    # Calling the installer again must therefore be a no-op for revisions.
+    assert first["presets_created"] == 0
     assert second["presets_created"] == 0
     assert memberships >= 60
     assert workflows == 21
