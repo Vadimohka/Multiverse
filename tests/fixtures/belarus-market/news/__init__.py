@@ -6,11 +6,14 @@ from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Mapping
 from unittest.mock import patch
+from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import httpx
+from bs4 import BeautifulSoup
 from app.services.belarus_market_pack import _preset_config, passport_sources
 from app.services.preset_compiler import compile_preset
 from workflow_engine.nodes import HTTPRequestNode, MappingNode, TransformNode, ValidateNode, canonical_url
@@ -19,11 +22,17 @@ from workflow_engine.types import ExecutionContext
 
 
 @dataclass(frozen=True)
+class NewsFixturePagination:
+    visited_pages: int
+
+
+@dataclass(frozen=True)
 class NewsFixtureResult:
     records: list[dict[str, Any]]
     assessment_status: str
     assessment_codes: list[str]
     traversal: dict[str, Any]
+    pagination: NewsFixturePagination
 
 
 def _display_source_dates(records: list[dict[str, Any]], timezone: str) -> list[dict[str, Any]]:
@@ -60,6 +69,8 @@ async def run_news_fixture(
     listing_html: str,
     details: Mapping[str, str],
     window: Mapping[str, Any],
+    *,
+    pages: Mapping[str, str] | None = None,
 ) -> NewsFixtureResult:
     """Execute an existing news profile against a hermetic HTML transport.
 
@@ -76,11 +87,16 @@ async def run_news_fixture(
     for phase in ("acquire", "traverse"):
         nodes[phase]["egress_resolver"] = public_resolver
     expected_details = {canonical_url(str(url)): body for url, body in details.items()}
+    expected_pages = {
+        canonical_url(str(url)): body for url, body in (pages or {}).items()
+    }
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if canonical_url(url) == canonical_url(source.url):
             body = listing_html
+        elif canonical_url(url) in expected_pages:
+            body = expected_pages[canonical_url(url)]
         elif canonical_url(url) in expected_details:
             body = expected_details[canonical_url(url)]
         else:
@@ -126,11 +142,56 @@ async def run_news_fixture(
     published_field = next(
         (field for field in detail_fields if field.get("name") == "source_published_at"), {}
     )
+    traversal = traversed["traversal"]
     return NewsFixtureResult(
         records=_display_source_dates(
             assessment["records"], str(published_field.get("timezone") or "UTC")
         ),
         assessment_status=str(assessment["assessment_status"]),
         assessment_codes=list(dict.fromkeys(codes)),
-        traversal=traversed["traversal"],
+        traversal=traversal,
+        pagination=NewsFixturePagination(
+            visited_pages=len(traversal.get("checkpoint", {}).get("completed_urls", []))
+        ),
+    )
+
+
+async def run_news_fixture_from_files(source_key: str) -> NewsFixtureResult:
+    """Load a retained fixture set using generic filename/profile conventions."""
+
+    root = Path(__file__).resolve().parent
+    listing = (root / f"{source_key}-list.html").read_text(encoding="utf-8")
+    detail = (root / f"{source_key}-detail.html").read_text(encoding="utf-8")
+    source, config = _fixture_config(
+        source_key,
+        {"from": "2000-01-01T00:00:00+03:00", "to": "2100-01-01T00:00:00+03:00"},
+    )
+    traverse = config["nodes"]["traverse"]
+    selector = str(traverse.get("detail", {}).get("selector") or "")
+    pagination = traverse.get("pagination") or {}
+    fixture_pages = sorted(root.glob(f"{source_key}-page-*.html"))
+    page_bodies: dict[str, str] = {}
+    bodies = [listing]
+    template = str(pagination.get("urlTemplate") or "")
+    for page_number, path in enumerate(fixture_pages[1:], start=2):
+        body = path.read_text(encoding="utf-8")
+        if template:
+            page_bodies[template.replace("{{page}}", str(page_number))] = body
+        bodies.append(body)
+
+    details: dict[str, str] = {}
+    for body in bodies:
+        soup = BeautifulSoup(body, "lxml")
+        for link in soup.select(selector):
+            href = str(link.get("href") or "").strip()
+            if href:
+                details[urljoin(source.url, href)] = detail
+
+    window = {
+        "from": "2000-01-01T00:00:00+03:00",
+        "to": "2100-01-01T00:00:00+03:00",
+        "max_pages": max(1, len(fixture_pages)),
+    }
+    return await run_news_fixture(
+        source_key, listing, details, window, pages=page_bodies
     )
