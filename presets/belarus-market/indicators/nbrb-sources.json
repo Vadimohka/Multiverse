@@ -16,5 +16,11 @@
     "name": "НБРБ / банковские драгоценные металлы",
     "url": "https://www.nbrb.by/statistics/valuables/bankingots",
     "status": "DRAFT"
+  },
+  {
+    "key": "indicator-bcse-home",
+    "name": "БВФБ / курсы и ставки РЕПО",
+    "url": "https://www.bcse.by/",
+    "status": "DRAFT"
   }
 ]

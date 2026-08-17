@@ -42,6 +42,23 @@ BCSE_NEWS_SCHEMA = {
 }
 
 
+MARKET_INDICATOR_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "MarketIndicator v1",
+    "type": "object",
+    "required": ["indicator_code", "effective_at", "value", "source_url"],
+    "properties": {
+        "indicator_code": {"type": "string"},
+        "series_id": {"type": "string"},
+        "effective_at": {"type": "string", "format": "date-time"},
+        "value": {"type": "number"},
+        "unit": {"type": ["string", "null"]},
+        "currency": {"type": ["string", "null"]},
+        "source_url": {"type": "string", "format": "uri"},
+    },
+}
+
+
 def bcse_news_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
     mapping_fields = [
         {"target": "news_id", "source_path": "record_id"},
@@ -207,6 +224,110 @@ def bcse_market_news_category_graph(source_id: str, dataset_id: str, *, incremen
         {"target": "fetched_at", "source_path": "fetched_at"},
     ]}
     graph["settings"]["natural_key_fields"] = ["source_id", "identity_key"]
+    return graph
+
+
+def bcse_home_market_indicators_graph(source_id: str, dataset_id: str, *, incremental: bool = False) -> dict:
+    """Extract the two live market widgets shown on the BCSE home page.
+
+    The page renders four currency instruments and nine BYN repo tenors in
+    separate JS widgets.  A single repeating-list selector intentionally
+    combines both widget row types while field selectors use alternatives for
+    the common label/value/date columns.
+    """
+    crawl_config = {
+        "url": "https://www.bcse.by/",
+        "wait_until": "networkidle",
+        "timeout": 60,
+        "capture_network": False,
+        "tabs_enabled": False,
+        "full_page": False,
+    }
+    extract_config = {
+        "input_path": "html",
+        "container_selector": "#currency .inf-instrument, #repo-body .inf-wrap",
+        "fields": [
+            {"name": "label", "selector": "a.text-asfalt, .inf-name"},
+            {"name": "value_raw", "selector": ".w-60p .text-asfalt, .inf-repo-percent"},
+            {"name": "observed_source", "selector": ".inf-date, .inf-repo-date"},
+            {"name": "change_percent_raw", "selector": ".w-50p > .text-right:first-child"},
+            {"name": "change_absolute_raw", "selector": ".w-50p span"},
+        ],
+    }
+    operations = [
+        {"type": "add_context", "fields": ["effective_at", "observed_at"]},
+        {"type": "constant", "field": "source_key", "value": "indicator-bcse-home"},
+        {"type": "copy", "to": "indicator_code", "source": "label"},
+        {"type": "copy", "to": "series_id", "source": "label"},
+        {"type": "copy", "to": "instrument", "source": "label"},
+        {"type": "copy", "to": "currency", "source": "label"},
+        {"type": "map", "field": "currency", "mapping": {
+            "USD/BYN_TOD": "USD", "EUR/BYN_TOD": "EUR", "RUB/BYN_TOD": "RUB", "CNY/BYN_TOD": "CNY",
+            "1-3 дней": "BYN", "6-8 дней": "BYN", "9-14 дней": "BYN", "15-30 дней": "BYN",
+            "31-60 дней": "BYN", "61-90 дней": "BYN", "91-180 дней": "BYN", "181-360 дней": "BYN", "более 360 дней": "BYN",
+        }},
+        {"type": "copy", "to": "value", "source": "value_raw"},
+        {"type": "number", "field": "value"},
+        {"type": "copy", "to": "change_percent", "source": "change_percent_raw"},
+        {"type": "number", "field": "change_percent"},
+        {"type": "copy", "to": "change_absolute", "source": "change_absolute_raw"},
+        {"type": "number", "field": "change_absolute"},
+        {"type": "copy", "to": "last_trade_at", "source": "observed_source"},
+        {"type": "copy", "to": "indicator_type", "source": "label"},
+        {"type": "map", "field": "indicator_type", "mapping": {
+            "USD/BYN_TOD": "FX_RATE", "EUR/BYN_TOD": "FX_RATE", "RUB/BYN_TOD": "FX_RATE", "CNY/BYN_TOD": "FX_RATE",
+            "1-3 дней": "REPO_RATE", "6-8 дней": "REPO_RATE", "9-14 дней": "REPO_RATE", "15-30 дней": "REPO_RATE",
+            "31-60 дней": "REPO_RATE", "61-90 дней": "REPO_RATE", "91-180 дней": "REPO_RATE", "181-360 дней": "REPO_RATE", "более 360 дней": "REPO_RATE",
+        }},
+        {"type": "copy", "to": "unit", "source": "indicator_type"},
+        {"type": "map", "field": "unit", "mapping": {"FX_RATE": "BYN per currency unit", "REPO_RATE": "percent per annum"}},
+    ]
+    mapping_fields = [
+        {"target": "indicator_code", "source_path": "indicator_code"},
+        {"target": "series_id", "source_path": "series_id"},
+        {"target": "effective_at", "source_path": "effective_at"},
+        {"target": "value", "source_path": "value"},
+        {"target": "unit", "source_path": "unit"},
+        {"target": "currency", "source_path": "currency"},
+        {"target": "source_url", "constant": "https://www.bcse.by/"},
+        {"target": "source_id", "constant": "bcse-home-indicators"},
+        {"target": "source_name", "constant": "БВФБ / курсы и ставки РЕПО"},
+        {"target": "source_section", "constant": "home-market-widgets"},
+        {"target": "source_authority", "constant": "PRIMARY"},
+        {"target": "indicator_type", "source_path": "indicator_type"},
+        {"target": "instrument", "source_path": "instrument"},
+        {"target": "value_raw", "source_path": "value_raw"},
+        {"target": "last_trade_at", "source_path": "last_trade_at"},
+        {"target": "change_percent", "source_path": "change_percent"},
+        {"target": "change_absolute", "source_path": "change_absolute"},
+        {"target": "selection_rule_id", "constant": "bcse-home-currency-repo-v1"},
+        {"target": "selection_rule_version", "constant": "market-indicators-v1"},
+        {"target": "selection_reason", "constant": "official BCSE home-page currency and BYN repo widgets"},
+        {"target": "fetched_at", "source_path": "observed_at"},
+    ]
+    graph = {
+        "version": 1,
+        "settings": {"source_id": source_id, "dataset_id": dataset_id, "natural_key_fields": ["series_id", "effective_at", "source_url"], "review_policy": {"new": False, "changed": True, "confidence_below": 0.8}},
+        "nodes": [
+            {"id": "trigger", "type": "manual_trigger", "position": {"x": 30, "y": 180}, "config": {}},
+            {"id": "browser", "type": "browser_open", "position": {"x": 260, "y": 180}, "config": crawl_config},
+            {"id": "parse", "type": "parse_html", "position": {"x": 480, "y": 180}, "config": {"input_path": "body"}},
+            {"id": "extract", "type": "extract_repeating_list", "position": {"x": 700, "y": 180}, "config": extract_config},
+            {"id": "transform", "type": "transform", "position": {"x": 940, "y": 180}, "config": {"input_path": "records", "operations": operations, "identity": ["series_id"]}},
+            {"id": "mapping", "type": "mapping", "position": {"x": 1180, "y": 180}, "config": {"input_path": "records", "fields": mapping_fields}},
+            {"id": "validate", "type": "validate", "position": {"x": 1420, "y": 180}, "config": {"input_path": "records", "required": ["indicator_code", "effective_at", "value", "source_url"], "schema": MARKET_INDICATOR_SCHEMA, "fail_on_error": True}},
+            {"id": "output", "type": "output", "position": {"x": 1660, "y": 180}, "config": {"input_path": "records", "name": "market_indicators"}},
+        ],
+        "edges": [
+            {"id": "e1", "source": "trigger", "target": "browser"},
+            {"id": "e2", "source": "browser", "target": "parse"},
+            {"id": "e3", "source": "parse", "target": "extract"},
+            {"id": "e4", "source": "extract", "target": "transform"},
+            {"id": "e5", "source": "transform", "target": "mapping"},
+            {"id": "e6", "source": "mapping", "target": "validate"},
+            {"id": "e7", "source": "validate", "target": "output"},
+        ],
+    }
     return graph
 
 

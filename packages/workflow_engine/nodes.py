@@ -3058,6 +3058,8 @@ def _apply_context_fields(row: dict[str, Any], operation: Mapping[str, Any], con
             value = source.get("name")
         elif name == "fetched_at":
             value = (context.effective_run_clock if context is not None else None) or datetime.now(UTC)
+        elif name in {"effective_at", "observed_at"}:
+            value = (context.effective_run_clock if context is not None else None) or datetime.now(UTC)
         elif name == "page_url":
             value = row.get("url") or row.get("page_url")
         elif name == "state":
